@@ -393,6 +393,21 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
 function buildRunBody(ctx: AdapterExecutionContext, sessionKey: string | null): Record<string, unknown> {
   const paperclipApiUrl = nonEmpty(ctx.config.paperclipApiUrl);
   const payloadTemplate = parseObject(ctx.config.payloadTemplate);
+  if (ctx.config.scopedRunEnvironment === true) {
+    const token = nonEmpty(ctx.authToken);
+    if (!token || !paperclipApiUrl) throw new Error("Missing heartbeat-scoped Paperclip authentication");
+    for (const key of ["environment", "session_id", "previous_response_id", "conversation_history", "hosted_room_dispatch"]) delete payloadTemplate[key];
+    const environment = {
+      PAPERCLIP_API_KEY: token,
+      PAPERCLIP_API_URL: paperclipApiUrl,
+      PAPERCLIP_RUN_ID: ctx.runId,
+      PAPERCLIP_AGENT_ID: ctx.agent.id,
+      PAPERCLIP_COMPANY_ID: ctx.agent.companyId,
+      ...(issueIdFromContext(ctx) ? { PAPERCLIP_TASK_ID: issueIdFromContext(ctx)! } : {}),
+      ...(nonEmpty(ctx.context.wakeReason) ? { PAPERCLIP_WAKE_REASON: nonEmpty(ctx.context.wakeReason)! } : {}),
+    };
+    return { ...payloadTemplate, environment, required_environment_capability: "trusted-local-foreground-v1", input: buildInput({ ...ctx, runtime: { ...ctx.runtime, sessionId: null } }, paperclipApiUrl), instructions: nonEmpty(ctx.config.instructions) ?? "Follow the assigned Paperclip task using the run-scoped environment. Never expose credentials." };
+  }
   const configuredInput = nonEmpty(payloadTemplate.input);
   const input = configuredInput && ctx.context.conversationMode === true
     ? `${configuredInput}\n\n${buildInput(ctx, paperclipApiUrl)}`
@@ -564,6 +579,7 @@ async function handleEvent(
   const parsed = parseJsonData(frame.data);
   const record = asRecord(parsed);
   const eventName = eventNameFromData(parsed, frame.event);
+  if (ctx.config.scopedRunEnvironment === true && eventName === "message.delta") return;
   state.lastEventName = eventName;
   await ctx.onLog(
     "stdout",
@@ -938,7 +954,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const reconnectMs = Math.floor(clamp(parseNonNegativeNumber(ctx.config.eventReconnectMs, DEFAULT_EVENT_RECONNECT_MS), 250, 30_000));
   const pollIntervalMs = Math.floor(clamp(parseNonNegativeNumber(ctx.config.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS), 250, 10_000));
   const strategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
-  const sessionKey = resolveSessionKey({
+  const scoped = ctx.config.scopedRunEnvironment === true;
+  const sessionKey = scoped ? null : resolveSessionKey({
     strategy,
     companyId: ctx.agent.companyId,
     agentId: ctx.agent.id,
@@ -946,6 +963,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     issueId: issueIdFromContext(ctx),
   });
   const extraHeaders = parseHeaders(ctx.config.headers);
+  if (scoped) for (const key of Object.keys(extraHeaders)) if (key.toLowerCase() === "x-hermes-session-key") delete extraHeaders[key];
   const runHeaders = buildHeaders({
     apiKey,
     sessionKey,
@@ -962,17 +980,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     accept: "text/event-stream",
   });
   const redactText = createTextRedactor([
+    ctx.authToken,
     apiKey,
     sessionKey,
     runHeaders.Authorization,
     runHeaders["X-Hermes-Session-Key"],
   ]);
-  const body = buildRunBody(ctx, sessionKey);
-  const createRunUrl = apiUrl(baseUrl, "/v1/runs");
+  let body: Record<string, unknown>;
+  try { body = buildRunBody(ctx, sessionKey); } catch (err) { return errorResult(err, baseUrl, redactText); }
+  const createRunUrl = apiUrl(baseUrl, scoped ? "/v1/trusted-local-runs" : "/v1/runs");
 
   await ctx.onMeta?.({
     adapterType: ADAPTER_TYPE,
-    command: "POST /v1/runs",
+    command: scoped ? "POST /v1/trusted-local-runs" : "POST /v1/runs",
     commandArgs: [createRunUrl],
     context: {
       runId: ctx.runId,
@@ -987,6 +1007,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   let runId: string | null = null;
   try {
+    if (scoped) {
+      const caps = asRecord(await fetchJson(apiUrl(baseUrl, "/v1/capabilities"), { method: "GET", headers: runHeaders, signal: AbortSignal.timeout(10_000) }));
+      const feature = asRecord(asRecord(caps?.features)?.run_environment);
+      if (feature?.enabled !== true || feature?.protocol !== "trusted-local-foreground-v1" || feature?.route !== "/v1/trusted-local-runs" || feature?.sessions !== "fresh-only") throw new Error("Receiver does not support scoped run environment capability");
+    }
     // This adapter has no local child process, so crossing into the first
     // remote create request is its dispatch boundary. Report it before the
     // request can block so continuation gates may release their issue lock.
@@ -997,6 +1022,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       body: JSON.stringify(body),
     });
     runId = extractRunId(created);
+    if (scoped && asRecord(created)?.environment_capability !== "trusted-local-foreground-v1") {
+      if (runId) await stopRun({ ctx, baseUrl, headers: runHeaders, runId, redactText });
+      throw new Error("Receiver did not acknowledge scoped run environment capability");
+    }
     if (!runId) {
       return {
         exitCode: 1,

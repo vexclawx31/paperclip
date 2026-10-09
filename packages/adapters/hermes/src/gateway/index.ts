@@ -43,6 +43,7 @@ Optional fields:
 - timeoutSec (number): defaults to 600.
 - eventReconnectMs (number): defaults to 2000.
 - instructions (string): stable Hermes instructions sent separately from wake input.
+- scopedRunEnvironment (boolean): defaults to false. When true, the heartbeat-scoped Paperclip run JWT and run identifiers are sent as a run-scoped environment to POST /v1/trusted-local-runs, only after GET /v1/capabilities advertises run_environment protocol trusted-local-foreground-v1 with fresh-only sessions. Requires paperclipApiUrl. Session keys are not sent and message.delta events are not logged. The run is stopped and fails if the receiver does not acknowledge the capability.
 
 Runtime mapping:
 - Creates runs with POST /v1/runs.
@@ -64,7 +65,7 @@ export function createServerAdapter(): ServerAdapterModule {
     sessionCodec,
     sessionManagement,
     models,
-    supportsLocalAgentJwt: false,
+    supportsLocalAgentJwt: true,
     supportsInstructionsBundle: false,
     requiresMaterializedRuntimeSkills: false,
     agentConfigurationDoc,

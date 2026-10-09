@@ -78,6 +78,7 @@ import {
 } from "./agent-config-primitives";
 import { defaultCreateValues } from "./agent-config-defaults";
 import { getUIAdapter } from "../adapters";
+import { isLocalAdapterCapabilities } from "../adapters/local-adapter";
 import { ClaudeLocalAdvancedFields } from "../adapters/claude-local/config-fields";
 import { MarkdownEditor } from "./MarkdownEditor";
 import { ChoosePathButton } from "./PathInstructionsModal";
@@ -609,7 +610,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const getCapabilities = useAdapterCapabilities();
   const adapterCaps = getCapabilities(adapterType);
   const isDotRunner = adapterType === "paperclip_runner" && (isCreate ? props.values.adapterSchemaValues?.provider : eff("adapterConfig", "provider", config.provider)) === "openai_dot";
-  const isLocal = !isDotRunner && (adapterCaps.supportsInstructionsBundle || adapterCaps.supportsSkills || adapterCaps.supportsLocalAgentJwt);
+  const isLocal = !isDotRunner && isLocalAdapterCapabilities(adapterType, adapterCaps);
   
   // The legacy working directory is an absolute path on the host, so the
   // managed-sandbox-only policy hides it. A stored value stays untouched; it is

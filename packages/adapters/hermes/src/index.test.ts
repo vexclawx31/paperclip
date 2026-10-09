@@ -38,7 +38,8 @@ test("root package export keeps explicit local and gateway adapter factories", (
   expect(localAdapter.type).toBe("hermes_local");
   expect(gatewayAdapter.type).toBe("hermes_gateway");
   expect(hermesGatewayType).toBe("hermes_gateway");
-  expect(gatewayAdapter.supportsLocalAgentJwt).toBe(false);
+  // The run JWT is only forwarded when scopedRunEnvironment is explicitly enabled.
+  expect(gatewayAdapter.supportsLocalAgentJwt).toBe(true);
   expect(gatewayAdapter.supportsInstructionsBundle).toBe(false);
 });
 

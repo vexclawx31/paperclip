@@ -76,6 +76,7 @@ import {
   resolveManagedSandboxEnvironmentId,
 } from "../lib/adapter-test-environment";
 import { queryKeys } from "../lib/queryKeys";
+import { isLocalAdapterCapabilities } from "../adapters/local-adapter";
 import { Dialog, DialogPortal } from "@/components/ui/dialog";
 import {
   Popover,
@@ -1118,10 +1119,7 @@ function OnboardingWizardInner({
    */
   const authSignalUndecided = canShowAdapterLogin && authSignalStatus === null;
 
-  const isLocalAdapterCaps =
-    adapterCaps.supportsInstructionsBundle ||
-    adapterCaps.supportsSkills ||
-    adapterCaps.supportsLocalAgentJwt;
+  const isLocalAdapterCaps = isLocalAdapterCapabilities(adapterType, adapterCaps);
   const isLocalAdapter =
     isLocalAdapterCaps ||
     adapterType === "claude_local" ||
