@@ -1107,3 +1107,172 @@ describe("mapFinalResultForTest", () => {
     expect(result.errorMessage).toBe("boom");
   });
 });
+
+describe("scoped run environment", () => {
+  const RUN_JWT = "header.run-scoped-jwt.signature";
+  const capabilities = {
+    features: {
+      run_environment: {
+        enabled: true,
+        protocol: "trusted-local-foreground-v1",
+        route: "/v1/trusted-local-runs",
+        sessions: "fresh-only",
+      },
+    },
+  };
+
+  function scopedCtx(extra: Record<string, unknown> = {}): AdapterExecutionContext {
+    const ctx = makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642",
+      apiKey: "secret-key",
+      paperclipApiUrl: "http://127.0.0.1:3100",
+      scopedRunEnvironment: true,
+      timeoutSec: 5,
+      ...extra,
+    });
+    ctx.authToken = RUN_JWT;
+    return ctx;
+  }
+
+  function receiver(options: { caps?: unknown; ack?: string | null } = {}) {
+    return vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/capabilities")) {
+        return new Response(JSON.stringify(options.caps ?? capabilities), { status: 200 });
+      }
+      if (url.endsWith("/v1/trusted-local-runs")) {
+        const ack = options.ack === undefined ? "trusted-local-foreground-v1" : options.ack;
+        return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started", ...(ack ? { environment_capability: ack } : {}) }), { status: 200 });
+      }
+      if (url.endsWith("/events")) {
+        return new Response(
+          sseStream([
+            "event: message.delta",
+            `data: {"delta":"streamed ${RUN_JWT}"}`,
+            "",
+            "event: run.completed",
+            "data: {\"status\":\"completed\",\"output\":\"done\"}",
+            "",
+          ].join("\n")),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(JSON.stringify({ status: "completed", output: "done" }), { status: 200 });
+    });
+  }
+
+  function logText(ctx: AdapterExecutionContext): string {
+    return (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls.map(([, line]) => String(line)).join("\n");
+  }
+
+  it("negotiates the capability, then creates a fresh trusted-local run with the run-scoped environment", async () => {
+    const fetchMock = receiver();
+    vi.stubGlobal("fetch", fetchMock);
+    const ctx = scopedCtx({
+      headers: { "x-hermes-session-key": "forged", "X-Extra": "kept" },
+      payloadTemplate: { session_id: "stale", previous_response_id: "r", conversation_history: [], hosted_room_dispatch: {}, environment: { PAPERCLIP_API_KEY: "other" } },
+    });
+    ctx.runtime.sessionId = "prior-session";
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    const urls = fetchMock.mock.calls.map(([input]) => String(input));
+    expect(urls[0]).toBe("http://127.0.0.1:8642/v1/capabilities");
+    expect(urls[1]).toBe("http://127.0.0.1:8642/v1/trusted-local-runs");
+    expect(urls).not.toContain("http://127.0.0.1:8642/v1/runs");
+    expect(ctx.onMeta).toHaveBeenCalledWith(expect.objectContaining({
+      command: "POST /v1/trusted-local-runs",
+      commandArgs: ["http://127.0.0.1:8642/v1/trusted-local-runs"],
+    }));
+    const init = fetchMock.mock.calls[1]?.[1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    expect(Object.keys(headers).map((k) => k.toLowerCase())).not.toContain("x-hermes-session-key");
+    expect(headers["X-Extra"]).toBe("kept");
+    const body = JSON.parse(String(init.body));
+    expect(body.environment).toEqual({
+      PAPERCLIP_API_KEY: RUN_JWT,
+      PAPERCLIP_API_URL: "http://127.0.0.1:3100",
+      PAPERCLIP_RUN_ID: "pc-run-1",
+      PAPERCLIP_AGENT_ID: "agent-1",
+      PAPERCLIP_COMPANY_ID: "company-1",
+      PAPERCLIP_TASK_ID: "issue-1",
+      PAPERCLIP_WAKE_REASON: "manual",
+    });
+    expect(body.required_environment_capability).toBe("trusted-local-foreground-v1");
+    for (const key of ["session_id", "previous_response_id", "conversation_history", "hosted_room_dispatch"]) {
+      expect(body).not.toHaveProperty(key);
+    }
+    // Credentials travel only in the environment, never in prompt text, logs or results.
+    expect(String(body.input)).not.toContain(RUN_JWT);
+    expect(String(body.instructions)).not.toContain(RUN_JWT);
+    expect(logText(ctx)).not.toContain(RUN_JWT);
+    expect(logText(ctx)).not.toContain("event=message.delta");
+    expect(JSON.stringify(result)).not.toContain(RUN_JWT);
+  });
+
+  it("refuses before any request when the run JWT or Paperclip API URL is missing", async () => {
+    for (const ctx of [scopedCtx(), scopedCtx({ paperclipApiUrl: undefined })]) {
+      if (ctx.config.paperclipApiUrl) delete ctx.authToken;
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const result = await execute(ctx);
+      expect(result.exitCode).toBe(1);
+      expect(result.errorMessage).toContain("Missing heartbeat-scoped Paperclip authentication");
+      expect(fetchMock).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([
+    [{ features: {} }],
+    [{ features: { run_environment: { ...capabilities.features.run_environment, enabled: false } } }],
+    [{ features: { run_environment: { ...capabilities.features.run_environment, sessions: "resumable" } } }],
+    [{ features: { run_environment: { ...capabilities.features.run_environment, route: "/v1/runs" } } }],
+    [{ features: { run_environment: { ...capabilities.features.run_environment, protocol: "trusted-local-foreground-v2" } } }],
+  ])("does not dispatch when the receiver capability is absent or different: %j", async (caps) => {
+    const fetchMock = receiver({ caps });
+    vi.stubGlobal("fetch", fetchMock);
+    const ctx = scopedCtx();
+    ctx.onDispatch = vi.fn();
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("does not support scoped run environment capability");
+    expect(ctx.onDispatch).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual(["http://127.0.0.1:8642/v1/capabilities"]);
+  });
+
+  it("stops the created run when the receiver does not acknowledge the capability", async () => {
+    const fetchMock = receiver({ ack: null });
+    vi.stubGlobal("fetch", fetchMock);
+    const ctx = scopedCtx();
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("did not acknowledge scoped run environment capability");
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toContain("http://127.0.0.1:8642/v1/runs/run-hermes-1/stop");
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/events"))).toBe(false);
+  });
+
+  it("keeps the default gateway contract unchanged when scopedRunEnvironment is not enabled", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify(
+      String(input).endsWith("/v1/runs") ? { run_id: "run-hermes-1", status: "started" } : { status: "completed", output: "done" },
+    ), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const ctx = scopedCtx({ scopedRunEnvironment: undefined });
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    const urls = fetchMock.mock.calls.map(([input]) => String(input));
+    expect(urls[0]).toBe("http://127.0.0.1:8642/v1/runs");
+    expect(urls).not.toContain("http://127.0.0.1:8642/v1/capabilities");
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect((init.headers as Record<string, string>)["X-Hermes-Session-Key"]).toBe("paperclip:company:company-1:agent:agent-1:issue:issue-1");
+    const body = JSON.parse(String(init.body));
+    expect(body).not.toHaveProperty("environment");
+    expect(String(init.body)).not.toContain(RUN_JWT);
+  });
+});

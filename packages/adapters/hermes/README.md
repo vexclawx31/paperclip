@@ -144,6 +144,33 @@ This mode does not start Hermes. It creates runs with `POST /v1/runs`, streams
 Hermes events with SSE, polls run status as a fallback, and stops timed-out runs
 with `POST /v1/runs/{run_id}/stop`.
 
+#### Optional run-scoped Paperclip credentials
+
+Set `"scopedRunEnvironment": true` (with `paperclipApiUrl`) to give the Hermes
+run its own heartbeat-scoped Paperclip JWT. The adapter first requires
+`GET /v1/capabilities` to advertise `features.run_environment` with protocol
+`trusted-local-foreground-v1`, route `/v1/trusted-local-runs` and sessions
+`fresh-only`. It then posts to `/v1/trusted-local-runs` with an `environment`
+object (`PAPERCLIP_API_KEY`, `PAPERCLIP_API_URL`, `PAPERCLIP_RUN_ID`,
+`PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, and when present
+`PAPERCLIP_TASK_ID` and `PAPERCLIP_WAKE_REASON`).
+
+In this mode:
+
+- No Hermes session key or prior session is sent.
+- `message.delta` events are not logged.
+- The JWT is redacted from logs and results.
+- The created run is stopped and fails if the receiver does not acknowledge
+  `environment_capability: "trusted-local-foreground-v1"`.
+
+The option is off by default. The gateway adapter is registered with
+`supportsLocalAgentJwt: true` so heartbeat mints the run JWT, but the JWT is
+only forwarded when this option is enabled. An external adapter that overrides
+`hermes_gateway` keeps its own declared value. The UI still classifies
+`hermes_gateway` as a remote gateway adapter
+(`ui/src/adapters/local-adapter.ts`). That flag does not enable local working
+directory, environment, model-detection or local environment-test controls.
+
 ### Compatibility with the old gateway package
 
 `@paperclipai/adapter-hermes-gateway` remains as a deprecated compatibility shim
