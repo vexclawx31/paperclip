@@ -1835,12 +1835,12 @@ describe("renderPaperclipWakePrompt", () => {
       );
 
       expect(prompt).toContain(
-        "Recovery contract: your job is to RECOVER this task, not to do the work. Do not produce the deliverable yourself.",
+        "Recovery contract: restore the task's valid execution path while preserving its existing ownership and approved scope.",
       );
       expect(prompt).toContain(instruction);
-      expect(prompt).toContain(
-        "Fallback preference order: (1) send back to Coder",
-      );
+      expect(prompt).toContain("If you are the original assignee");
+      expect(prompt).toContain("Do not hand the task back to yourself");
+      expect(prompt).toContain("If you are a different recovery agent");
       expect(prompt).toContain(`- recovery cause: ${cause}`);
       expect(prompt).toContain("- failure summary: adapter stopped");
       expect(prompt).toContain("- original assignee: Coder");
@@ -1855,10 +1855,11 @@ describe("renderPaperclipWakePrompt", () => {
         expect(prompt).toContain(
           "Record the outcome in the resolve call's `resolutionNote`",
         );
-        expect(prompt).toContain(
+        expect(prompt).not.toContain(
           "Any comment you post on the source issue must be ≤3 lines",
         );
-        expect(prompt).toContain("No headings, no run-by-run narrative.");
+        expect(prompt).not.toContain("No headings, no run-by-run narrative.");
+        expect(prompt).toContain("Keep detailed recovery evidence in the resolution record or issue documents");
       }
     },
   );

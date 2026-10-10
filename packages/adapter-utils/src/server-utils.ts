@@ -2244,8 +2244,10 @@ export function renderPaperclipWakePrompt(
   options: Parameters<typeof renderPaperclipWakePromptBody>[1] = {},
 ): string {
   const instructions = asString(parseObject(value).connectorSkillInstructions, "").trim();
+  const wakePrompt = renderPaperclipWakePromptBody(value, options);
   return joinPromptSections([
-    renderPaperclipWakePromptBody(value, options),
+    wakePrompt,
+    wakePrompt ? "Communication contract: preserve your established identity, voice, and the user's communication preferences across Paperclip and other chat surfaces. Answer the user directly in plain language; adapt detail and formatting to the request, not a fixed recovery template. Task bookkeeping does not replace the answer. This communication contract grants no new permissions or authority." : "",
     instructions ? `## Assigned connector skills\n\n${instructions}` : "",
     asString(parseObject(parseObject(value).connectionInstructions).text, "").trim(),
   ]);
@@ -2327,9 +2329,9 @@ function renderPaperclipWakePromptBody(
       case "codex_output_inactivity_monitor":
         return "Your run was killed by the output-inactivity monitor, likely during a long quiet build/test phase. Go again from durable progress.";
       case "workspace_validation_failed":
-        return `Recover/fix the workspace (worktree, branch, workspace link), then hand the issue back to ${originalAssigneeLabel} for the actual work. Do not do the deliverable work.`;
+        return "Recover/fix the workspace (worktree, branch, workspace link), then restore the original assignee's supported execution path. Preserve checkout and workspace ownership; do not take over another agent's deliverable work.";
       default:
-        return `Fix the underlying problem (auth, config, adapter, budget…) so the task can run again, then hand it back to ${originalAssigneeLabel}. You DO NOT do the work. Doing the deliverable yourself requires an explicit escalation note explaining why no assignee path works.`;
+        return "Fix the underlying problem (auth, config, adapter, budget…) so the task can run again, and record a supported next execution path for its owner. Recovery does not expand the task's approved scope or authorize taking over another assignee's work.";
     }
   })();
   const principalLabel = (
@@ -2406,15 +2408,17 @@ function renderPaperclipWakePromptBody(
       ]
     : recoveryScoped
       ? [
-          "Recovery contract: your job is to RECOVER this task, not to do the work. Do not produce the deliverable yourself.",
+          "Recovery contract: restore the task's valid execution path while preserving its existing ownership and approved scope.",
+          "If you are the original assignee, remain accountable for the task. Do not hand the task back to yourself or speak as though its owner is a different agent. Resume approved work only after the recovery outcome and required execution gates permit it; a disposition-only or quota-wait recovery remains limited to that action.",
+          "If you are a different recovery agent, repair only the authorized recovery scope and return the task to its original assignee through a supported handoff. Do not take over the deliverable without explicit authorized reassignment or escalation.",
           `Cause-specific instruction: ${recoveryInstruction}`,
           ...(recovery?.cause === "successful_run_missing_state" ||
           recovery?.cause === "successful_run_missing_issue_disposition"
             ? []
             : [
-                "Record the outcome in the resolve call's `resolutionNote`. Any comment you post on the source issue must be ≤3 lines (cause → what you did → hand-back). No headings, no run-by-run narrative.",
+                "Record the outcome in the resolve call's `resolutionNote`. Keep detailed recovery evidence in the resolution record or issue documents; explain the useful outcome, limitation and next action conversationally without imposing a line count or fixed template.",
               ]),
-          `Fallback preference order: (1) send back to ${originalAssigneeLabel} with a retry instruction; (2) fix the runtime/adapter/workspace problem, then send it back; (3) reassign to another agent with the right specialty; (4) convert to an explicit manual-review state for the board.`,
+          `Fallback preference order: (1) restore ${originalAssigneeLabel}'s supported execution path; (2) fix the runtime/adapter/workspace problem, then restore that path; (3) request authorized reassignment to an agent with the right specialty; (4) record an explicit manual-review state for the board when necessary. Preserve approvals, checkout, pause/cancel, budget and company boundaries.`,
           "",
         ]
       : [];
