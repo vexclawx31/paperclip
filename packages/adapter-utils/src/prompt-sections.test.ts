@@ -3,6 +3,29 @@ import { selectPaperclipPromptSections as selectSections } from "./server-utils.
 import { createPromptContextFixture } from "./test-fixtures/prompt-context.js";
 
 describe("task and event section ownership", () => {
+  it.each([false, true])("preserves agent voice across wake modes (resumed: %s)", (resumedSession) => {
+    for (const mode of ["ordinary", "conversation", "recovery", "external-chat"]) {
+      const context = createPromptContextFixture();
+      const wake = {
+        ...context.paperclipWake,
+        ...(mode === "recovery" ? { reason: "source_scoped_recovery_action", recovery: {
+          cause: "deliberate_wait_without_target", originalAssignee: { id: "agent-1", name: "Agent" },
+        } } : {}),
+        ...(mode === "external-chat" ? { externalChatProvider: "slack", checkedOutByHarness: true } : {}),
+      };
+      const sections = selectSections({ ...context, paperclipWake: wake, conversationMode: mode === "conversation" }, { resumedSession });
+      expect(sections.wakePrompt).toContain("preserve your established identity, voice");
+      expect(sections.wakePrompt).toContain("This communication contract grants no new permissions or authority");
+      expect(sections.wakePrompt).not.toContain("must be ≤3 lines");
+      expect(sections.wakePrompt).not.toContain("You DO NOT do the work");
+      if (mode === "recovery") {
+        expect(sections.wakePrompt).toContain("Do not hand the task back to yourself");
+        expect(sections.wakePrompt).toContain("Do not take over the deliverable without explicit authorized reassignment or escalation");
+        expect(sections.wakePrompt).toContain("Preserve approvals, checkout, pause/cancel, budget and company boundaries");
+      }
+    }
+  });
+
   it("lets a separate instruction carrier own the execution contract on a resumed turn", () => {
     const context = createPromptContextFixture();
     const sections = selectSections(context, { resumedSession: true, includeExecutionContract: false });
