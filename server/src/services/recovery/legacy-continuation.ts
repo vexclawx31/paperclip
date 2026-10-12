@@ -1,9 +1,4 @@
 import { createHash } from "node:crypto";
-import {
-  TASK_TOOL_RECEIPT_DETAIL_KEY,
-  TASK_TOOL_STATUS_OPERATION,
-  TASK_TOOL_STATUS_RECEIPT_ACTIONS,
-} from "../run-owned-state.js";
 
 /** This contract deliberately has no narrative, liveness label or progress count. */
 export interface LegacyContinuationInput {
@@ -95,33 +90,35 @@ export function isBoundLegacyDispositionRepairRun(run: BindingRun, source: Bindi
     episode.attempt >= 1 && episode.attempt <= episode.maxAttempts;
 }
 /**
- * Attribution by committed, monotonic state, not activity timestamps (issue
- * activity is written after the issue commit, so its order is not transition
- * order). The repair run must hold a completed task-tool status receipt whose
- * route-committed `status` and `statusVersion` equal the issue's current ones.
- * `status_version` is bumped by a database trigger on every status change, so
- * any later transition, including A -> B -> A, breaks the match. No matching
- * receipt (another lane, a crash before the receipt, a foreign run/agent)
- * means the prose is shown.
+ * Attribution from committed state that the normal issue API already
+ * produces, without activity ordering (route activity can be written after the
+ * issue commit, so its order is not transition order):
+ *  - `dispositionRepairIssueStatusVersion` is the issue's `status_version`
+ *    when recovery scheduled this repair (server-owned context). A database
+ *    trigger bumps it on every status change, and re-asserting blocked bumps
+ *    it too, so `current === baseline + 1` proves exactly one status change in
+ *    the repair window. A -> B -> A, or any extra change, fails.
+ *  - The repair run itself logged a successful `issue.updated` with the
+ *    current status (only successful writes are logged).
+ * Anything else (no baseline, other runs or agents, more or fewer changes)
+ * shows the prose. Residual: if another actor made the single change and the
+ * repair re-sent the same status without a bump, the two agree on the
+ * disposition and the repair stays quiet.
  */
-export function repairRunCompletedCurrentStatus(input: {
-  run: { id: string; agentId: string };
+export function repairRunOwnsCurrentStatus(input: {
+  run: { id: string; agentId: string; contextSnapshot?: unknown };
   issue: { status: string; statusVersion: number };
-  receipts: ReadonlyArray<{ runId: string | null; agentId: string | null; actorType: string; action: string; details: unknown }>;
+  statusActivities: ReadonlyArray<{ runId: string | null; agentId: string | null; actorType: string; action: string; details: unknown }>;
 }): boolean {
-  return input.receipts.some((row) => {
-    const receipt = record(record(row.details)[TASK_TOOL_RECEIPT_DETAIL_KEY]);
-    const result = record(receipt.result);
-    return row.actorType === "agent" &&
-      row.runId === input.run.id &&
-      row.agentId === input.run.agentId &&
-      row.action === TASK_TOOL_STATUS_RECEIPT_ACTIONS.completed &&
-      receipt.operation === TASK_TOOL_STATUS_OPERATION &&
-      receipt.state === "completed" &&
-      typeof result.status === "string" && result.status === input.issue.status &&
-      typeof result.statusVersion === "number" && Number.isSafeInteger(result.statusVersion) &&
-      result.statusVersion === input.issue.statusVersion;
-  });
+  const baseline = record(input.run.contextSnapshot).dispositionRepairIssueStatusVersion;
+  if (typeof baseline !== "number" || !Number.isSafeInteger(baseline)) return false;
+  if (input.issue.statusVersion !== baseline + 1) return false;
+  return input.statusActivities.some((row) =>
+    row.actorType === "agent" &&
+    row.runId === input.run.id &&
+    row.agentId === input.run.agentId &&
+    row.action === "issue.updated" &&
+    record(row.details).status === input.issue.status);
 }
 /**
  * A bound repair may stay quiet only after it recorded a durable disposition:

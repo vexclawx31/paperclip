@@ -17,9 +17,8 @@ import {
   dispositionRepairQuietEligible,
   isBoundLegacyDispositionRepairRun,
   legacyDispositionRepairSourceRunId,
-  repairRunCompletedCurrentStatus,
+  repairRunOwnsCurrentStatus,
 } from "./legacy-continuation.js";
-import { TASK_TOOL_STATUS_RECEIPT_ACTIONS } from "../run-owned-state.js";
 
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 
@@ -87,10 +86,10 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 /**
  * Server-side quiet-presentation decision for a finishing run. True only for a
- * disposition-only legacy repair bound to its own successful source run that
- * holds a completed task-tool status receipt matching the issue's current
- * status and statusVersion exactly, and whose disposition is durable.
- * Never reads provider text or activity timestamps.
+ * disposition-only legacy repair bound to its own successful source run, whose
+ * own successful status write is the single status change since recovery
+ * scheduled it (committed status_version baseline + 1), and whose disposition
+ * is durable. Never reads provider text or activity timestamps.
  */
 export async function resolveDispositionOnlyRecoveryQuiet(
   db: Db,
@@ -105,9 +104,9 @@ export async function resolveDispositionOnlyRecoveryQuiet(
   const [issue] = await db.select().from(issues)
     .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.run.companyId))).limit(1);
   if (!issue) return false;
-  // This run's own completed task-tool status receipts. No ordering is used:
-  // the exact current statusVersion match decides.
-  const receipts = await db.select({
+  // This run's own successful issue writes (normal API activity). No ordering
+  // is used; the committed status_version baseline decides.
+  const statusActivities = await db.select({
     runId: activityLog.runId, agentId: activityLog.agentId, actorType: activityLog.actorType,
     action: activityLog.action, details: activityLog.details,
   }).from(activityLog)
@@ -117,12 +116,12 @@ export async function resolveDispositionOnlyRecoveryQuiet(
       eq(activityLog.entityId, input.issueId),
       eq(activityLog.runId, input.run.id),
       eq(activityLog.agentId, input.run.agentId),
-      eq(activityLog.action, TASK_TOOL_STATUS_RECEIPT_ACTIONS.completed),
+      eq(activityLog.action, "issue.updated"),
     ));
-  if (!repairRunCompletedCurrentStatus({
+  if (!repairRunOwnsCurrentStatus({
     run: input.run,
     issue: { status: issue.status, statusVersion: issue.statusVersion },
-    receipts,
+    statusActivities,
   })) {
     return false;
   }

@@ -1,4 +1,4 @@
-import { assertLocalClaudeLoginContext, localClaudeLoginEnvironment, readLocalClaudeLoginTarget, LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS, LOCAL_CLAUDE_TASK_TOOL_PROMPT, localClaudeTaskToolAllowedNames } from "./local-login.js";
+import { assertLocalClaudeLoginContext, localClaudeLoginEnvironment, readLocalClaudeLoginTarget, LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS } from "./local-login.js";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -572,9 +572,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     onLog,
   });
   const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
-  const localTaskToolAllowedNames = config.localClaudeLogin === true && !executionTargetIsRemote
-    ? localClaudeTaskToolAllowedNames(runtimeMcpServers)
-    : [];
   const runtimeMcpIdentity = JSON.stringify(
     runtimeMcpServers.map(({ name, url, connectionId }) => ({ name, url, connectionId })),
   );
@@ -874,8 +871,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     attemptInstructionsFilePath: string | undefined,
   ) => {
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
-    if (config.localClaudeLogin === true) args.push("--safe-mode", "--setting-sources", "", "--disable-slash-commands");
-    else if (config.managedAiConnection) args.push("--setting-sources", "user");
+    // Native login runs with ordinary CLI behavior (MCP, skills, settings);
+    // its isolation is the pinned HOME/command/PATH environment, not CLI flags.
+    if (config.managedAiConnection) args.push("--setting-sources", "user");
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     args.push(...buildClaudeExecutionPermissionArgs({
       dangerouslySkipPermissions,
@@ -897,12 +895,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (attemptInstructionsFilePath && !resumeSessionId) {
       args.push("--append-system-prompt-file", attemptInstructionsFilePath);
     }
-    if (runtimeMcpServers.length > 0 || config.localClaudeLogin === true) {
+    if (runtimeMcpServers.length > 0) {
       args.push("--mcp-config", effectiveMcpConfigPath, "--strict-mcp-config");
     }
-    // Native login keeps default permissions; pre-approve only the exact
-    // run-scoped Paperclip task tools, never Bash or a command prefix.
-    if (localTaskToolAllowedNames.length > 0) args.push("--allowedTools", localTaskToolAllowedNames.join(","));
     args.push("--add-dir", effectivePromptBundleAddDir);
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;
@@ -943,8 +938,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionHandoffNote,
       taskContextNote,
       renderedPrompt,
-      // Admitted native-login runs only; every attempt, including resumes.
-      localTaskToolAllowedNames.length > 0 ? LOCAL_CLAUDE_TASK_TOOL_PROMPT : "",
     ]);
     const promptMetrics = {
       promptChars: prompt.length,

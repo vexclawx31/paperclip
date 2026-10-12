@@ -7,9 +7,8 @@ import {
   dispositionRepairQuietEligible,
   isBoundLegacyDispositionRepairRun,
   legacyDispositionRepairSourceRunId,
-  repairRunCompletedCurrentStatus,
+  repairRunOwnsCurrentStatus,
 } from "../services/recovery/legacy-continuation.js";
-import { TASK_TOOL_RECEIPT_DETAIL_KEY, TASK_TOOL_STATUS_RECEIPT_ACTIONS } from "../services/run-owned-state.js";
 
 // Synthetic identities only.
 const source = {
@@ -100,40 +99,32 @@ describe("disposition-only recovery presentation", () => {
   });
 });
 
-describe("repair-run attribution by completed task-tool status receipt", () => {
-  const repairRun = { id: "run-repair", agentId: "agent-a" };
-  const receiptDetails = (result: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
-    [TASK_TOOL_RECEIPT_DETAIL_KEY]: { operation: "update_task_status", key: "k", digest: "d", state: "completed", result, ...extra },
-  });
-  const completed = {
-    runId: "run-repair", agentId: "agent-a", actorType: "agent",
-    action: TASK_TOOL_STATUS_RECEIPT_ACTIONS.completed,
-    details: receiptDetails({ status: "done", statusVersion: 4 }),
-  };
+describe("repair-run attribution from normal API status writes", () => {
+  // Baseline 3 recorded at scheduling; the repair's own write made it 4.
+  const repairRun = { id: "run-repair", agentId: "agent-a", contextSnapshot: { dispositionRepairIssueStatusVersion: 3 } };
+  const write = { runId: "run-repair", agentId: "agent-a", actorType: "agent", action: "issue.updated", details: { status: "done" } };
   const issue = { status: "done", statusVersion: 4 };
-  it("accepts the repair run's own completed receipt at the exact current version", () => {
-    expect(repairRunCompletedCurrentStatus({ run: repairRun, issue, receipts: [completed] })).toBe(true);
+  it("accepts the repair's own write as the single status change since scheduling", () => {
+    expect(repairRunOwnsCurrentStatus({ run: repairRun, issue, statusActivities: [write] })).toBe(true);
   });
-  it("matches any of the run's receipts without relying on order", () => {
-    const older = { ...completed, details: receiptDetails({ status: "in_review", statusVersion: 3 }) };
-    expect(repairRunCompletedCurrentStatus({ run: repairRun, issue, receipts: [completed, older] })).toBe(true);
-    expect(repairRunCompletedCurrentStatus({ run: repairRun, issue, receipts: [older, completed] })).toBe(true);
+  it("does not depend on activity order", () => {
+    const earlier = { ...write, details: { status: "in_progress" } };
+    expect(repairRunOwnsCurrentStatus({ run: repairRun, issue, statusActivities: [earlier, write] })).toBe(true);
+    expect(repairRunOwnsCurrentStatus({ run: repairRun, issue, statusActivities: [write, earlier] })).toBe(true);
   });
   it.each([
-    ["no receipt (crash before receipt or another lane)", [], issue],
-    ["A -> B -> A after the repair (version advanced)", [completed], { status: "done", statusVersion: 6 }],
-    ["status changed since", [completed], { status: "in_review", statusVersion: 5 }],
-    ["another run", [{ ...completed, runId: "run-other" }], issue],
-    ["another agent", [{ ...completed, agentId: "agent-b" }], issue],
-    ["board actor", [{ ...completed, actorType: "user" }], issue],
-    ["pending reservation", [{ ...completed, action: TASK_TOOL_STATUS_RECEIPT_ACTIONS.pending, details: receiptDetails({ status: "done", statusVersion: 4 }, { state: "pending" }) }], issue],
-    ["released reservation", [{ ...completed, action: TASK_TOOL_STATUS_RECEIPT_ACTIONS.released, details: receiptDetails({}, { state: "released" }) }], issue],
-    ["comment receipt", [{ ...completed, details: receiptDetails({ status: "done", statusVersion: 4 }, { operation: "add_task_comment" }) }], issue],
-    ["missing version", [{ ...completed, details: receiptDetails({ status: "done", statusVersion: null }) }], issue],
-    ["string version", [{ ...completed, details: receiptDetails({ status: "done", statusVersion: "4" }) }], issue],
-    ["plain issue.updated activity", [{ ...completed, action: "issue.updated", details: { status: "done" } }], issue],
-  ] as const)("rejects %s", (_label, receipts, current) => {
-    expect(repairRunCompletedCurrentStatus({ run: repairRun, issue: current, receipts })).toBe(false);
+    ["no status write by the repair", [], issue, repairRun],
+    ["A -> B -> A after the repair (two more changes)", [write], { status: "done", statusVersion: 6 }, repairRun],
+    ["no status change at all", [write], { status: "done", statusVersion: 3 }, repairRun],
+    ["status differs from the repair's write", [write], { status: "in_review", statusVersion: 4 }, repairRun],
+    ["another run", [{ ...write, runId: "run-other" }], issue, repairRun],
+    ["another agent", [{ ...write, agentId: "agent-b" }], issue, repairRun],
+    ["board actor", [{ ...write, actorType: "user" }], issue, repairRun],
+    ["non-update activity", [{ ...write, action: "issue.comment_added" }], issue, repairRun],
+    ["missing baseline (older repair context)", [write], issue, { ...repairRun, contextSnapshot: {} }],
+    ["string baseline", [write], issue, { ...repairRun, contextSnapshot: { dispositionRepairIssueStatusVersion: "3" } }],
+  ] as const)("rejects %s", (_label, statusActivities, current, run) => {
+    expect(repairRunOwnsCurrentStatus({ run, issue: current, statusActivities })).toBe(false);
   });
   it("requires durable structure for waiting dispositions", () => {
     expect(dispositionRepairQuietEligible({ status: "done", unblockDescriptor: null, hasDurableWaitingPath: false })).toBe(true);

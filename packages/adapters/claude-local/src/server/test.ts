@@ -373,8 +373,7 @@ export async function testEnvironment(
       }
 
       const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
-      if (config.localClaudeLogin === true) args.push("--safe-mode", "--setting-sources", "", "--disable-slash-commands", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}");
-      else if (config.managedAiConnection) args.push("--setting-sources", "user");
+      if (config.managedAiConnection) args.push("--setting-sources", "user");
       args.push(...buildClaudeProbePermissionArgs({
         dangerouslySkipPermissions,
         targetIsRemote,

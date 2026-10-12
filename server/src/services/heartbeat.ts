@@ -2,10 +2,7 @@ import { externalObjectService } from "./external-objects.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
-import { LOCAL_CLAUDE_TASK_TOOL_SERVER } from "@paperclipai/adapter-claude-local/server";
 import { resolveDispositionOnlyRecoveryQuiet } from "./recovery/disposition-repair.js";
-import { enableTaskToolsForRun, shouldDeliverTaskTools } from "./task-tools.js";
-import { preserveRunTaskToolCapabilitySql } from "./run-owned-state.js";
 
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { restoreNativeWorkspaceBestEffort } from "./native-runtime/native-workspace-best-effort.js";
@@ -24776,19 +24773,6 @@ export function heartbeatService(
               runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
                 token: authToken, connectionId: "paperclip-project-tools" });
             }
-            // Explicit native-login opt-in only: run-JWT task comment/status tools.
-            // The server stamps the capability into this run's own context; the
-            // endpoint admits only stamped runs. Ordinary, managed, and remote
-            // runs never receive this server or the capability.
-            if (shouldDeliverTaskTools({
-                  localClaudeLogin: runtimeConfig.localClaudeLogin, adapterType: agent.adapterType,
-                  executionTargetKind: executionTarget?.kind, hasRunToken: Boolean(authToken),
-                  hasApiBaseUrl: Boolean(configuredPaperclipApiBaseUrl()), issueId: issueRef?.id,
-                }) && authToken && issueRef &&
-                await enableTaskToolsForRun(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id, issueId: issueRef.id })) {
-              runtimeMcpServers.unshift({ name: LOCAL_CLAUDE_TASK_TOOL_SERVER.name, url: `${paperclipApiBaseUrl()}/api/mcp/task-tools`,
-                token: authToken, connectionId: LOCAL_CLAUDE_TASK_TOOL_SERVER.connectionId });
-            }
             const runtimeMcp = createAdapterRuntimeMcpAccess(runtimeMcpServers);
             if (runtimeTools && runtimeToolDelivery === "invocation_context") {
               adapterContext.paperclipRuntimeTools = runtimeTools;
@@ -25191,9 +25175,7 @@ export function heartbeatService(
           await db
             .update(heartbeatRuns)
             .set({
-              // Keep the server-stamped task-tool capability; `context` is a
-              // pre-delivery copy that does not carry it.
-              contextSnapshot: preserveRunTaskToolCapabilitySql(context),
+              contextSnapshot: context,
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));

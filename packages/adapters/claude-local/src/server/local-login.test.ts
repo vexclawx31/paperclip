@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { assertLocalClaudeLoginContext, localClaudeLoginEnvironment, readLocalClaudeLoginTarget, LOCAL_CLAUDE_AUTH_KEYS, localClaudeTaskToolAllowedNames } from "./local-login.js";
+import { assertLocalClaudeLoginContext, localClaudeLoginEnvironment, readLocalClaudeLoginTarget, LOCAL_CLAUDE_AUTH_KEYS } from "./local-login.js";
 const target = { companyId: "company-fixture", agentId: "agent-fixture", userId: "user-fixture", host: "host.fixture", uid: 501, home: "/synthetic/home", configDir: "/synthetic/home/.claude", model: "claude-opus-5-5", command: "/synthetic/bin/claude", path: "/synthetic/bin:/usr/bin:/bin" };
 beforeEach(() => vi.stubEnv("PAPERCLIP_LOCAL_CLAUDE_LOGIN_TARGET_JSON", JSON.stringify(target)));
 afterEach(() => vi.unstubAllEnvs());
@@ -31,20 +31,4 @@ describe("explicit bounded native Claude login", () => {
    // Default-home mode: native Claude derives HOME/.claude itself; an explicit dir selects another credential context.
    expect("CLAUDE_CONFIG_DIR" in env).toBe(false);expect("claude_config_dir" in env).toBe(false);
  });
-});
-describe("run-scoped task tool admission", () => {
- const task = { name: "paperclip-task", connectionId: "paperclip-task-tools", url: "http://paperclip.test/api/mcp/task-tools" };
- const projects = { name: "Paperclip projects", connectionId: "paperclip-project-tools", url: "http://paperclip.test/api/mcp/project-tools" };
- it("admits only the exact semantic tools of the delivered task server", () => {
-   expect(localClaudeTaskToolAllowedNames([task, projects])).toEqual(["mcp__paperclip-task__add_task_comment", "mcp__paperclip-task__update_task_status"]);
-   for (const name of localClaudeTaskToolAllowedNames([task, projects])) expect(name).not.toMatch(/Bash|\*|\(|project/);
- });
- it.each([
-   ["no task server", [projects]],
-   ["duplicate task servers", [task, { ...task, url: "http://evil.test/api/mcp/task-tools" }]],
-   ["renamed task server", [{ ...task, name: "Paperclip projects" }]],
-   ["name collision", [task, { ...projects, name: "paperclip-task" }]],
-   ["foreign endpoint", [{ ...task, url: "http://paperclip.test/api/mcp/project-tools" }]],
-   ["impersonating name", [{ ...projects, name: "paperclip-task" }]],
- ])("admits nothing for %s", (_label, servers) => expect(localClaudeTaskToolAllowedNames(servers)).toEqual([]));
 });
