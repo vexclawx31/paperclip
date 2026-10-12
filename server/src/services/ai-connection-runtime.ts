@@ -17,6 +17,7 @@ import { decideCodexAuthMerge, withAccountHomeSecretMutationLock } from "@paperc
 import { WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
+import { assertLocalClaudeLoginContext, localClaudeLoginEnvironment, readLocalClaudeLoginTarget } from "@paperclipai/adapter-claude-local/server";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
@@ -221,6 +222,32 @@ export async function prepareManagedAiRuntime(
     config: Record<string, unknown>;
   },
 ) {
+  if (input.config.localClaudeLogin === true) {
+    assertLocalClaudeLoginContext({ companyId: input.companyId, agentId: input.agentId,
+      userId: input.responsibleUserId, adapterType: input.adapterType, config: input.config });
+    if (input.binding.provider !== "anthropic" || input.binding.method !== "subscription" || input.binding.mode !== "responsible_user") {
+      throw unprocessable("Local Claude login requires the explicit local subscription context");
+    }
+    const localTarget = readLocalClaudeLoginTarget();
+    await assertManagedAiProjectAuth(input.config, "anthropic");
+    for (const file of ["settings.json", "settings.local.json"]) {
+      try {
+        const settings = await readFile(path.join(localTarget.configDir, file), "utf8");
+        if (/apiKeyHelper|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN/.test(settings)) {
+          throw unprocessable("Native Claude settings contain competing authentication configuration");
+        }
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+    const identity = `local-claude:${input.companyId}:${input.agentId}:${input.responsibleUserId}`;
+    // Native Claude owns login and refresh, so the session identity is the
+    // admitted principal itself; no Paperclip-held credential revision exists.
+    return { sessionIdentity: identity,
+      config: { ...input.config, managedAiRouting: undefined, command: localTarget.command, localClaudeLoginAgentId: input.agentId, env: localClaudeLoginEnvironment((input.config.env ?? {}) as Record<string, unknown>) },
+      attribution: { connectionId: "local-native", grantId: "local-native", provider: "anthropic" as const,
+        method: "subscription" as const, mode: "responsible_user" as const, responsibleUserId: input.responsibleUserId,
+        source: "local_claude_login" }, accountName: "Local Claude Code login", accountOwnerUserId: localTarget.userId,
+      identity, home: undefined, cleanup: async () => {} };
+  }
   const configuredEnv =
     input.config.env && typeof input.config.env === "object"
       ? (input.config.env as Record<string, unknown>)

@@ -3164,6 +3164,9 @@ export function recoveryService(
         ...(input.legacyEpisode ? {
           legacyDispositionEpisode: { ...input.legacyEpisode, attempt: input.attempt },
           dispositionRepairSourceRunId: input.latestRun?.id ?? null,
+          // Committed status version when the repair was scheduled. Quiet
+          // presentation requires exactly one status change since then.
+          dispositionRepairIssueStatusVersion: input.issue.statusVersion,
         } : {}),
         bypassContinuationSummaryPark: true,
         dispositionRepairInstruction:

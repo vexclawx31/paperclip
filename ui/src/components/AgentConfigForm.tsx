@@ -1,6 +1,7 @@
 import { useConnectionModels } from "./ai-connections/useConnectionModels";
 import { aiRoutingHarness } from "@paperclipai/shared";
 import { AiConnectionField } from "./ai-connections/AiConnectionField";
+import { LocalClaudeLoginSource } from "./LocalClaudeLoginSource";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema } from "@paperclipai/shared";
 import { testAgentSetup } from "@/lib/test-agent-setup";
 import { setupEfforts } from "../lib/agent-setup-fields";
@@ -1686,7 +1687,10 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
             </Field>
           )}
 
-          {!isDotRunner && !isCreate && selectedCompanyId && <AiConnectionField companyId={selectedCompanyId} agentId={props.agent.id} agentName={props.agent.name} adapterType={aiRoutingHarness(adapterType, eff("adapterConfig", "provider", config.provider), eff("adapterConfig", "acpxAgent", config.acpxAgent))}
+          {!isDotRunner && !isCreate && <LocalClaudeLoginSource companyId={selectedCompanyId ?? ""} agentId={props.agent.id} adapterType={adapterType}
+            enabled={eff("adapterConfig", "localClaudeLogin", config.localClaudeLogin) === true}
+            onChange={enabled => mark("adapterConfig", "localClaudeLogin", enabled)} />}
+          {!isDotRunner && !isCreate && selectedCompanyId && eff("adapterConfig", "localClaudeLogin", config.localClaudeLogin) !== true && <AiConnectionField companyId={selectedCompanyId} agentId={props.agent.id} agentName={props.agent.name} adapterType={aiRoutingHarness(adapterType, eff("adapterConfig", "provider", config.provider), eff("adapterConfig", "acpxAgent", config.acpxAgent))}
             routerAdapterType={adapterType} value={aiRuntimeConnectionBindingSchema.safeParse((overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection).data}
             model={String(eff("adapterConfig", "model", config.model) ?? "")} environmentId={currentDefaultEnvironmentId || undefined} legacy
             onChange={binding => mark("runtime", "runtimeConfig", { ...runtimeConfig, aiConnection: binding })} />}
