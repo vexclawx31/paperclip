@@ -1,4 +1,4 @@
-import { assertLocalClaudeLoginContext, localClaudeLoginEnvironment, readLocalClaudeLoginTarget } from "./local-login.js";
+import { assertLocalClaudeLoginContext, localClaudeLoginEnvironment, readLocalClaudeLoginTarget, LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS } from "./local-login.js";
 import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestContext,
@@ -93,6 +93,7 @@ export async function testEnvironment(
   const localLoginTarget = config.localClaudeLogin === true ? readLocalClaudeLoginTarget() : null;
   const command = localLoginTarget?.command ?? asString(config.command, "claude");
   const stripHostLoaderEnv = localLoginTarget !== null;
+  const unsetEnvKeys = localLoginTarget ? LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS : undefined;
   const target = ctx.executionTarget ?? null;
   const targetIsRemote = target?.kind === "remote";
   const targetIsSandbox = target?.kind === "remote" && target.transport === "sandbox";
@@ -130,7 +131,12 @@ export async function testEnvironment(
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") env[key] = value;
   }
-  if (config.localClaudeLogin === true) Object.assign(env, localClaudeLoginEnvironment(env));
+  if (localLoginTarget) {
+    // Replace, not merge: keys removed by the native-login shaping must not survive.
+    const localEnv = localClaudeLoginEnvironment(env) as Record<string, string>;
+    for (const key of Object.keys(env)) if (!(key in localEnv)) delete env[key];
+    Object.assign(env, localEnv);
+  }
   // For a local probe, resolve the trusted `claude` executable and a
   // deny-by-default child env from the shared builder, so a hostile caller
   // value can neither select the executable nor reach the child. A remote
@@ -293,6 +299,7 @@ export async function testEnvironment(
       timeoutSec: 45,
       graceSec: 5,
       stripHostLoaderEnv,
+      unsetEnvKeys,
     });
     if (
       !detectedCliVersion ||
@@ -408,6 +415,7 @@ export async function testEnvironment(
           stdin: "Respond with hello.",
           onLog: async () => {},
           stripHostLoaderEnv,
+          unsetEnvKeys,
         },
       );
 

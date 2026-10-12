@@ -14,15 +14,21 @@ describe("explicit bounded native Claude login", () => {
    vi.stubEnv("PAPERCLIP_LOCAL_CLAUDE_LOGIN_TARGET_JSON", value);
    expect(() => readLocalClaudeLoginTarget()).toThrow();
  });
+ it.each(["/synthetic/home/.claude-custom", "/synthetic/home/.claude/", "/synthetic/home/nested/.claude", "/synthetic/other/.claude"])("denies non-default config dir %s", configDir => {
+   vi.stubEnv("PAPERCLIP_LOCAL_CLAUDE_LOGIN_TARGET_JSON", JSON.stringify({...target, configDir}));
+   expect(() => readLocalClaudeLoginTarget()).toThrow();
+ });
  it("accepts only the admitted local principal", () => expect(() => assertLocalClaudeLoginContext(input, host)).not.toThrow());
  it.each([{companyId:"other"},{agentId:"other"},{userId:"other"},{userId:null},{adapterType:"codex_local"},{remote:true}])("denies foreign or remote context %j", change => expect(() => assertLocalClaudeLoginContext({...input,...change},host)).toThrow());
  it.each([{hostname:"other"},{uid:0},{home:"/root"}])("denies another host/user %j", change => expect(() => assertLocalClaudeLoginContext(input,{...host,...change})).toThrow());
  it.each([{engine:"acp"},{model:"other"},{filesystemScope:"workspace"},{networkScope:"allowlist"},{managedAiConnection:{}},{extraArgs:["--settings=x"]},{extraArgs:["--fallback-model", "other"]},{command:"/workspace/fake"},{env:{NODE_OPTIONS:"--require=/workspace/fake"}},{env:{PATH:"/workspace"}}])("denies competing execution %j", change => expect(() => assertLocalClaudeLoginContext({...input,config:{...input.config,...change}},host)).toThrow());
  it("blanks competing auth without altering task credentials or permissions", () => {
-   const env = localClaudeLoginEnvironment({CLAUDE_CODE_OAUTH_TOKEN:"synthetic",anthropic_api_key:"synthetic",PAPERCLIP_API_KEY:"task-fixture",OTHER:"kept",NODE_OPTIONS:"--require=fixture",DYLD_INSERT_LIBRARIES:"fixture"});
+   const env = localClaudeLoginEnvironment({CLAUDE_CODE_OAUTH_TOKEN:"synthetic",anthropic_api_key:"synthetic",PAPERCLIP_API_KEY:"task-fixture",OTHER:"kept",NODE_OPTIONS:"--require=fixture",DYLD_INSERT_LIBRARIES:"fixture",CLAUDE_CONFIG_DIR:"/synthetic/hostile",claude_config_dir:"/synthetic/hostile"});
    for (const key of LOCAL_CLAUDE_AUTH_KEYS) expect(env[key]).toBe("");
    expect(env.anthropic_api_key).toBeUndefined();expect(env.PAPERCLIP_API_KEY).toBe("task-fixture");expect(env.OTHER).toBe("kept");
    expect(env.NODE_OPTIONS).toBeUndefined();expect(env.DYLD_INSERT_LIBRARIES).toBeUndefined();expect(env.PATH).toBe(target.path);
-   expect(env.HOME).toBe(target.home);expect(env.CLAUDE_CONFIG_DIR).toBe(target.configDir);expect(input.config.dangerouslySkipPermissions).toBe(false);
+   expect(env.HOME).toBe(target.home);expect(input.config.dangerouslySkipPermissions).toBe(false);
+   // Default-home mode: native Claude derives HOME/.claude itself; an explicit dir selects another credential context.
+   expect("CLAUDE_CONFIG_DIR" in env).toBe(false);expect("claude_config_dir" in env).toBe(false);
  });
 });

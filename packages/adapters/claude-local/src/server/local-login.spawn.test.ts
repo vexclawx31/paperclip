@@ -62,7 +62,9 @@ beforeEach(async () => {
   vi.stubEnv("PATH", `${hostBin}:/usr/bin:/bin`);
   vi.stubEnv("PAPERCLIP_HOME", path.join(root, "paperclip-home"));
   vi.stubEnv("PAPERCLIP_INSTANCE_ID", "synthetic");
+  // Hostile inherited config dirs: default-home mode must omit them at final spawn.
   vi.stubEnv("CLAUDE_CONFIG_DIR", "/synthetic/host/claude-config");
+  vi.stubEnv("claude_config_dir", "/synthetic/host/claude-config-lower");
   vi.stubEnv("ANTHROPIC_API_KEY", "synthetic-host-provider-value");
   vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-host-provider-value");
   for (const [key, value] of Object.entries(HOST_LOADER_ENV)) vi.stubEnv(key, value);
@@ -88,7 +90,8 @@ function expectAdmittedChildEnv(env: Record<string, string>) {
   expect(env.PAPERCLIP_LOCAL_CLAUDE_LOGIN_TARGET_JSON).toBeUndefined();
   expect(env.PATH).toBe(fixture.target.path);
   expect(env.HOME).toBe(fixture.target.home);
-  expect(env.CLAUDE_CONFIG_DIR).toBe(fixture.target.configDir);
+  // Native Claude derives HOME/.claude itself; any explicit dir selects another credential context.
+  for (const key of Object.keys(env)) expect(key.toUpperCase()).not.toBe("CLAUDE_CONFIG_DIR");
   expect(env.ANTHROPIC_API_KEY).toBe("");
   expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("");
 }
@@ -101,7 +104,7 @@ describe("admitted native Claude login final child env", () => {
         adapterType: "claude_local", adapterConfig: {} },
       runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
       config: { localClaudeLogin: true, engine: "cli", model: "claude-opus-5-5", cwd: fixture.workspace,
-        promptTemplate: "Synthetic prompt." },
+        promptTemplate: "Synthetic prompt.", env: { CLAUDE_CONFIG_DIR: "/synthetic/configured/claude-config" } },
       context: {},
       authToken: "task-fixture",
       onLog: async () => {},
@@ -125,7 +128,8 @@ describe("admitted native Claude login final child env", () => {
       adapterType: "claude_local",
       config: { localClaudeLogin: true, localClaudeLoginAgentId: fixture.target.agentId, engine: "cli",
         model: "claude-opus-5-5", cwd: fixture.workspace, command: fixture.target.command,
-        env: { PATH: fixture.target.path, CLAUDE_CODE_OAUTH_TOKEN: "synthetic-config-value" } },
+        env: { PATH: fixture.target.path, CLAUDE_CODE_OAUTH_TOKEN: "synthetic-config-value",
+          CLAUDE_CONFIG_DIR: "/synthetic/configured/claude-config" } },
       executionTarget: null,
     });
     const codes = result.checks.map((check) => check.code);
@@ -138,6 +142,24 @@ describe("admitted native Claude login final child env", () => {
     expect(dumps.filter((dump) => dump.name.startsWith("admitted-version-"))).toHaveLength(1);
     expect(dumps.filter((dump) => dump.name.startsWith("admitted-run-"))).toHaveLength(1);
     for (const dump of dumps) expectAdmittedChildEnv(dump.env);
+  });
+
+  it("ordinary execute keeps its configured CLAUDE_CONFIG_DIR", async () => {
+    vi.stubEnv("PAPERCLIP_LOCAL_CLAUDE_LOGIN_TARGET_JSON", "");
+    const result = await execute({
+      runId: "run-ordinary-config-dir",
+      agent: { id: "agent-ordinary", companyId: "company-ordinary", name: "Claude",
+        adapterType: "claude_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { engine: "cli", model: "claude-opus-5-5", cwd: fixture.workspace, command: fixture.target.command,
+        promptTemplate: "Synthetic prompt.", env: { CLAUDE_CONFIG_DIR: "/synthetic/configured/claude-config" } },
+      context: {},
+      onLog: async () => {},
+    });
+    expect(result.exitCode).toBe(0);
+    const run = (await readDumps()).filter((dump) => dump.name.startsWith("admitted-run-"));
+    expect(run).toHaveLength(1);
+    expect(run[0].env.CLAUDE_CONFIG_DIR).toBe("/synthetic/configured/claude-config");
   });
 
   it("ordinary local probe keeps deny-by-default bare `claude` resolution on host PATH", async () => {

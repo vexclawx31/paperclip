@@ -15,7 +15,9 @@ export function readLocalClaudeLoginTarget(): LocalClaudeLoginTarget {
         typeof (target as unknown as Record<string, unknown>)[key] !== "string" ||
         !(target as unknown as Record<string, string>)[key].trim()) ||
       !Number.isSafeInteger(target.uid) || target.uid < 0 ||
-      !target.home.startsWith("/") || !target.configDir.startsWith(target.home + "/") ||
+      // Default-home mode only: an explicit CLAUDE_CONFIG_DIR selects a different
+      // native credential context, so other config dirs stay refused.
+      !target.home.startsWith("/") || target.configDir !== target.home + "/.claude" ||
       !target.command.startsWith("/") || target.command.includes("..") ||
       target.path.split(":").some(entry => !entry.startsWith("/") || entry.includes(".."))) {
     throw new Error("Local Claude login admission is invalid");
@@ -29,6 +31,9 @@ export const LOCAL_CLAUDE_AUTH_KEYS = [
   "AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
   "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
 ] as const;
+// Native Claude must resolve its default config under the pinned HOME. The
+// process launcher removes these after the host env merge; blanking is not enough.
+export const LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS = ["CLAUDE_CONFIG_DIR"] as const;
 export function assertLocalClaudeLoginContext(input: {
   companyId: string; agentId: string; userId?: string | null;
   adapterType?: string; config: Record<string, unknown>; remote?: boolean;
@@ -65,10 +70,10 @@ export function localClaudeLoginEnvironment(env: Record<string, unknown>): Recor
   const target = readLocalClaudeLoginTarget();
   for (const key of Object.keys(result)) {
     if (/^(NODE_OPTIONS|NODE_PATH|LD_.*|DYLD_.*|BASH_ENV|ENV|ZDOTDIR)$/i.test(key)) delete result[key];
+    if (LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS.some(unset => unset === key.toUpperCase())) delete result[key];
   }
   result.PATH = target.path;
   result.HOME = target.home;
-  result.CLAUDE_CONFIG_DIR = target.configDir;
   delete result.PAPERCLIP_LOCAL_CLAUDE_LOGIN_TARGET_JSON;
   return result;
 }

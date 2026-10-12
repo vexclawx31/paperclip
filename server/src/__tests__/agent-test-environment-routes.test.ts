@@ -258,7 +258,8 @@ describe("agent test-environment route", () => {
   });
   it("reports local source and runs current probe rather than re-verifying a stored token", async () => {
     const preparedIdentity = "synthetic-admitted-agent";
-    const preparedEnv = { HOME: "/synthetic/native-home", CLAUDE_CONFIG_DIR: "/synthetic/native-home/.claude", CLAUDE_CODE_OAUTH_TOKEN: "" };
+    // Default-home native mode: prepared env pins HOME and omits CLAUDE_CONFIG_DIR.
+    const preparedEnv = { HOME: "/synthetic/native-home", CLAUDE_CODE_OAUTH_TOKEN: "" };
     const cleanup = vi.fn();
     mockPrepareManagedAiRuntime.mockImplementation(async (_db, input) => ({
       config: { ...input.config, localClaudeLoginAgentId: preparedIdentity, env: preparedEnv },

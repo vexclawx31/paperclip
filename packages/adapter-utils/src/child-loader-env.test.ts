@@ -64,6 +64,29 @@ describe("opt-in host loader env stripping at the final spawn sink", () => {
     }
   });
 
+  it("omits explicitly unset keys even when host env and caller env supply them", async () => {
+    vi.stubEnv("CLAUDE_CONFIG_DIR", "/synthetic/host/claude-config");
+    vi.stubEnv("claude_config_dir", "/synthetic/host/claude-config-lower");
+    for (const target of [null, { kind: "local" as const }]) {
+      const result = await runAdapterExecutionTargetProcess(`loader-env-${++counter}`, target, process.execPath,
+        DUMP_ENV, { ...runOptions({ stripHostLoaderEnv: true }), unsetEnvKeys: ["CLAUDE_CONFIG_DIR"] });
+      expect(result.exitCode).toBe(0);
+      const childEnv = JSON.parse(result.stdout) as Record<string, string>;
+      for (const key of Object.keys(childEnv)) expect(key.toUpperCase()).not.toBe("CLAUDE_CONFIG_DIR");
+      expect(childEnv.HOME).toBe(PINNED_ENV.HOME);
+      expect(childEnv.PATH).toBe(PINNED_ENV.PATH);
+      expect(childEnv.PAPERCLIP_API_KEY).toBe("task-fixture");
+    }
+  });
+
+  it("keeps CLAUDE_CONFIG_DIR for callers that do not opt in", async () => {
+    vi.stubEnv("CLAUDE_CONFIG_DIR", "/synthetic/host/claude-config");
+    const result = await runChildProcess(`loader-env-${++counter}`, process.execPath, DUMP_ENV,
+      runOptions({ stripHostLoaderEnv: true }));
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).CLAUDE_CONFIG_DIR).toBe(PINNED_ENV.CLAUDE_CONFIG_DIR);
+  });
+
   it("leaves ordinary callers unchanged", async () => {
     const result = await runChildProcess(`loader-env-${++counter}`, process.execPath, DUMP_ENV, runOptions());
     expect(result.exitCode).toBe(0);
