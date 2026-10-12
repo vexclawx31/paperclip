@@ -1,3 +1,4 @@
+import { assertLocalClaudeLoginContext, localClaudeLoginEnvironment, readLocalClaudeLoginTarget } from "./local-login.js";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -171,7 +172,9 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   const { runId, agent, config, context, runtimeCommandSpec, executionTarget, authToken } = input;
   const onLog = input.onLog ?? (async () => {});
 
-  const command = asString(config.command, "claude");
+  if (config.localClaudeLogin === true) assertLocalClaudeLoginContext({ companyId: agent.companyId, agentId: agent.id,
+    config, remote: executionTarget?.kind === "remote" });
+  const command = config.localClaudeLogin === true ? readLocalClaudeLoginTarget().command : asString(config.command, "claude");
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const workspaceSource = asString(workspaceContext.source, "");
@@ -306,11 +309,19 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     env.PAPERCLIP_API_KEY = authToken;
   }
 
+  if (config.localClaudeLogin === true) Object.assign(env, localClaudeLoginEnvironment(env));
   const runtimeEnv = Object.fromEntries(
     Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
+  if (config.localClaudeLogin === true) {
+    delete runtimeEnv.PAPERCLIP_LOCAL_CLAUDE_LOGIN_TARGET_JSON;
+    for (const key of Object.keys(runtimeEnv)) {
+      if (/^(NODE_OPTIONS|NODE_PATH|LD_.*|DYLD_.*|BASH_ENV|ENV|ZDOTDIR)$/i.test(key)) delete runtimeEnv[key];
+    }
+    runtimeEnv.PATH = readLocalClaudeLoginTarget().path;
+  }
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
     executionTarget,
     asNumber(config.timeoutSec, 0),
@@ -382,6 +393,7 @@ export async function runClaudeLogin(input: {
     timeoutSec: runtime.timeoutSec,
     graceSec: runtime.graceSec,
     onLog,
+    stripHostLoaderEnv: input.config.localClaudeLogin === true,
   });
 
   const loginMeta = detectClaudeLoginRequired({
@@ -397,6 +409,8 @@ export async function runClaudeLogin(input: {
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  if (ctx.config.localClaudeLogin === true) assertLocalClaudeLoginContext({companyId: ctx.agent.companyId,
+    agentId: ctx.agent.id, config: ctx.config, remote: ctx.executionTarget?.kind === "remote"});
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
   const engineSelection = await resolveClaudeExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
@@ -847,7 +861,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     attemptInstructionsFilePath: string | undefined,
   ) => {
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
-    if (config.managedAiConnection) args.push("--setting-sources", "user");
+    if (config.localClaudeLogin === true) args.push("--safe-mode", "--setting-sources", "", "--disable-slash-commands");
+    else if (config.managedAiConnection) args.push("--setting-sources", "user");
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     args.push(...buildClaudeExecutionPermissionArgs({
       dangerouslySkipPermissions,
@@ -869,7 +884,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (attemptInstructionsFilePath && !resumeSessionId) {
       args.push("--append-system-prompt-file", attemptInstructionsFilePath);
     }
-    if (runtimeMcpServers.length > 0) {
+    if (runtimeMcpServers.length > 0 || config.localClaudeLogin === true) {
       args.push("--mcp-config", effectiveMcpConfigPath, "--strict-mcp-config");
     }
     args.push("--add-dir", effectivePromptBundleAddDir);
@@ -973,6 +988,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
       },
       localProcessSandbox,
+      stripHostLoaderEnv: config.localClaudeLogin === true,
     });
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
@@ -1269,6 +1285,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         env,
         timeoutSec,
         graceSec,
+        stripHostLoaderEnv: config.localClaudeLogin === true,
       });
       if (
         !detectedCliVersion ||

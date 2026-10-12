@@ -1,3 +1,4 @@
+export { assertLocalClaudeLoginContext, localClaudeLoginEnvironment, readLocalClaudeLoginTarget } from "./local-login.js";
 export { claudeSessionCwdMatchesExecutionTarget, execute, runClaudeLogin } from "./execute.js";
 export * from "./acp.js";
 export { getConfigSchema } from "./config-schema.js";

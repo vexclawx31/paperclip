@@ -303,6 +303,8 @@ export interface AdapterExecutionTargetProcessOptions {
    */
   settleRunDisposition?: (() => DuplexBrokerRunDisposition) | null;
   localProcessSandbox?: LocalProcessSandboxOptions | null;
+  /** Local-only opt-in: strip host loader variables from the final child env. */
+  stripHostLoaderEnv?: boolean;
 }
 
 export interface AdapterExecutionTargetShellOptions {
@@ -926,6 +928,7 @@ export async function runAdapterExecutionTargetProcess(
     onSpawn: options.onSpawn,
     terminalResultCleanup: options.terminalResultCleanup,
     localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
+    stripHostLoaderEnv: target?.kind === "local" || !target ? options.stripHostLoaderEnv : undefined,
     remoteExecution: adapterExecutionTargetToRemoteSpec(target),
   });
   // Closing an SSH client on timeout/disconnect does not prove the remote

@@ -27,7 +27,11 @@ export const LEGACY_DISPOSITION_REPAIR_INSTRUCTION =
   "The previous task run ended without a recorded disposition or an owned next execution path. " +
   "Re-read the current task state. Use Paperclip tools/API to record completion, a real blocker, " +
   "a question or approval request, or a supported next execution path. " +
-  "A final message alone does not record disposition. Respect Stop, pause, budget and approval gates.";
+  "A final message alone does not record disposition. This is a disposition-only recovery, not another user conversation turn. " +
+  "Do not repeat the previous answer or restate the existing blocker in a comment. " +
+  "When the prior answer already explains the outcome, save the lifecycle fields without a comment; keep recovery evidence in the resolution record. " +
+  "Comment only for a new material blocker, changed outcome, or concrete human action not already communicated. " +
+  "Respect Stop, pause, budget and approval gates.";
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};

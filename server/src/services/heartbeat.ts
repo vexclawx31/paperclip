@@ -21513,7 +21513,12 @@ export function heartbeatService(
         ["local", "ssh"].includes(
           selectedEnvironmentForConfig?.driver ?? "local",
         );
+      if (executionRunConfig.localClaudeLogin === true &&
+          (selectedEnvironmentForConfig && selectedEnvironmentForConfig.driver !== "local" || trustPreset.kind !== "standard")) {
+        throw new ConfigurationIncompleteFailure("Local Claude login is restricted to this host's standard local execution", {});
+      }
       const aiBinding = agent.runtimeConfig?.aiConnection ? aiConnectionBindingSchema.parse(agent.runtimeConfig.aiConnection) : undefined;
+      if (executionRunConfig.localClaudeLogin === true && !aiBinding) throw new ConfigurationIncompleteFailure("Local Claude login requires an explicit subscription binding", {});
       const { resolvedConfig, secretKeys, secretManifest } =
         await resolveExecutionRunAdapterConfig({
           managedAiCredentials: Boolean(aiBinding),
@@ -21552,7 +21557,7 @@ export function heartbeatService(
             await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake);
             return;
           }
-          if (responsibleUserId && issueId) {
+          if (responsibleUserId && issueId && resolvedConfig.localClaudeLogin !== true) {
             await connectionIntentService(db).request({ sub: agent.id, company_id: agent.companyId, run_id: run.id, responsible_user_id: responsibleUserId }, aiBinding.provider, { purpose: "ai" }).catch(() => {
               logger.warn({ runId: run.id, agentId: agent.id }, "Could not attach AI connection request; runtime configuration action remains available");
             });
@@ -22547,6 +22552,9 @@ export function heartbeatService(
       await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
       const workspaceRealization = realizationResult.workspaceRealization;
       const executionTarget = realizationResult.executionTarget;
+      if (resolvedConfig.localClaudeLogin === true && executionTarget?.kind === "remote") {
+        throw new ConfigurationIncompleteFailure("Local Claude login cannot execute on a remote or sandbox target", {});
+      }
       let instructionCopy: Awaited<ReturnType<typeof instructionCopies.prepare>> = null;
       let instructionSave: Record<string, unknown> | null = null;
       const recordInstructionSave = async (saved: NonNullable<Awaited<ReturnType<typeof instructionCopies.get>>>) => {
