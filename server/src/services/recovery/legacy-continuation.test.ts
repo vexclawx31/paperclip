@@ -8,6 +8,15 @@ const input: LegacyContinuationInput = {
   gates: { stopped: false, paused: false, budgetBlocked: false, pendingWait: false, activeExecution: false, ownedLifecycle: false, conversation: false, agentInvokable: true },
 };
 describe("legacy continuation authority", () => {
+  it("keeps disposition repair separate from another user-facing reply", () => {
+    const decision = decideLegacyContinuation(input);
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") throw new Error("expected disposition repair");
+    expect(decision.instruction).toContain("disposition-only recovery");
+    expect(decision.instruction).toContain("Do not repeat the previous answer");
+    expect(decision.instruction).toContain("without a comment");
+    expect(decision.instruction).toContain("new material blocker");
+  });
   it("requests agent repair for a successful process without a task disposition", () => {
     expect(decideLegacyContinuation(input)).toMatchObject({ kind: "enqueue", nextAttempt: 1 });
   });

@@ -1,3 +1,4 @@
+import { assertLocalClaudeLoginContext, localClaudeLoginEnvironment, readLocalClaudeLoginTarget, LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS } from "./local-login.js";
 import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestContext,
@@ -87,7 +88,12 @@ export async function testEnvironment(
 
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
-  const command = asString(config.command, "claude");
+  if (config.localClaudeLogin === true) assertLocalClaudeLoginContext({ companyId: ctx.companyId,
+    agentId: asString(config.localClaudeLoginAgentId, ""), config, remote: ctx.executionTarget?.kind === "remote" });
+  const localLoginTarget = config.localClaudeLogin === true ? readLocalClaudeLoginTarget() : null;
+  const command = localLoginTarget?.command ?? asString(config.command, "claude");
+  const stripHostLoaderEnv = localLoginTarget !== null;
+  const unsetEnvKeys = localLoginTarget ? LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS : undefined;
   const target = ctx.executionTarget ?? null;
   const targetIsRemote = target?.kind === "remote";
   const targetIsSandbox = target?.kind === "remote" && target.transport === "sandbox";
@@ -125,14 +131,26 @@ export async function testEnvironment(
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") env[key] = value;
   }
+  if (localLoginTarget) {
+    // Replace, not merge: keys removed by the native-login shaping must not survive.
+    const localEnv = localClaudeLoginEnvironment(env) as Record<string, string>;
+    for (const key of Object.keys(env)) if (!(key in localEnv)) delete env[key];
+    Object.assign(env, localEnv);
+  }
   // For a local probe, resolve the trusted `claude` executable and a
   // deny-by-default child env from the shared builder, so a hostile caller
   // value can neither select the executable nor reach the child. A remote
   // target keeps the caller command and env; the remote transport owns its own
-  // env sanitization.
+  // env sanitization. An admitted local Claude login probes the operator-pinned
+  // absolute executable directly instead of resolving `claude` on host PATH.
   const localProbe = targetIsRemote
     ? null
-    : await buildLocalAdapterTestProbeEnv({ callerEnv: env, trustedEnv: process.env });
+    : await buildLocalAdapterTestProbeEnv({
+        callerEnv: env,
+        trustedEnv: process.env,
+        admittedCommand: localLoginTarget?.command,
+      });
+  if (config.localClaudeLogin === true && localProbe) Object.assign(localProbe.env, localClaudeLoginEnvironment(localProbe.env));
   checks.push(
     ...(await prepareSandboxClaudeProbeRuntime({
       managedAiConnection: Boolean(config.managedAiConnection),
@@ -178,7 +196,7 @@ export async function testEnvironment(
   // reflect what the agent will actually see at runtime. Only consider env
   // vars from the adapter config in that case; the probe itself will surface
   // any auth issues on the remote box.
-  const considerHostEnv = !targetIsRemote && !config.managedAiConnection;
+  const considerHostEnv = !targetIsRemote && !config.managedAiConnection && config.localClaudeLogin !== true;
   const hasBedrock =
     env.CLAUDE_CODE_USE_BEDROCK === "1" ||
     env.CLAUDE_CODE_USE_BEDROCK === "true" ||
@@ -282,6 +300,8 @@ export async function testEnvironment(
       env: versionProbeEnv,
       timeoutSec: 45,
       graceSec: 5,
+      stripHostLoaderEnv,
+      unsetEnvKeys,
     });
     if (
       !detectedCliVersion ||
@@ -395,6 +415,8 @@ export async function testEnvironment(
           graceSec: 5,
           stdin: "Respond with hello.",
           onLog: async () => {},
+          stripHostLoaderEnv,
+          unsetEnvKeys,
         },
       );
 

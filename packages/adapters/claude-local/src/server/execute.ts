@@ -1,3 +1,4 @@
+import { assertLocalClaudeLoginContext, localClaudeLoginEnvironment, readLocalClaudeLoginTarget, LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS } from "./local-login.js";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
@@ -176,7 +177,9 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   const { runId, agent, config, context, runtimeCommandSpec, executionTarget, authToken } = input;
   const onLog = input.onLog ?? (async () => {});
 
-  const command = asString(config.command, "claude");
+  if (config.localClaudeLogin === true) assertLocalClaudeLoginContext({ companyId: agent.companyId, agentId: agent.id,
+    config, remote: executionTarget?.kind === "remote" });
+  const command = config.localClaudeLogin === true ? readLocalClaudeLoginTarget().command : asString(config.command, "claude");
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const workspaceSource = asString(workspaceContext.source, "");
@@ -311,11 +314,25 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     env.PAPERCLIP_API_KEY = authToken;
   }
 
+  if (config.localClaudeLogin === true) {
+    // Replace, not merge: keys removed by the native-login shaping must not survive.
+    const localEnv = localClaudeLoginEnvironment(env) as Record<string, string>;
+    for (const key of Object.keys(env)) if (!(key in localEnv)) delete env[key];
+    Object.assign(env, localEnv);
+  }
   const runtimeEnv = Object.fromEntries(
     Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
+  if (config.localClaudeLogin === true) {
+    delete runtimeEnv.PAPERCLIP_LOCAL_CLAUDE_LOGIN_TARGET_JSON;
+    for (const key of Object.keys(runtimeEnv)) {
+      if (/^(NODE_OPTIONS|NODE_PATH|LD_.*|DYLD_.*|BASH_ENV|ENV|ZDOTDIR)$/i.test(key)) delete runtimeEnv[key];
+      if (LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS.some(unset => unset === key.toUpperCase())) delete runtimeEnv[key];
+    }
+    runtimeEnv.PATH = readLocalClaudeLoginTarget().path;
+  }
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
     executionTarget,
     asNumber(config.timeoutSec, 0),
@@ -387,6 +404,8 @@ export async function runClaudeLogin(input: {
     timeoutSec: runtime.timeoutSec,
     graceSec: runtime.graceSec,
     onLog,
+    stripHostLoaderEnv: input.config.localClaudeLogin === true,
+    unsetEnvKeys: input.config.localClaudeLogin === true ? LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS : undefined,
   });
 
   const loginMeta = detectClaudeLoginRequired({
@@ -402,6 +421,8 @@ export async function runClaudeLogin(input: {
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  if (ctx.config.localClaudeLogin === true) assertLocalClaudeLoginContext({companyId: ctx.agent.companyId,
+    agentId: ctx.agent.id, config: ctx.config, remote: ctx.executionTarget?.kind === "remote"});
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
   const engineSelection = await resolveClaudeExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
@@ -489,9 +510,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     0,
     asNumber(config.terminalResultCleanupGraceMs, 5_000),
   );
+  const localLoginUnsetEnvKeys = config.localClaudeLogin === true ? LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS : undefined;
   const effectiveEnv = Object.fromEntries(
     Object.entries({ ...process.env, ...env }).filter(
-      (entry): entry is [string, string] => typeof entry[1] === "string",
+      (entry): entry is [string, string] =>
+        typeof entry[1] === "string" &&
+        !localLoginUnsetEnvKeys?.some((unset) => unset === entry[0].toUpperCase()),
     ),
   );
   const modelEnv = executionTargetIsRemote ? env : effectiveEnv;
@@ -852,6 +876,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     attemptInstructionsFilePath: string | undefined,
   ) => {
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
+    // Native login runs with ordinary CLI behavior (MCP, skills, settings);
+    // its isolation is the pinned HOME/command/PATH environment, not CLI flags.
     if (config.managedAiConnection) args.push("--setting-sources", "user");
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     args.push(...buildClaudeExecutionPermissionArgs({
@@ -990,6 +1016,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
       },
       localProcessSandbox,
+      stripHostLoaderEnv: config.localClaudeLogin === true,
+      unsetEnvKeys: localLoginUnsetEnvKeys,
     });
     await accountingLog.flush();
 
@@ -1307,6 +1335,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         env,
         timeoutSec,
         graceSec,
+        stripHostLoaderEnv: config.localClaudeLogin === true,
+        unsetEnvKeys: localLoginUnsetEnvKeys,
       });
       if (
         !detectedCliVersion ||

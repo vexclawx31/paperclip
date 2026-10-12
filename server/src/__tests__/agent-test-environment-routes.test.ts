@@ -252,6 +252,40 @@ describe("agent test-environment route", () => {
     await unregisterTestAdapter("external_test");
   });
 
+  it("rejects a native opt-in without a binding before secret resolution", async () => {
+    const app = await createApp();
+    const res = await request(app).post("/api/companies/company-1/adapters/external_test/test-environment")
+      .send({adapterConfig:{localClaudeLogin:true}});
+    expect(res.status).toBe(422);expect(mockSecretService.resolveAdapterConfigForRuntime).not.toHaveBeenCalled();expect(testEnvironmentSpy).not.toHaveBeenCalled();
+  });
+  it("rejects native mode on a remote target before runtime preparation", async () => {
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({kind:"remote",transport:"sandbox",remoteCwd:"/workspace",providerKey:"daytona",runner:{execute:vi.fn()}});
+    const app = await createApp();
+    const res = await request(app).post("/api/companies/company-1/adapters/external_test/test-environment")
+      .send({adapterConfig:{localClaudeLogin:true},environmentId:"11111111-1111-4111-8111-111111111111",aiConnection:{mode:"responsible_user",provider:"anthropic",method:"subscription"}});
+    expect(res.status).toBe(422);expect(mockPrepareManagedAiRuntime).not.toHaveBeenCalled();expect(testEnvironmentSpy).not.toHaveBeenCalled();
+  });
+  it("reports local source and runs current probe rather than re-verifying a stored token", async () => {
+    const preparedIdentity = "synthetic-admitted-agent";
+    // Default-home native mode: prepared env pins HOME and omits CLAUDE_CONFIG_DIR.
+    const preparedEnv = { HOME: "/synthetic/native-home", CLAUDE_CODE_OAUTH_TOKEN: "" };
+    const cleanup = vi.fn();
+    mockPrepareManagedAiRuntime.mockImplementation(async (_db, input) => ({
+      config: { ...input.config, localClaudeLoginAgentId: preparedIdentity, env: preparedEnv },
+      accountName: "Local Claude Code login", accountOwnerUserId: "local-board", cleanup,
+    }));
+    testEnvironmentSpy.mockResolvedValue({adapterType:"external_test",status:"pass",checks:[{code:"claude_hello_probe_passed",level:"info",message:"synthetic current hello"}],testedAt:new Date(0).toISOString()});
+    const app = await createApp();
+    const res = await request(app).post("/api/companies/company-1/adapters/external_test/test-environment")
+      .send({adapterConfig:{localClaudeLogin:true},aiConnection:{mode:"responsible_user",provider:"anthropic",method:"subscription"}});
+    expect(res.status,JSON.stringify(res.body)).toBe(200);expect(res.body.checks.some((c:{code:string})=>c.code==="claude_local_login_source")).toBe(true);
+    expect(mockValidateAiApiKey).not.toHaveBeenCalled();expect(testEnvironmentSpy).toHaveBeenCalledTimes(1);
+    expect(testEnvironmentSpy).toHaveBeenCalledWith(expect.objectContaining({
+      config: expect.objectContaining({ localClaudeLogin: true, localClaudeLoginAgentId: preparedIdentity, env: preparedEnv }),
+    }));
+    expect(cleanup).toHaveBeenCalledTimes(1);
+  });
+
   it("tests the instance default sandbox when the agent inherits its environment", async () => {
     const environmentId = "11111111-1111-4111-8111-111111111111";
     mockInstanceSettingsService.get.mockResolvedValue({ defaultEnvironmentId: environmentId });

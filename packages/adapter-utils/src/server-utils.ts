@@ -4688,6 +4688,8 @@ export async function ensureCommandResolvable(
   throw new Error(`Command not found in PATH: "${command}"`);
 }
 
+const HOST_LOADER_ENV_KEY = /^(NODE_OPTIONS|NODE_PATH|LD_.*|DYLD_.*|BASH_ENV|ENV|ZDOTDIR)$/i;
+
 export async function runChildProcess(
   runId: string,
   command: string,
@@ -4708,6 +4710,18 @@ export async function runChildProcess(
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
+    /**
+     * Opt-in: remove loader/startup-hook variables (NODE_OPTIONS, NODE_PATH,
+     * LD_*, DYLD_*, BASH_ENV, ENV, ZDOTDIR) from the final child env, after the
+     * host process.env merge. Ordinary callers leave this unset.
+     */
+    stripHostLoaderEnv?: boolean;
+    /**
+     * Opt-in: keys (case-insensitive) that must be absent from the final child
+     * env, even when inherited from host process.env. Ordinary callers leave
+     * this unset.
+     */
+    unsetEnvKeys?: readonly string[];
   },
 ): Promise<RunProcessResult> {
   const onLogError =
@@ -4745,8 +4759,11 @@ export async function runChildProcess(
     })
       .then((target) => {
         const childEnv = { ...mergedEnv, ...target.env };
+        const unsetEnvKeys = new Set((opts.unsetEnvKeys ?? []).map((key) => key.toUpperCase()));
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
+          else if (opts.stripHostLoaderEnv && HOST_LOADER_ENV_KEY.test(key)) delete childEnv[key];
+          else if (unsetEnvKeys.has(key.toUpperCase())) delete childEnv[key];
         }
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,

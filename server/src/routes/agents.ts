@@ -3514,6 +3514,23 @@ export function agentRoutes(
   }
 
   async function validateManagedAgentBinding(req: Request, companyId: string, agentId: string, adapterType: string, config: Record<string, unknown>, binding: AiRuntimeConnectionBinding, environmentId: string | null | undefined, test: boolean, newAgent = false) {
+    if (config.localClaudeLogin === true) {
+      if (binding.mode === "router") throw unprocessable("Local Claude login requires an explicit subscription binding");
+      const localEnvironmentId = await resolveAdapterTestEnvironmentId(companyId, environmentId);
+      if (localEnvironmentId) {
+        await assertAdapterTestEnvironmentForCompany(companyId, localEnvironmentId);
+        const environment = await environmentsSvc.getById(localEnvironmentId);
+        if (!environment || environment.driver !== "local") throw unprocessable("Local Claude login requires the local host");
+      }
+      const local = await prepareManagedAiRuntime(db, { companyId, agentId, responsibleUserId: responsibleUserForAiRequest(req), adapterType, binding, config });
+      if (test) {
+        const result = await requireServerAdapter(adapterType).testEnvironment({ companyId, adapterType, config: local.config });
+        if (!result.checks.some(check => /hello_probe_(passed|succeeded)$/.test(check.code)) || result.status === "fail") {
+          throw unprocessable("Local Claude login failed its current provider check", { code: "ai_connection_validation_failed" });
+        }
+      }
+      return undefined;
+    }
     if (binding.mode === "router") {
       const settings = await import("../services/instance-settings.js");
       if (!(await settings.instanceSettingsService(db).getExperimental()).enableAiConnectionRouters) throw unprocessable("Ask your instance operator to enable AI connection routing.");
@@ -3584,6 +3601,7 @@ export function agentRoutes(
 
       const requestedBinding = req.body.aiConnection ? aiRuntimeConnectionBindingSchema.parse(req.body.aiConnection) : undefined;
       const aiBinding = requestedBinding?.mode === "router" ? undefined : requestedBinding;
+      if (req.body.adapterConfig?.localClaudeLogin === true && !aiBinding) throw unprocessable("Local Claude login requires an explicit subscription binding");
       if (aiBinding && req.body.testCredentials && Object.keys(req.body.testCredentials).length) throw unprocessable("A managed connection test cannot override its credentials");
       const inputAdapterConfig = aiBinding ? { ...req.body.adapterConfig, env: stripAiAuthBindings(req.body.adapterConfig?.env) } : (req.body?.adapterConfig ?? {}) as Record<string, unknown>;
       const savedAgentId = typeof req.body.agentId === "string" ? req.body.agentId : null;
@@ -3775,7 +3793,13 @@ export function agentRoutes(
             effectiveAdapterConfig.apiKey = req.body.testCredentials.API_SERVER_KEY;
           }
         }
+        if (effectiveAdapterConfig.localClaudeLogin === true && executionTarget?.kind === "remote") throw unprocessable("Local Claude login cannot run remotely");
         const result = aiBinding ? await withManagedAiProbe(db, { companyId, agentId: req.body.agentId ?? "", responsibleUserId: responsibleUserForAiRequest(req), adapterType: type, binding: aiBinding, config: effectiveAdapterConfig, allowUninstalledPersonal: !req.body.agentId, allowUninstalledShared: !req.body.agentId && await canInstallSharedAiConnectionForNewAgent(db, req, companyId, aiBinding) }, async managed => {
+          if (effectiveAdapterConfig.localClaudeLogin === true) {
+            const tested = await adapter.testEnvironment({ companyId, adapterType: type, config: managed.config, executionTarget, environmentName });
+            tested.checks.unshift({ code: "claude_local_login_source", level: "info", message: "Tested local Claude Code login on the operator-admitted host/user. Native Claude owns credentials and renewal; this verdict reflects the current probe, not historical runs." });
+            return tested;
+          }
           const tested = await testManagedEnvironment(type, { companyId, adapterType: type, config: managed.config, executionTarget, environmentName }, aiBinding, managed, savedAgentId ?? undefined);
           tested.checks.unshift({ code: "ai_connection_tested", level: "info", message: `Tested ${managed.accountName} — ${managed.accountOwnerUserId ? managed.accountOwnerUserId === responsibleUserForAiRequest(req) ? "your personal account" : "the owner’s account authorized for this agent" : "company-shared account"}. Responsible user: ${req.actor.type === "agent" ? responsibleUserForAiRequest(req) ?? "unavailable" : "the signed-in user"}.` });
           return tested;

@@ -139,15 +139,20 @@ async function resolveTrustedExecutable(
  * `command` path.
  *
  * The builder never logs, returns, or reflects a proxy value in a check.
+ *
+ * `admittedCommand` is only for the operator-admitted local Claude login: the
+ * absolute executable read from server admission, never from caller config.
+ * When set, the builder uses it as-is and does not resolve a bare name.
  */
 export async function buildLocalAdapterTestProbeEnv(input: {
   callerEnv: Record<string, string>;
   trustedEnv?: NodeJS.ProcessEnv;
   commandName?: string;
+  admittedCommand?: string;
 }): Promise<LocalProbeEnvironment> {
   const trustedEnv = input.trustedEnv ?? process.env;
   const commandName = input.commandName ?? "claude";
-  const command = await resolveTrustedExecutable(commandName, trustedEnv);
+  const command = input.admittedCommand ?? await resolveTrustedExecutable(commandName, trustedEnv);
 
   const env: Record<string, string> = {};
 

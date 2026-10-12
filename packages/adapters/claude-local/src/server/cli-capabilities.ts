@@ -76,6 +76,8 @@ async function probeClaudeCommandVersion(input: {
   env: Record<string, string>;
   timeoutSec: number;
   graceSec: number;
+  stripHostLoaderEnv?: boolean;
+  unsetEnvKeys?: readonly string[];
 }): Promise<string | null> {
   const version = await runAdapterExecutionTargetProcess(
     input.runId,
@@ -88,6 +90,8 @@ async function probeClaudeCommandVersion(input: {
       timeoutSec: Math.max(1, Math.min(input.timeoutSec, 20)),
       graceSec: Math.max(1, Math.min(input.graceSec, 5)),
       onLog: async () => {},
+      stripHostLoaderEnv: input.stripHostLoaderEnv,
+      unsetEnvKeys: input.unsetEnvKeys,
     },
   );
 
@@ -103,6 +107,8 @@ export async function readClaudeCommandVersion(input: {
   env: Record<string, string>;
   timeoutSec: number;
   graceSec: number;
+  stripHostLoaderEnv?: boolean;
+  unsetEnvKeys?: readonly string[];
 }): Promise<string | null> {
   // Do not cache this probe: an operator may upgrade Claude Code while the
   // Paperclip server is running, and the next Test/run should recover without

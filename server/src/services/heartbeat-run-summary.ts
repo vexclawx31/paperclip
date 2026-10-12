@@ -133,6 +133,7 @@ export const LEGACY_WITHHELD_RUN_COMMENT =
 export const RUN_PRESENTATION_RESOLVER_VERSION = "1";
 export const CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON =
   "allow_chat_run_presentation";
+export const DISPOSITION_ONLY_RECOVERY_QUIET_REASON = "disposition_only_recovery_quiet";
 
 export type RunPresentationCommentAction = "reuse" | "create" | "none";
 export type { RunPresentationDecision } from "@paperclipai/shared";
@@ -385,6 +386,9 @@ export function resolveHeartbeatRunResponse(input: {
    * finalization. Never read this capability from provider/context JSON. */
   externalChatCommittedResponseWakeSummaryAuthorized?: boolean;
   externalChatReviewResponseSummaryAuthorized?: boolean;
+  /** Server-verified disposition-only legacy repair run (bound source run).
+   * Never derived from provider/context text. */
+  dispositionOnlyRecovery?: boolean;
   finalAgentMessage?: {
     text: string;
     sourceEventId: string | null;
@@ -532,6 +536,22 @@ export function resolveHeartbeatRunResponse(input: {
         commentAction: "reuse",
         commentId: input.existingComment.id,
         reasonCodes: ["explicit_non_progress_comment_precedence"],
+      }),
+    };
+  }
+
+  // A disposition-only repair records lifecycle state; its closing prose is
+  // bookkeeping that would repeat the source run's answer. New blockers,
+  // outcomes or human actions must be written explicitly (comment, status
+  // comment, or interaction) and are reused above. The withheld message stays
+  // in run events; the decision keeps its event id as private evidence.
+  if (input.dispositionOnlyRecovery === true) {
+    return {
+      text: null,
+      decision: decision("none", {
+        sourceEventId: input.finalAgentMessage?.sourceEventId ?? null,
+        commentAction: "none",
+        reasonCodes: [DISPOSITION_ONLY_RECOVERY_QUIET_REASON],
       }),
     };
   }

@@ -168,6 +168,7 @@ import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { nativeRetryCancellationCommitCondition, rethrowNativeCancellationLockConflict, claimCancellationRequest, startupCancellationFence } from "./native-runtime/native-cancellation-request.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
+import { resolveDispositionOnlyRecoveryQuiet } from "./recovery/disposition-repair.js";
 
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { restoreNativeWorkspaceBestEffort } from "./native-runtime/native-workspace-best-effort.js";
@@ -497,6 +498,7 @@ import {
 import {
   buildHeartbeatRunIssueComment,
   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
+  DISPOSITION_ONLY_RECOVERY_QUIET_REASON,
   findHeartbeatRunCompletionComment,
   HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS,
   HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS,
@@ -7613,6 +7615,11 @@ export function heartbeatService(
       (hasAcceptedSemanticResult(parseObject(run.resultJson)) ||
         presentationDecision.reasonCodes.includes(
           "legacy_adapter_summary_ambiguous",
+        ) ||
+        // A bound disposition-only repair is quiet by design; never wake the
+        // agent again to force the repeated answer back into the thread.
+        presentationDecision.reasonCodes.includes(
+          DISPOSITION_ONLY_RECOVERY_QUIET_REASON,
         ))
     ) {
       await patchRunIssueCommentStatus(run.id, {
@@ -14981,6 +14988,13 @@ export function heartbeatService(
         ["local", "ssh"].includes(
           selectedEnvironmentForConfig?.driver ?? "local",
         );
+      if (executionRunConfig.localClaudeLogin === true &&
+          (selectedEnvironmentForConfig && selectedEnvironmentForConfig.driver !== "local" || trustPreset.kind !== "standard")) {
+        throw new ConfigurationIncompleteFailure("Local Claude login is restricted to this host's standard local execution", {});
+      }
+      if (executionRunConfig.localClaudeLogin === true && (!aiBinding || requestedAiBinding?.mode === "router")) {
+        throw new ConfigurationIncompleteFailure("Local Claude login requires an explicit subscription binding", {});
+      }
 
       const { resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest } =
         await resolveExecutionRunAdapterConfig({
@@ -15020,7 +15034,7 @@ export function heartbeatService(
             await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake);
             return;
           }
-          if (responsibleUserId && issueId) {
+          if (responsibleUserId && issueId && resolvedConfig.localClaudeLogin !== true) {
             await connectionIntentService(db).request({ sub: agent.id, company_id: agent.companyId, run_id: run.id, responsible_user_id: responsibleUserId }, aiBinding.provider, { purpose: "ai" }).catch(() => {
               logger.warn({ runId: run.id, agentId: agent.id }, "Could not attach AI connection request; runtime configuration action remains available");
             });
@@ -16090,6 +16104,9 @@ export function heartbeatService(
       await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
       const workspaceRealization = realizationResult.workspaceRealization;
       const executionTarget = realizationResult.executionTarget;
+      if (resolvedConfig.localClaudeLogin === true && executionTarget?.kind === "remote") {
+        throw new ConfigurationIncompleteFailure("Local Claude login cannot execute on a remote or sandbox target", {});
+      }
       let instructionCopy: Awaited<ReturnType<typeof instructionCopies.prepare>> = null;
       let instructionSave: Record<string, unknown> | null = null;
       const recordInstructionSave = async (saved: NonNullable<Awaited<ReturnType<typeof instructionCopies.get>>>) => {
@@ -19197,8 +19214,14 @@ export function heartbeatService(
               livenessRun.contextSnapshot,
               externalChatPresentationAuthorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
             );
+            // Server-owned repair context, revalidated against its source run,
+            // and quiet only after a durable disposition was recorded.
+            const dispositionOnlyRecovery = await resolveDispositionOnlyRecoveryQuiet(db, {
+              run: livenessRun, issueId: issueId ?? null,
+            });
             const resolved = resolveHeartbeatRunResponse({
               resultJson: persistedResultJson,
+              dispositionOnlyRecovery,
               conversationTurnFinished: isConversation(issueContext) && livenessRun.status === "succeeded"
                 && persistedResultJson?.finalizationReasonCode === "conversation_turn_finished",
               existingComment: existingRunComment,
