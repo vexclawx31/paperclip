@@ -13,6 +13,7 @@ import {
   budgetPolicies,
   companies,
   companySkills,
+  costEvents,
   createDb,
   environmentLeases,
   environments,
@@ -74,7 +75,7 @@ describeEmbeddedPostgres("disposition-only recovery presentation through real he
     adapterErrors.length = 0;
     await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.status, "running"));
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
-    for (const table of [activityLog, environmentLeases, issueComments, issueRelations, issues, executionWorkspaces, heartbeatRunEvents, activityLog, heartbeatRuns, agentWakeupRequests, agentRuntimeState, budgetPolicies, agents, environments, companySkills, companies, authUsers]) {
+    for (const table of [costEvents, activityLog, environmentLeases, issueComments, issueRelations, issues, executionWorkspaces, heartbeatRunEvents, activityLog, heartbeatRuns, agentWakeupRequests, agentRuntimeState, budgetPolicies, agents, environments, companySkills, companies, authUsers]) {
       await db.delete(table);
     }
   });
