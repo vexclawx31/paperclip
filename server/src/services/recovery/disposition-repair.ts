@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agentWakeupRequests,
   approvals,
   heartbeatRuns,
@@ -12,6 +13,13 @@ import {
   issues,
 } from "@paperclipai/db";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
+import {
+  dispositionRepairQuietEligible,
+  isBoundLegacyDispositionRepairRun,
+  legacyDispositionRepairSourceRunId,
+  repairRunCompletedCurrentStatus,
+} from "./legacy-continuation.js";
+import { TASK_TOOL_STATUS_RECEIPT_ACTIONS } from "../run-owned-state.js";
 
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 
@@ -73,6 +81,57 @@ export function dispositionRepairDelayMs(attempt: number, fingerprint: string) {
     DISPOSITION_REPAIR_BASE_DELAYS_MS,
     "disposition repair",
   );
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Server-side quiet-presentation decision for a finishing run. True only for a
+ * disposition-only legacy repair bound to its own successful source run that
+ * holds a completed task-tool status receipt matching the issue's current
+ * status and statusVersion exactly, and whose disposition is durable.
+ * Never reads provider text or activity timestamps.
+ */
+export async function resolveDispositionOnlyRecoveryQuiet(
+  db: Db,
+  input: { run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "status" | "runtimeMode" | "contextSnapshot">; issueId: string | null },
+): Promise<boolean> {
+  if (!input.issueId || !UUID_RE.test(input.issueId)) return false;
+  const sourceId = legacyDispositionRepairSourceRunId(input.run);
+  if (!sourceId || !UUID_RE.test(sourceId)) return false;
+  const [source] = await db.select().from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.id, sourceId), eq(heartbeatRuns.companyId, input.run.companyId))).limit(1);
+  if (!isBoundLegacyDispositionRepairRun(input.run, source ?? null, input.issueId)) return false;
+  const [issue] = await db.select().from(issues)
+    .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.run.companyId))).limit(1);
+  if (!issue) return false;
+  // This run's own completed task-tool status receipts. No ordering is used:
+  // the exact current statusVersion match decides.
+  const receipts = await db.select({
+    runId: activityLog.runId, agentId: activityLog.agentId, actorType: activityLog.actorType,
+    action: activityLog.action, details: activityLog.details,
+  }).from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, input.run.companyId),
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.entityId, input.issueId),
+      eq(activityLog.runId, input.run.id),
+      eq(activityLog.agentId, input.run.agentId),
+      eq(activityLog.action, TASK_TOOL_STATUS_RECEIPT_ACTIONS.completed),
+    ));
+  if (!repairRunCompletedCurrentStatus({
+    run: input.run,
+    issue: { status: issue.status, statusVersion: issue.statusVersion },
+    receipts,
+  })) {
+    return false;
+  }
+  const state = await collectDispositionRepairSourceState(db, { issue, excludeRunId: input.run.id });
+  return dispositionRepairQuietEligible({
+    status: issue.status,
+    unblockDescriptor: issue.unblockDescriptor,
+    hasDurableWaitingPath: state.hasDurableWaitingPath,
+  });
 }
 
 export async function collectDispositionRepairSourceState(

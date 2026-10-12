@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { execute } from "./execute.js";
 import { testEnvironment } from "./test.js";
+import { LOCAL_CLAUDE_TASK_TOOL_PROMPT } from "./local-login.js";
 
 // Synthetic fixtures only: no real credential, settings, or Claude binary is read
 // or launched. The admitted "claude" is a harmless node script that records the
@@ -24,9 +25,10 @@ async function writeFakeClaude(commandPath: string, dumpDir: string, label: stri
 const fs = require("node:fs");
 const argv = process.argv.slice(2);
 const kind = argv.includes("--version") ? "version" : "run";
-fs.writeFileSync(${JSON.stringify(dumpDir)} + "/${label}-" + kind + "-" + process.pid + ".json", JSON.stringify({ argv, env: process.env }));
+let prompt = "";
+if (kind === "run") { try { prompt = fs.readFileSync(0, "utf8"); } catch {} }
+fs.writeFileSync(${JSON.stringify(dumpDir)} + "/${label}-" + kind + "-" + process.pid + ".json", JSON.stringify({ argv, env: process.env, prompt }));
 if (kind === "version") { console.log("${version} (Claude Code)"); process.exit(0); }
-try { fs.readFileSync(0, "utf8"); } catch {}
 console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "${SESSION_ID}", model: "claude-opus-5-5" }));
 console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, session_id: "${SESSION_ID}", result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }));
 `;
@@ -80,7 +82,7 @@ async function readDumps() {
   return Promise.all(names.map(async (name) => ({
     name,
     ...(JSON.parse(await fs.readFile(path.join(fixture.dumpDir, name), "utf8")) as {
-      argv: string[]; env: Record<string, string>;
+      argv: string[]; env: Record<string, string>; prompt?: string;
     }),
   })));
 }
@@ -120,6 +122,66 @@ describe("admitted native Claude login final child env", () => {
     expect(run[0].env.PAPERCLIP_API_KEY).toBe("task-fixture");
     expect(run[0].argv).toContain("--safe-mode");
     expect(run[0].argv[run[0].argv.indexOf("--model") + 1]).toBe("claude-opus-5-5");
+  });
+
+  it("pre-approves only the exact run-scoped task tools, keeping default permissions", async () => {
+    const servers = [
+      { name: "paperclip-task", url: "http://paperclip.test/api/mcp/task-tools", token: "synthetic-run-jwt", connectionId: "paperclip-task-tools" },
+      { name: "Paperclip projects", url: "http://paperclip.test/api/mcp/project-tools", token: "synthetic-run-jwt", connectionId: "paperclip-project-tools" },
+    ];
+    const base = {
+      agent: { id: fixture.target.agentId, companyId: fixture.target.companyId, name: "Claude", adapterType: "claude_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      context: {}, authToken: "task-fixture", onLog: async () => {}, runtimeMcp: { getServers: () => servers },
+    };
+    const result = await execute({ ...base, runId: "run-local-login-task-tools",
+      config: { localClaudeLogin: true, engine: "cli", model: "claude-opus-5-5", cwd: fixture.workspace,
+        dangerouslySkipPermissions: false, promptTemplate: "Synthetic prompt." } });
+    expect(result.exitCode).toBe(0);
+    const run = (await readDumps()).filter((dump) => dump.name.startsWith("admitted-run-"));
+    expect(run).toHaveLength(1);
+    const argv = run[0].argv;
+    expect(argv[argv.indexOf("--allowedTools") + 1]).toBe("mcp__paperclip-task__add_task_comment,mcp__paperclip-task__update_task_status");
+    expect(argv.filter((arg) => arg === "--allowedTools")).toHaveLength(1);
+    for (const forbidden of ["--dangerously-skip-permissions", "--permission-mode", "--allow-dangerously-skip-permissions", "--settings"]) {
+      expect(argv).not.toContain(forbidden);
+    }
+    expect(argv.join(" ")).not.toMatch(/Bash|node -e|curl/);
+    expect(argv[argv.indexOf("--setting-sources") + 1]).toBe("");
+    expect(argv).toContain("--strict-mcp-config");
+    expectAdmittedChildEnv(run[0].env);
+    expect(run[0].env.PAPERCLIP_API_KEY).toBe("task-fixture");
+    // The effective prompt directs lifecycle writes to the exact tools, not shell HTTP.
+    expect(run[0].prompt).toContain(LOCAL_CLAUDE_TASK_TOOL_PROMPT);
+    expect(run[0].prompt).toContain("mcp__paperclip-task__update_task_status");
+
+    // Ordinary execution with the same servers is unchanged: no tool admission.
+    vi.stubEnv("PAPERCLIP_LOCAL_CLAUDE_LOGIN_TARGET_JSON", "");
+    await fs.rm(fixture.dumpDir, { recursive: true, force: true });
+    await fs.mkdir(fixture.dumpDir, { recursive: true });
+    const ordinary = await execute({ ...base, runId: "run-ordinary-task-tools",
+      agent: { ...base.agent, id: "agent-ordinary", companyId: "company-ordinary" },
+      config: { engine: "cli", model: "claude-opus-5-5", cwd: fixture.workspace, command: fixture.target.command,
+        dangerouslySkipPermissions: false, promptTemplate: "Synthetic prompt." } });
+    expect(ordinary.exitCode).toBe(0);
+    const ordinaryRun = (await readDumps()).filter((dump) => dump.name.startsWith("admitted-run-"));
+    expect(ordinaryRun[0].argv).not.toContain("--allowedTools");
+    expect(ordinaryRun[0].prompt).not.toContain("Paperclip task writes in this run");
+  });
+
+  it("adds no tool guidance when the task server was not delivered", async () => {
+    const result = await execute({
+      runId: "run-local-login-no-task-tools",
+      agent: { id: fixture.target.agentId, companyId: fixture.target.companyId, name: "Claude", adapterType: "claude_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { localClaudeLogin: true, engine: "cli", model: "claude-opus-5-5", cwd: fixture.workspace,
+        dangerouslySkipPermissions: false, promptTemplate: "Synthetic prompt." },
+      context: {}, authToken: "task-fixture", onLog: async () => {},
+    });
+    expect(result.exitCode).toBe(0);
+    const run = (await readDumps()).filter((dump) => dump.name.startsWith("admitted-run-"));
+    expect(run[0].argv).not.toContain("--allowedTools");
+    expect(run[0].prompt).not.toContain("Paperclip task writes in this run");
   });
 
   it("local probe selects the admitted command and PATH even when host PATH resolves a different claude", async () => {

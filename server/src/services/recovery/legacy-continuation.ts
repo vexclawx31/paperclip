@@ -1,4 +1,9 @@
 import { createHash } from "node:crypto";
+import {
+  TASK_TOOL_RECEIPT_DETAIL_KEY,
+  TASK_TOOL_STATUS_OPERATION,
+  TASK_TOOL_STATUS_RECEIPT_ACTIONS,
+} from "../run-owned-state.js";
 
 /** This contract deliberately has no narrative, liveness label or progress count. */
 export interface LegacyContinuationInput {
@@ -59,6 +64,81 @@ export function legacyDispositionEpisode(run: {
     attempt,
     maxAttempts: handoff || oldRecovery ? 1 : LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS,
   };
+}
+type BindingRun = { id: string; companyId: string; agentId: string; status?: string | null; runtimeMode?: string | null; contextSnapshot?: unknown };
+function runIssueId(run: BindingRun) {
+  const context = record(run.contextSnapshot);
+  const value = context.issueId ?? context.taskId;
+  return typeof value === "string" && value ? value : null;
+}
+/** Source run of a persisted legacy repair; the same fallback dispatch admission uses. */
+export function legacyDispositionRepairSourceRunId(run: { contextSnapshot?: unknown }): string | null {
+  const context = record(run.contextSnapshot);
+  if (!(typeof record(context.legacyDispositionEpisode).id === "string" && record(context.legacyDispositionEpisode).id)) return null;
+  const sourceId = context.dispositionRepairSourceRunId ?? context.retryOfRunId;
+  return typeof sourceId === "string" && sourceId ? sourceId : null;
+}
+/**
+ * True only for a server-scheduled disposition-only repair run whose persisted
+ * episode is bound to a successful source run of the same company, agent and
+ * issue. Context is server-owned; provider text is never consulted.
+ */
+export function isBoundLegacyDispositionRepairRun(run: BindingRun, source: BindingRun | null, issueId: string | null): boolean {
+  const sourceId = legacyDispositionRepairSourceRunId(run);
+  if (!sourceId || !issueId || !source || run.runtimeMode === "native") return false;
+  const episode = legacyDispositionEpisode(run);
+  return source.id === sourceId && source.id !== run.id &&
+    source.companyId === run.companyId && source.agentId === run.agentId &&
+    source.status === "succeeded" &&
+    runIssueId(run) === issueId && runIssueId(source) === issueId &&
+    legacyDispositionEpisode(source).id === episode.id &&
+    episode.attempt >= 1 && episode.attempt <= episode.maxAttempts;
+}
+/**
+ * Attribution by committed, monotonic state, not activity timestamps (issue
+ * activity is written after the issue commit, so its order is not transition
+ * order). The repair run must hold a completed task-tool status receipt whose
+ * route-committed `status` and `statusVersion` equal the issue's current ones.
+ * `status_version` is bumped by a database trigger on every status change, so
+ * any later transition, including A -> B -> A, breaks the match. No matching
+ * receipt (another lane, a crash before the receipt, a foreign run/agent)
+ * means the prose is shown.
+ */
+export function repairRunCompletedCurrentStatus(input: {
+  run: { id: string; agentId: string };
+  issue: { status: string; statusVersion: number };
+  receipts: ReadonlyArray<{ runId: string | null; agentId: string | null; actorType: string; action: string; details: unknown }>;
+}): boolean {
+  return input.receipts.some((row) => {
+    const receipt = record(record(row.details)[TASK_TOOL_RECEIPT_DETAIL_KEY]);
+    const result = record(receipt.result);
+    return row.actorType === "agent" &&
+      row.runId === input.run.id &&
+      row.agentId === input.run.agentId &&
+      row.action === TASK_TOOL_STATUS_RECEIPT_ACTIONS.completed &&
+      receipt.operation === TASK_TOOL_STATUS_OPERATION &&
+      receipt.state === "completed" &&
+      typeof result.status === "string" && result.status === input.issue.status &&
+      typeof result.statusVersion === "number" && Number.isSafeInteger(result.statusVersion) &&
+      result.statusVersion === input.issue.statusVersion;
+  });
+}
+/**
+ * A bound repair may stay quiet only after it recorded a durable disposition:
+ * a terminal status, or a waiting status backed by structured evidence
+ * (blocker relation, unblock descriptor, pending interaction/approval, user
+ * owner, monitor or execution stage). Without that, its closing prose may be
+ * the only record of a new blocker or required human action, so it is shown.
+ */
+export function dispositionRepairQuietEligible(input: {
+  status: string;
+  unblockDescriptor: unknown;
+  hasDurableWaitingPath: boolean;
+}): boolean {
+  if (input.status === "done" || input.status === "cancelled") return true;
+  if (input.status === "blocked") return input.hasDurableWaitingPath || input.unblockDescriptor != null;
+  if (input.status === "in_review") return input.hasDurableWaitingPath;
+  return false;
 }
 export function legacyDispositionFingerprint(companyId: string, issueId: string, agentId: string, episodeId: string) {
   return `legacy_disposition:v1:${createHash("sha256").update(JSON.stringify([companyId, issueId, agentId, episodeId])).digest("hex")}`;

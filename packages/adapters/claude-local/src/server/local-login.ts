@@ -34,6 +34,33 @@ export const LOCAL_CLAUDE_AUTH_KEYS = [
 // Native Claude must resolve its default config under the pinned HOME. The
 // process launcher removes these after the host env merge; blanking is not enough.
 export const LOCAL_CLAUDE_LOGIN_UNSET_ENV_KEYS = ["CLAUDE_CONFIG_DIR"] as const;
+// Run-scoped task write tools delivered only to admitted native-login runs.
+// Default permissions refuse shell HTTP; these exact MCP tools are pre-approved
+// instead of any Bash/command-prefix rule. The server binds them to the run's task.
+export const LOCAL_CLAUDE_TASK_TOOL_SERVER = {
+  name: "paperclip-task",
+  connectionId: "paperclip-task-tools",
+  tools: ["add_task_comment", "update_task_status"],
+} as const;
+/** Prompt section added only when the exact task tools were admitted for this run. */
+export const LOCAL_CLAUDE_TASK_TOOL_PROMPT = [
+  "## Paperclip task writes in this run",
+  "Shell HTTP calls to the Paperclip API (curl, node, scripts) are not permitted in this run and will be refused.",
+  "Where the Paperclip skill tells you to call the API to comment on or change the status of your current task, use these tools instead:",
+  "- `mcp__paperclip-task__add_task_comment` for task comments.",
+  "- `mcp__paperclip-task__update_task_status` for in_progress, in_review, blocked or done. Blocking requires a comment explaining the blocker and an `unblockAction` naming the exact action that unblocks it.",
+  "Give every call a new `idempotencyKey`; reuse a key only to retry the identical call after a timeout. If a retry reports an unknown outcome, inspect the task before acting again.",
+  "Other Paperclip operations are unavailable here; describe what is needed in a task comment instead of attempting them through the shell.",
+].join("\n");
+/** Exact `--allowedTools` entries, or none unless the server is delivered unambiguously. */
+export function localClaudeTaskToolAllowedNames(servers: ReadonlyArray<{ name: string; connectionId: string; url: string }>): string[] {
+  const server = LOCAL_CLAUDE_TASK_TOOL_SERVER;
+  const matches = servers.filter(candidate => candidate.connectionId === server.connectionId);
+  if (matches.length !== 1 || matches[0].name !== server.name ||
+      servers.filter(candidate => candidate.name === server.name).length !== 1 ||
+      !/\/api\/mcp\/task-tools$/.test(matches[0].url)) return [];
+  return server.tools.map(tool => `mcp__${server.name}__${tool}`);
+}
 export function assertLocalClaudeLoginContext(input: {
   companyId: string; agentId: string; userId?: string | null;
   adapterType?: string; config: Record<string, unknown>; remote?: boolean;
