@@ -40,6 +40,10 @@ export async function uninstallCommand(
   dependencies: Partial<UninstallDependencies> = {},
 ): Promise<void> {
   const instanceId = resolvePaperclipInstanceId();
+  // Reject an unrelated/unverified store before touching any host service.
+  const paths = resolveInstallStorePaths();
+  const hadStore = fs.existsSync(paths.cliRoot);
+  if (hadStore) assertManagedInstallStore(paths);
   const detect = dependencies.detectServiceManager ?? detectServiceManager;
   const platform = dependencies.platform ?? process.platform;
   const userHomeDir = dependencies.userHomeDir ?? os.homedir();
@@ -67,9 +71,6 @@ export async function uninstallCommand(
     if (status.installed || status.active) await detection.manager.uninstall();
   }
 
-  const paths = resolveInstallStorePaths();
-  const hadStore = fs.existsSync(paths.cliRoot);
-  if (hadStore) assertManagedInstallStore(paths);
   const shimRemoved = await withInstallStoreLock(async () => {
     if (hadStore) assertManagedInstallStore(paths);
     const removed = removeManagedShim(paths);

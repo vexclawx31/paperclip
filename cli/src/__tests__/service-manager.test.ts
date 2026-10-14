@@ -101,8 +101,18 @@ describe("systemd drift regeneration", () => {
 });
 
 describe("service adapter dispatch", () => {
+  it.each([LaunchdServiceManager, SystemdServiceManager])("rejects direct default-runner construction before filesystem work", (Manager) => {
+    expect(() => new Manager("default")).toThrow("injected command runner");
+  });
+
+  it.each(["darwin", "linux"] as const)("refuses implicit host service access on %s in the test runtime", async (platform) => {
+    const detection = await detectServiceManager({ platform, instanceId: "default" });
+    expect(detection).toEqual({ supported: false, reason: expect.stringContaining("injected command runner") });
+  });
+
   it("selects launchd on macOS", async () => {
-    const detection = await detectServiceManager({ platform: "darwin", instanceId: "default" });
+    const runner: CommandRunner = async () => ({ stdout: "", stderr: "" });
+    const detection = await detectServiceManager({ platform: "darwin", instanceId: "default", runner });
     expect(detection.supported).toBe(true);
     if (detection.supported) expect(detection.manager).toBeInstanceOf(LaunchdServiceManager);
   });
