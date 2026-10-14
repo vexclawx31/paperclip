@@ -41,7 +41,14 @@ export interface ServiceManager {
 export type CommandResult = { stdout: string; stderr: string };
 export type CommandRunner = (command: string, args: string[], options?: { inherit?: boolean }) => Promise<CommandResult>;
 
+function isTestRuntime(): boolean {
+  return process.env.VITEST === "true" || process.env.NODE_ENV === "test";
+}
+
 export const defaultCommandRunner: CommandRunner = async (command, args, options) => {
+  // HOME and PAPERCLIP_HOME do not isolate a user's launchd/systemd namespace.
+  // Tests must inject a runner; block before spawning even for direct managers.
+  if (isTestRuntime()) throw new Error("Host service commands require an injected command runner in tests.");
   if (options?.inherit) {
     await new Promise<void>((resolve, reject) => {
       const child = execFile(command, args, { windowsHide: true }, (error) => error ? reject(error) : resolve());
@@ -207,6 +214,9 @@ export class SystemdServiceManager implements ServiceManager {
   readonly definitionPath: string;
 
   constructor(readonly instanceId: string, private readonly runner: CommandRunner = defaultCommandRunner, private readonly homeDir = resolvePaperclipHomeDir(), private readonly shimPath = resolveServiceShimPath(), userHomeDir = os.homedir()) {
+    if (isTestRuntime() && runner === defaultCommandRunner) {
+      throw new Error("Host service managers require an injected command runner in tests.");
+    }
     this.serviceName = systemdServiceName(instanceId);
     this.definitionPath = path.join(userHomeDir, ".config", "systemd", "user", this.serviceName);
   }
@@ -282,6 +292,9 @@ export class LaunchdServiceManager implements ServiceManager {
   private readonly stderrPath: string;
 
   constructor(readonly instanceId: string, private readonly runner: CommandRunner = defaultCommandRunner, private readonly homeDir = resolvePaperclipHomeDir(), private readonly shimPath = resolveServiceShimPath(), userHomeDir = os.homedir()) {
+    if (isTestRuntime() && runner === defaultCommandRunner) {
+      throw new Error("Host service managers require an injected command runner in tests.");
+    }
     this.serviceName = launchdServiceName(instanceId);
     this.definitionPath = path.join(userHomeDir, "Library", "LaunchAgents", `${this.serviceName}.plist`);
     const logDir = path.join(homeDir, "instances", instanceId, "logs");
@@ -347,6 +360,9 @@ export type ServiceManagerDetection = { supported: true; manager: ServiceManager
 
 export async function detectServiceManager(input: { instanceId?: string; platform?: NodeJS.Platform; runner?: CommandRunner } = {}): Promise<ServiceManagerDetection> {
   const instanceId = resolvePaperclipInstanceId(input.instanceId);
+  if (isTestRuntime() && (!input.runner || input.runner === defaultCommandRunner)) {
+    return { supported: false, reason: "Host service detection requires an injected command runner in tests." };
+  }
   const platform = input.platform ?? process.platform;
   const runner = input.runner ?? defaultCommandRunner;
   if (platform === "darwin") return { supported: true, manager: new LaunchdServiceManager(instanceId, runner) };

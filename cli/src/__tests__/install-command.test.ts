@@ -384,7 +384,9 @@ describe("managed install commands", () => {
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(unrelatedFile, "keep");
 
-    await expect(uninstallCommand()).rejects.toThrow("unverified install store");
+    const detectServiceManager = vi.fn();
+    await expect(uninstallCommand({ detectServiceManager })).rejects.toThrow("unverified install store");
+    expect(detectServiceManager).not.toHaveBeenCalled();
     expect(fs.readFileSync(unrelatedFile, "utf8")).toBe("keep");
   });
 
