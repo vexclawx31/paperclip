@@ -14,7 +14,13 @@ import {
 import {
   SELF_OWNED_UNBLOCK_ACTION_MAX_CHARS,
   selfOwnedUnblockAction,
+  selfOwnedUnblockInstruction,
+  UNBLOCK_REQUESTED_CONTINUATION_STATE,
 } from "../services/self-owned-unblock.js";
+import {
+  inheritedSelfUnblockBinding,
+  SELF_UNBLOCK_CONTINUATION_STATE,
+} from "../modules/wake-queue/domain/context.js";
 
 // Regression coverage for LIT-119. An agent may only name itself as the owner
 // of an unblock descriptor, so a self-owned descriptor means "I still have to
@@ -193,5 +199,28 @@ describe("self-owned descriptor is not an external wait (MUST 2)", () => {
       issue,
       selfParkedOnOwnUnblockAction: true,
     }).kind).toBe("exhausted");
+  });
+});
+
+describe("failed self-unblock follow-up keeps its action through immediate recovery (LIT-120)", () => {
+  const instruction = selfOwnedUnblockInstruction(action);
+  const bound = { livenessContinuationState: UNBLOCK_REQUESTED_CONTINUATION_STATE, livenessContinuationInstruction: instruction };
+
+  it("uses the same continuation state as the unblock wake", () => {
+    expect(SELF_UNBLOCK_CONTINUATION_STATE).toBe(UNBLOCK_REQUESTED_CONTINUATION_STATE);
+  });
+
+  it("carries only the exact bound state and instruction from an unsuccessful run", () => {
+    for (const status of ["failed", "timed_out", "interrupted", "cancelled"]) {
+      expect(inheritedSelfUnblockBinding({ status, contextSnapshot: { ...bound, issueId, livenessContinuationAttempt: 2, modelProfile: "x" } }))
+        .toEqual(bound);
+    }
+  });
+
+  it("does not re-deliver after success, without a binding, or for an oversized instruction", () => {
+    expect(inheritedSelfUnblockBinding({ status: "succeeded", contextSnapshot: bound })).toEqual({});
+    expect(inheritedSelfUnblockBinding({ status: "failed", contextSnapshot: { livenessContinuationInstruction: instruction } })).toEqual({});
+    expect(inheritedSelfUnblockBinding({ status: "failed", contextSnapshot: { ...bound, livenessContinuationState: "plan_only" } })).toEqual({});
+    expect(inheritedSelfUnblockBinding({ status: "failed", contextSnapshot: { ...bound, livenessContinuationInstruction: "x".repeat(4001) } })).toEqual({});
   });
 });

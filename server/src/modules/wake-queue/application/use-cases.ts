@@ -1,4 +1,4 @@
-import { enrichPromotedWakeContext } from "../domain/context.js";
+import { enrichPromotedWakeContext, inheritedSelfUnblockBinding } from "../domain/context.js";
 import {
   decideQueuedCommentAction,
   decideReleaseRecovery,
@@ -685,7 +685,8 @@ async function runReleaseRecoveryTail(
   // in the application layer, before the transaction port queues the run.
   const { retryReason, recoveryReason, recoverySource } =
     deriveImmediateRecoveryContextLabels(issue.status);
-  // This fresh normal-model seed carries no inherited recovery/model-profile fields.
+  // This fresh normal-model seed carries no inherited recovery/model-profile
+  // fields; only a failed self-unblock follow-up's own action binding.
   const recoveryContextSnapshot: Record<string, unknown> = {
     issueId: issue.id,
     taskId: issue.id,
@@ -693,6 +694,7 @@ async function runReleaseRecoveryTail(
     retryReason,
     source: recoverySource,
     retryOfRunId: run.id,
+    ...inheritedSelfUnblockBinding(run),
   };
 
   const recoveryResponsibleUserId = await resolveResponsibleUserForQueuedRun(
