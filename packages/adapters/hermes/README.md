@@ -162,6 +162,15 @@ In this mode:
 - The JWT is redacted from logs and results.
 - The created run is stopped and fails if the receiver does not acknowledge
   `environment_capability: "trusted-local-foreground-v1"`.
+- `PAPERCLIP_WAKE_REASON` is a hint only. The receiver rejects any env value
+  with a control character, so a safe machine value
+  (`[A-Za-z0-9_.:-]{1,128}`) is sent unchanged. Any other reason has control
+  characters flattened to spaces and is cut to 512 UTF-8 bytes; if nothing
+  printable remains, the variable is omitted. The full, unmodified reason still
+  reaches the agent in the run input.
+- An HTTP error receipt includes the receiver's error message, flattened and
+  redacted (for example `Hermes gateway HTTP 400: Run environment denied by
+  policy`).
 
 The option is off by default. The gateway adapter is registered with
 `supportsLocalAgentJwt: true` so heartbeat mints the run JWT, but the JWT is

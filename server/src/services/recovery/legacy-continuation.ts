@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
+import { selfOwnedUnblockAction, selfOwnedUnblockInstruction } from "../self-owned-unblock.js";
 
 /** This contract deliberately has no narrative, liveness label or progress count. */
 export interface LegacyContinuationInput {
   run: { id: string; companyId: string; agentId: string; status: string; runtimeMode?: string | null };
-  issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null; assigneeUserId?: string | null } | null;
+  issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null; assigneeUserId?: string | null; unblockDescriptor?: unknown } | null;
   agent: { id: string; companyId: string; status: string } | null;
   episode: LegacyDispositionEpisode;
   gates: {
@@ -149,7 +150,10 @@ export function decideLegacyContinuation(input: LegacyContinuationInput):
   if (run.status !== "succeeded") return { kind: "skip", reason: "run_not_successful" };
   if (!issue || !agent || issue.companyId !== run.companyId || agent.companyId !== run.companyId || agent.id !== run.agentId) return { kind: "skip", reason: "invalid_binding" };
   if (issue.assigneeAgentId !== run.agentId || issue.assigneeUserId) return { kind: "skip", reason: "owner_changed" };
-  if (!["todo", "in_progress"].includes(issue.status)) return { kind: "skip", reason: "recorded_disposition" };
+  // A self-owned descriptor records the agent's own pending action, not a
+  // wait; the gates below still respect every real waiting path.
+  const selfOwnedAction = selfOwnedUnblockAction(issue, run.agentId);
+  if (!["todo", "in_progress"].includes(issue.status) && !selfOwnedAction) return { kind: "skip", reason: "recorded_disposition" };
   for (const [blocked, reason] of [
     [gates.stopped, "stopped"], [gates.paused, "paused"],
     [gates.budgetBlocked, "budget_blocked"], [gates.pendingWait, "durable_wait"],
@@ -162,6 +166,37 @@ export function decideLegacyContinuation(input: LegacyContinuationInput):
   return {
     kind: "enqueue", nextAttempt,
     idempotencyKey: `issue_disposition_repair:${issue.id}:${legacyDispositionFingerprint(run.companyId, issue.id, run.agentId, episode.id)}:${nextAttempt}`,
-    instruction: LEGACY_DISPOSITION_REPAIR_INSTRUCTION,
+    instruction: legacyDispositionRepairInstruction(issue, run.agentId),
+  };
+}
+/** Repair instruction; a self-park carries the owner's own action into the next run. */
+export function legacyDispositionRepairInstruction(
+  issue: { status: string; unblockDescriptor?: unknown } | null | undefined,
+  agentId: string | null | undefined,
+) {
+  const action = agentId ? selfOwnedUnblockAction(issue, agentId) : null;
+  return action
+    ? `${selfOwnedUnblockInstruction(action)}\n${LEGACY_DISPOSITION_REPAIR_INSTRUCTION}`
+    : LEGACY_DISPOSITION_REPAIR_INSTRUCTION;
+}
+/**
+ * Context for the follow-up queued when an issue_unblock_requested wake lands
+ * while the owner's own run on that issue is still running. It continues that
+ * run's bounded episode (the same counter legacy disposition repair and native
+ * liveness continuation use), so park -> self-wake -> park cannot loop. Returns
+ * null at the cap: the wake then coalesces as before and the run's own
+ * continuation decision reports exhaustion and escalates.
+ */
+export function selfUnblockFollowupContext(runningRun: {
+  id: string;
+  contextSnapshot?: unknown;
+  continuationAttempt?: number | null;
+}): Record<string, unknown> | null {
+  const episode = legacyDispositionEpisode(runningRun);
+  if (episode.attempt >= episode.maxAttempts) return null;
+  return {
+    livenessContinuationSourceRunId: episode.id,
+    livenessContinuationAttempt: episode.attempt + 1,
+    livenessContinuationMaxAttempts: episode.maxAttempts,
   };
 }
