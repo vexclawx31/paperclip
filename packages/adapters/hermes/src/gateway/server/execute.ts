@@ -98,6 +98,49 @@ function nonEmpty(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+// The receiver rejects any env value containing a control character
+// (gateway/runtime_context.py validate_environment), so a multi-line wake
+// reason would deny the whole run. The env var is a hint only: keep safe
+// machine values, otherwise send flattened, bounded text. The full reason
+// still reaches the agent through the run input (paperclipWake.reason).
+const SAFE_MACHINE_WAKE_REASON = /^[A-Za-z0-9_.:-]{1,128}$/;
+const WAKE_REASON_ENV_MAX_BYTES = 512;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g;
+
+function flattenControlCharacters(value: string): string {
+  return value.replace(CONTROL_CHARACTERS, " ").replace(/\s+/g, " ").trim();
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const suffix = "...";
+  let out = "";
+  let bytes = Buffer.byteLength(suffix, "utf8");
+  for (const char of value) {
+    const size = Buffer.byteLength(char, "utf8");
+    if (bytes + size > maxBytes) break;
+    out += char;
+    bytes += size;
+  }
+  return `${out.trimEnd()}${suffix}`;
+}
+
+export function wakeReasonEnvValue(value: unknown): string | null {
+  const raw = nonEmpty(value);
+  if (!raw) return null;
+  if (SAFE_MACHINE_WAKE_REASON.test(raw)) return raw;
+  const flat = flattenControlCharacters(raw);
+  return flat ? truncateUtf8(flat, WAKE_REASON_ENV_MAX_BYTES) : null;
+}
+
+function receiverErrorText(body: unknown): string | null {
+  const record = asRecord(body);
+  const error = record?.error;
+  const message = typeof error === "string" ? error : nonEmpty(asRecord(error)?.message) ?? nonEmpty(record?.message);
+  const flat = message ? flattenControlCharacters(message) : "";
+  return flat ? (flat.length <= 300 ? flat : `${flat.slice(0, 297)}...`) : null;
+}
+
 function parseNonNegativeNumber(value: unknown, fallback: number): number {
   const parsed = typeof value === "number"
     ? value
@@ -335,7 +378,7 @@ function buildRunBody(ctx: AdapterExecutionContext, sessionKey: string | null): 
       PAPERCLIP_AGENT_ID: ctx.agent.id,
       PAPERCLIP_COMPANY_ID: ctx.agent.companyId,
       ...(issueIdFromContext(ctx) ? { PAPERCLIP_TASK_ID: issueIdFromContext(ctx)! } : {}),
-      ...(nonEmpty(ctx.context.wakeReason) ? { PAPERCLIP_WAKE_REASON: nonEmpty(ctx.context.wakeReason)! } : {}),
+      ...(wakeReasonEnvValue(ctx.context.wakeReason) ? { PAPERCLIP_WAKE_REASON: wakeReasonEnvValue(ctx.context.wakeReason)! } : {}),
     };
     return { ...payloadTemplate, environment, required_environment_capability: "trusted-local-foreground-v1", input: buildInput({ ...ctx, runtime: { ...ctx.runtime, sessionId: null } }, paperclipApiUrl), instructions: nonEmpty(ctx.config.instructions) ?? "Follow the assigned Paperclip task using the run-scoped environment. Never expose credentials." };
   }
@@ -397,7 +440,10 @@ async function fetchJson(input: RequestInfo | URL, init: RequestInit): Promise<u
   const body = await readResponseJson(response);
   if (!response.ok) {
     const classified = classifyHttpError(response.status);
-    const err = new Error(`Hermes gateway HTTP ${response.status}`) as HermesHttpError;
+    // Receipts keep the receiver's reason (e.g. "Run environment denied by
+    // policy"); errorResult redacts the message before it is persisted.
+    const receiverReason = receiverErrorText(body);
+    const err = new Error(`Hermes gateway HTTP ${response.status}${receiverReason ? `: ${receiverReason}` : ""}`) as HermesHttpError;
     err.status = response.status;
     err.code = classified.code;
     err.retryNotBefore = response.headers.get("retry-after");

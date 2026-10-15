@@ -856,3 +856,137 @@ describe("mapFinalResultForTest", () => {
     expect(result.errorMessage).toBe("boom");
   });
 });
+
+describe("scoped run environment", () => {
+  const RUN_JWT = "header.run-scoped-jwt.signature";
+  const capabilities = {
+    features: {
+      run_environment: {
+        enabled: true,
+        protocol: "trusted-local-foreground-v1",
+        route: "/v1/trusted-local-runs",
+        sessions: "fresh-only",
+      },
+    },
+  };
+
+  function scopedCtx(extra: Record<string, unknown> = {}): AdapterExecutionContext {
+    const ctx = makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642",
+      apiKey: "secret-key",
+      paperclipApiUrl: "http://127.0.0.1:3100",
+      scopedRunEnvironment: true,
+      timeoutSec: 5,
+      ...extra,
+    });
+    ctx.authToken = RUN_JWT;
+    return ctx;
+  }
+
+  function receiver(options: { caps?: unknown; ack?: string | null } = {}) {
+    return vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/capabilities")) {
+        return new Response(JSON.stringify(options.caps ?? capabilities), { status: 200 });
+      }
+      if (url.endsWith("/v1/trusted-local-runs")) {
+        const ack = options.ack === undefined ? "trusted-local-foreground-v1" : options.ack;
+        return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started", ...(ack ? { environment_capability: ack } : {}) }), { status: 200 });
+      }
+      if (url.endsWith("/events")) {
+        return new Response(
+          sseStream([
+            "event: message.delta",
+            `data: {"delta":"streamed ${RUN_JWT}"}`,
+            "",
+            "event: run.completed",
+            "data: {\"status\":\"completed\",\"output\":\"done\"}",
+            "",
+          ].join("\n")),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(JSON.stringify({ status: "completed", output: "done" }), { status: 200 });
+    });
+  }
+
+  // Mirror of the receiver's value policy (hermes-agent gateway/runtime_context.py
+  // validate_environment at release 0b6aaff0): non-empty strings, <=8192 UTF-8
+  // bytes each, no C0 control characters or DEL, <=32768 bytes in total. A
+  // rejection is the receiver's real HTTP 400 envelope.
+  function policyReceiver(options: { echoInRejection?: string; reject?: boolean } = {}) {
+    const base = receiver();
+    return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/trusted-local-runs")) {
+        const env = (JSON.parse(String(init?.body)).environment ?? {}) as Record<string, unknown>;
+        const valueOk = (v: unknown) => typeof v === "string" && v.length > 0 &&
+          Buffer.byteLength(v, "utf8") <= 8192 && ![...v].some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127);
+        const total = Object.entries(env).reduce((n, [k, v]) => n + Buffer.byteLength(k) + Buffer.byteLength(String(v)), 0);
+        if (options.reject || !Object.values(env).every(valueOk) || total > 32768) {
+          return new Response(JSON.stringify({ error: {
+            message: `Run environment denied by policy${options.echoInRejection ?? ""}`,
+            type: "invalid_request_error", param: null, code: null,
+          } }), { status: 400 });
+        }
+      }
+      return base(input, init);
+    });
+  }
+
+  const MULTILINE_REASON = [
+    "Supervisor continuation for LIT-105:",
+    "1. Record Jamal's model-diversity requirement.\t(critical)",
+    "2. Record the no-chase regression scenario.\u007f",
+    `3. ${"Keep the full authorized direction in the run input. ".repeat(60).trimEnd()}`,
+  ].join("\n");
+
+  it("delivers a multi-line wake reason: bounded control-free env value, full direction in input", async () => {
+    const fetchMock = policyReceiver();
+    vi.stubGlobal("fetch", fetchMock);
+    const ctx = scopedCtx();
+    ctx.context.wakeReason = MULTILINE_REASON;
+    ctx.context.paperclipWake = { ...(ctx.context.paperclipWake as object), reason: MULTILINE_REASON };
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    const init = fetchMock.mock.calls.find(([input]) => String(input).endsWith("/v1/trusted-local-runs"))?.[1] as RequestInit;
+    const body = JSON.parse(String(init.body));
+    const envReason = String(body.environment.PAPERCLIP_WAKE_REASON);
+    expect(envReason).not.toMatch(/[\u0000-\u001f\u007f]/);
+    expect(Buffer.byteLength(envReason, "utf8")).toBeLessThanOrEqual(512);
+    expect(envReason.startsWith("Supervisor continuation for LIT-105: 1. Record Jamal's")).toBe(true);
+    // The model still receives the complete, unmodified direction.
+    expect(String(body.input)).toContain(MULTILINE_REASON);
+  });
+
+  it("keeps a safe machine wake reason unchanged and omits one with no printable text", async () => {
+    for (const [reason, expected] of [["issue_unblock_requested", "issue_unblock_requested"], ["\n\t\r", undefined]] as const) {
+      const fetchMock = policyReceiver();
+      vi.stubGlobal("fetch", fetchMock);
+      const ctx = scopedCtx();
+      ctx.context.wakeReason = reason;
+      const result = await execute(ctx);
+      expect(result.exitCode).toBe(0);
+      const init = fetchMock.mock.calls.find(([input]) => String(input).endsWith("/v1/trusted-local-runs"))?.[1] as RequestInit;
+      expect(JSON.parse(String(init.body)).environment.PAPERCLIP_WAKE_REASON).toBe(expected);
+    }
+  });
+
+  it("surfaces the receiver's rejection reason in the error receipt without secrets or control characters", async () => {
+    // A receiver-side rejection that (worst case) echoes credentials and
+    // control characters back in its error envelope.
+    vi.stubGlobal("fetch", policyReceiver({ reject: true, echoInRejection: `\nvalue=${RUN_JWT} key=secret-key\u0007` }));
+    const ctx = scopedCtx({ apiKey: "secret-key" });
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_protocol_error");
+    expect(result.errorMessage).toContain("Hermes gateway HTTP 400");
+    expect(result.errorMessage).toContain("Run environment denied by policy");
+    expect(result.errorMessage).not.toMatch(/[\u0000-\u001f\u007f]/);
+    expect(JSON.stringify(result)).not.toContain(RUN_JWT);
+    expect(JSON.stringify(result)).not.toContain("secret-key");
+  });
+});

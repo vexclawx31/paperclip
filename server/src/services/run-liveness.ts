@@ -13,6 +13,13 @@ export interface RunLivenessIssueInput {
   title: string;
   description: string | null;
   workMode?: string | null;
+  /**
+   * Set by the caller only when the issue is blocked solely on an unblock
+   * descriptor owned by the run's own agent, with no real waiting path
+   * (blocker issue, pending interaction/approval, monitor, execution stage or
+   * user owner). That is pending own work, not a wait.
+   */
+  selfOwnedUnblockAction?: string | null;
 }
 
 export interface RunLivenessEvidenceInput {
@@ -336,6 +343,17 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
 
   if (issueStatus === "done" || issueStatus === "cancelled") {
     return output("completed", `Issue is ${issueStatus}`);
+  }
+
+  // Checked before any blocker or evidence rule: a comment or the status
+  // write itself must not turn a self-park into "advanced" or "blocked".
+  const selfOwnedUnblockAction = readText(input.issue?.selfOwnedUnblockAction);
+  if (issueStatus === "blocked" && selfOwnedUnblockAction) {
+    return output(
+      "plan_only",
+      "Issue is blocked only on this agent's own unblock action; no external waiting path exists",
+      selfOwnedUnblockAction.length <= 500 ? selfOwnedUnblockAction : `${selfOwnedUnblockAction.slice(0, 497)}...`,
+    );
   }
 
   if (declaredBlocker(input)) {

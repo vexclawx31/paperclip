@@ -1,4 +1,5 @@
 import type { IssueUnblockDescriptor } from "@paperclipai/shared";
+import { selfOwnedUnblockInstruction, UNBLOCK_REQUESTED_CONTINUATION_STATE } from "./self-owned-unblock.js";
 
 export const ROUTABLE_BLOCKED_ROLLOUT_AT = new Date("2026-07-23T18:13:03.000Z");
 
@@ -28,7 +29,13 @@ export async function deliverAgentUnblockNotification(input: {
     reason: "issue_unblock_requested";
     idempotencyKey: string;
     payload: { issueId: string; action: string };
-    contextSnapshot: { wakeReason: "issue_unblock_requested"; issueId: string; taskId: string };
+    contextSnapshot: {
+      wakeReason: "issue_unblock_requested";
+      issueId: string;
+      taskId: string;
+      livenessContinuationState: string;
+      livenessContinuationInstruction: string;
+    };
   }) => Promise<unknown>;
   markNotified: (notifiedAt: Date) => Promise<unknown>;
   now?: () => Date;
@@ -47,7 +54,15 @@ export async function deliverAgentUnblockNotification(input: {
     reason: "issue_unblock_requested",
     idempotencyKey: `issue-unblock:${issue.id}:${issue.blockedTransitionAt.toISOString()}`,
     payload: { issueId: issue.id, action: issue.unblockDescriptor.action },
-    contextSnapshot: { wakeReason: "issue_unblock_requested", issueId: issue.id, taskId: issue.id },
+    // The owner's action must reach the next run's input; the payload alone is
+    // a receipt and is not rendered into the wake prompt.
+    contextSnapshot: {
+      wakeReason: "issue_unblock_requested",
+      issueId: issue.id,
+      taskId: issue.id,
+      livenessContinuationState: UNBLOCK_REQUESTED_CONTINUATION_STATE,
+      livenessContinuationInstruction: selfOwnedUnblockInstruction(issue.unblockDescriptor.action),
+    },
   });
   await input.markNotified((input.now ?? (() => new Date()))());
   return true;

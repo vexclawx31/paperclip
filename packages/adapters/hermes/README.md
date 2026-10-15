@@ -144,6 +144,20 @@ This mode does not start Hermes. It creates runs with `POST /v1/runs`, streams
 Hermes events with SSE, polls run status as a fallback, and stops timed-out runs
 with `POST /v1/runs/{run_id}/stop`.
 
+#### Wake reason in the run-scoped environment
+
+When `"scopedRunEnvironment": true`:
+
+- `PAPERCLIP_WAKE_REASON` is a hint only. The receiver rejects any env value
+  with a control character, so a safe machine value
+  (`[A-Za-z0-9_.:-]{1,128}`) is sent unchanged. Any other reason has control
+  characters flattened to spaces and is cut to 512 UTF-8 bytes; if nothing
+  printable remains, the variable is omitted. The full, unmodified reason still
+  reaches the agent in the run input.
+- An HTTP error receipt includes the receiver's error message, flattened and
+  redacted (for example `Hermes gateway HTTP 400: Run environment denied by
+  policy`).
+
 ### Compatibility with the old gateway package
 
 `@paperclipai/adapter-hermes-gateway` remains as a deprecated compatibility shim

@@ -78,6 +78,14 @@ Entering `blocked` requires a routable waiting path. An issue may transition int
 
 When a structured unblock descriptor is the waiting path, Paperclip immediately notifies the named owner: an agent owner gets a wake, a user or board owner gets an inbox notification. Prose-only blocked — free-text that names an owner or action in a comment without any of the paths above — routes to nobody. It is rejected at the API or auto-classified as `needs_attention` with a board notification, never silently accepted as a healthy waiting state.
 
+A descriptor whose owner is the assigned agent itself is that agent's own pending work, not an external wait. Agents can only name themselves as descriptor owners, so this is the common agent-created shape. Paperclip treats it as follows:
+
+- The owner wake carries the descriptor `action` into the next run's wake prompt; the wake payload is a receipt only.
+- If the owner's own run on the issue is still running, the wake is held behind it as one follow-up rather than merged into the exiting run. A duplicate delivery merges into that follow-up.
+- The follow-up continues the source run's bounded continuation episode (the same counter as legacy disposition repair and native liveness continuation). Re-parking on the agent's own action therefore cannot loop: once the episode is exhausted, Paperclip opens a board-owned recovery action and leaves the assignee unchanged.
+- Run liveness classifies such a run as `plan_only` with the action as `nextAction`, even if the run posted a comment. It is not `blocked`.
+- Every real waiting path still wins: unresolved blocker issues, pending interactions or approvals, a scheduled monitor, a pending execution stage, a user owner, pause/stop holds, budget, and recovery ownership. With any of these present the issue stays a normal blocked wait.
+
 A permission denial is not, by itself, a blocker. If an instructed step is denied at an authorization boundary but the issue's own deliverable is complete, the right disposition is `done`, not `blocked` (see the review-delegation rules in §6).
 
 This requirement is prospective-only on rollout: it applies to transitions into `blocked` made after the feature ships, gated on the blocked-transition timestamp against the rollout marker, not on issue `createdAt`. Issues already blocked at upgrade time are untouched — no backfilled notifications, no retroactive validation, no `needs_attention` storm on deploy. Triage of pre-existing prose-blocked issues is a one-time opt-in digest, not a default.
