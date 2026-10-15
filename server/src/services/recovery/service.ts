@@ -8,6 +8,8 @@ import {
   legacyDispositionRepairInstruction, type LegacyDispositionEpisode,
 } from "./legacy-continuation.js";
 import { hasLiveLegacyController } from "../legacy-controller-lease.js";
+import { selfOwnedUnblockAction } from "../self-owned-unblock.js";
+import { DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS, readContinuationAttempt } from "./run-liveness-continuations.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { isWaitingConversation, settleConversationTurn, deliverConversationComments } from "../agent-conversations.js";
 import {
@@ -3733,6 +3735,63 @@ export function recoveryService(
     });
   }
 
+  /**
+   * Native runs never enter legacy disposition repair, and the stranded sweep
+   * skips blocked issues. A native self-park (blocked only on the assignee's
+   * own unblock action, nothing real waiting) whose bounded continuation is
+   * spent therefore needs this explicit board escalation: exactly one
+   * board-owned recovery action, assignee unchanged, then quiet.
+   */
+  async function escalateExhaustedNativeSelfPark(issueRef: { id: string; companyId: string }): Promise<boolean> {
+    const [issue] = await db.select().from(issues)
+      .where(and(eq(issues.id, issueRef.id), eq(issues.companyId, issueRef.companyId))).limit(1);
+    if (!issue || issue.status !== "blocked" || !issue.assigneeAgentId || issue.assigneeUserId || issue.hiddenAt) return false;
+    if (!selfOwnedUnblockAction(issue, issue.assigneeAgentId)) return false;
+    const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+    if (!latestRun || latestRun.agentId !== issue.assigneeAgentId || latestRun.status !== "succeeded") return false;
+    const [run] = await db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, latestRun.id), eq(heartbeatRuns.companyId, issue.companyId))).limit(1);
+    if (!run || run.runtimeMode !== "native") return false;
+    if (run.livenessState !== "plan_only" && run.livenessState !== "empty_response") return false;
+    const attempt = readContinuationAttempt(run.continuationAttempt);
+    if (attempt < DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS) return false;
+    if (await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id)) return false;
+    if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) return false;
+    const state = await collectDispositionRepairSourceState(db, { issue, excludeRunId: run.id });
+    if (state.hasDurableWaitingPath || state.hasActiveExecutionPath) return false;
+    const episode = legacyDispositionEpisode(run);
+    const escalated = await escalateDispositionRepair({
+      issue,
+      latestRun,
+      fingerprint: legacyDispositionFingerprint(issue.companyId, issue.id, issue.assigneeAgentId, episode.id),
+      attemptCount: attempt,
+      terminalReason: "self_unblock_continuation_exhausted",
+      legacyEpisode: { id: episode.id, attempt, maxAttempts: DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS },
+    });
+    return Boolean(escalated);
+  }
+
+  async function reconcileExhaustedNativeSelfParks(opts?: { issueCreatedAtGte?: Date | null }) {
+    const candidates = await db
+      .select({ id: issues.id, companyId: issues.companyId })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "blocked"),
+          sql`${issues.assigneeAgentId} is not null`,
+          isNull(issues.assigneeUserId),
+          isNull(issues.hiddenAt),
+          sql`${issues.unblockDescriptor} -> 'owner' ->> 'agentId' = ${issues.assigneeAgentId}::text`,
+          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+        ),
+      );
+    const issueIds: string[] = [];
+    for (const candidate of candidates) {
+      if (await escalateExhaustedNativeSelfPark(candidate)) issueIds.push(candidate.id);
+    }
+    return issueIds;
+  }
+
   async function legacyRepairDispatchBlock(runId: string): Promise<string | null> {
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).limit(1);
     const context = parseObject(run?.contextSnapshot);
@@ -5522,6 +5581,10 @@ export function recoveryService(
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
 
+    const nativeSelfParkEscalations = await reconcileExhaustedNativeSelfParks(opts);
+    result.escalated += nativeSelfParkEscalations.length;
+    result.issueIds.push(...nativeSelfParkEscalations);
+
     const activeRecovery = await reconcileActiveRecoveryActions();
     result.continuationRequeued += activeRecovery.requeued;
     result.escalated += activeRecovery.escalated;
@@ -6236,6 +6299,7 @@ export function recoveryService(
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
     reconcileLegacyContinuation,
+    escalateExhaustedNativeSelfPark,
     legacyRepairDispatchBlock,
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,

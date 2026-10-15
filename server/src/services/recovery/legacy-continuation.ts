@@ -58,7 +58,8 @@ export function legacyDispositionEpisode(run: {
   return {
     id: typeof context.dispositionRepairFingerprint === "string" ? context.dispositionRepairFingerprint : typeof context.livenessContinuationSourceRunId === "string" ? context.livenessContinuationSourceRunId : run.id,
     attempt,
-    maxAttempts: handoff || oldRecovery ? 1 : LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS,
+    // An inherited episode keeps its own (never wider) allowance.
+    maxAttempts: handoff || oldRecovery ? 1 : Math.max(1, Math.min(LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS, count(context.livenessContinuationMaxAttempts) || LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS)),
   };
 }
 type BindingRun = { id: string; companyId: string; agentId: string; status?: string | null; runtimeMode?: string | null; contextSnapshot?: unknown };

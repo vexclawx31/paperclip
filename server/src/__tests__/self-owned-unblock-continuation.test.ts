@@ -8,6 +8,7 @@ import { classifyRunLiveness } from "../services/run-liveness.ts";
 import { decideRunLivenessContinuation } from "../services/run-continuations.ts";
 import {
   decideLegacyContinuation,
+  legacyDispositionEpisode,
   selfUnblockFollowupContext,
   type LegacyContinuationInput,
 } from "../services/recovery/legacy-continuation.js";
@@ -18,6 +19,7 @@ import {
   UNBLOCK_REQUESTED_CONTINUATION_STATE,
 } from "../services/self-owned-unblock.js";
 import {
+  inheritedContinuationEpisode,
   inheritedSelfUnblockBinding,
   SELF_UNBLOCK_CONTINUATION_STATE,
 } from "../modules/wake-queue/domain/context.js";
@@ -67,6 +69,7 @@ describe("same-issue self-unblock follow-up (MUST 1)", () => {
       },
       wakeup,
       markNotified: async () => undefined,
+      durableWaitingPath: async () => null,
     });
     const options = (wakeup.mock.calls[0] as unknown as [string, { contextSnapshot: Record<string, unknown> }])[1];
     const instruction = String(options.contextSnapshot.livenessContinuationInstruction ?? "");
@@ -222,5 +225,63 @@ describe("failed self-unblock follow-up keeps its action through immediate recov
     expect(inheritedSelfUnblockBinding({ status: "failed", contextSnapshot: { livenessContinuationInstruction: instruction } })).toEqual({});
     expect(inheritedSelfUnblockBinding({ status: "failed", contextSnapshot: { ...bound, livenessContinuationState: "plan_only" } })).toEqual({});
     expect(inheritedSelfUnblockBinding({ status: "failed", contextSnapshot: { ...bound, livenessContinuationInstruction: "x".repeat(4001) } })).toEqual({});
+  });
+});
+
+describe("immediate recovery keeps the shared continuation episode (LIT-126)", () => {
+  const followupContext = {
+    issueId,
+    wakeReason: "issue_unblock_requested",
+    livenessContinuationState: UNBLOCK_REQUESTED_CONTINUATION_STATE,
+    livenessContinuationInstruction: selfOwnedUnblockInstruction(action),
+    livenessContinuationSourceRunId: "episode-run",
+    livenessContinuationAttempt: 1,
+    livenessContinuationMaxAttempts: 2,
+    modelProfile: "x",
+  };
+
+  it("carries episode identity and spent allowance from an unsuccessful run, never model-profile fields", () => {
+    for (const status of ["failed", "timed_out", "interrupted", "cancelled"]) {
+      expect(inheritedContinuationEpisode({ status, contextSnapshot: followupContext })).toEqual({
+        livenessContinuationSourceRunId: "episode-run",
+        livenessContinuationAttempt: 1,
+        livenessContinuationMaxAttempts: 2,
+      });
+    }
+  });
+
+  it("maps a persisted legacy repair episode onto the same counters", () => {
+    expect(inheritedContinuationEpisode({
+      status: "failed",
+      contextSnapshot: { legacyDispositionEpisode: { id: "legacy-episode", attempt: 2, maxAttempts: 2 }, dispositionRepairAttempt: 2 },
+    })).toEqual({ livenessContinuationSourceRunId: "legacy-episode", livenessContinuationAttempt: 2, livenessContinuationMaxAttempts: 2 });
+  });
+
+  it("starts nothing for success, an unspent episode or a missing identity", () => {
+    expect(inheritedContinuationEpisode({ status: "succeeded", contextSnapshot: followupContext })).toEqual({});
+    expect(inheritedContinuationEpisode({ status: "failed", contextSnapshot: { ...followupContext, livenessContinuationAttempt: 0 } })).toEqual({});
+    expect(inheritedContinuationEpisode({ status: "failed", contextSnapshot: { livenessContinuationAttempt: 1 } })).toEqual({});
+  });
+
+  it("alternating refused launch -> recovery -> self-park stays inside the one episode", () => {
+    // Attempt 1 follow-up is refused; the recovery run inherits its episode.
+    const recoveryContext = { ...inheritedContinuationEpisode({ status: "failed", contextSnapshot: followupContext }), ...inheritedSelfUnblockBinding({ status: "failed", contextSnapshot: followupContext }) };
+    const recoveryRun = { id: "recovery-run", contextSnapshot: recoveryContext, continuationAttempt: 1 };
+    expect(legacyDispositionEpisode(recoveryRun)).toEqual({ id: "episode-run", attempt: 1, maxAttempts: 2 });
+    // It succeeds and self-parks: the follow-up is attempt 2 of the same episode.
+    const second = selfUnblockFollowupContext(recoveryRun)!;
+    expect(second).toEqual({ livenessContinuationSourceRunId: "episode-run", livenessContinuationAttempt: 2, livenessContinuationMaxAttempts: 2 });
+    // Attempt 2 is refused too; its recovery self-parks again: the cap is reached.
+    const secondRecovery = { id: "recovery-run-2", contextSnapshot: inheritedContinuationEpisode({ status: "failed", contextSnapshot: second }), continuationAttempt: 2 };
+    expect(selfUnblockFollowupContext(secondRecovery)).toBeNull();
+    // Negative control: without inheritance the recovery run opened a fresh episode.
+    expect(selfUnblockFollowupContext({ id: "recovery-run", contextSnapshot: {}, continuationAttempt: 0 }))
+      .toEqual({ livenessContinuationSourceRunId: "recovery-run", livenessContinuationAttempt: 1, livenessContinuationMaxAttempts: 2 });
+  });
+
+  it("an inherited episode never widens its own allowance", () => {
+    expect(legacyDispositionEpisode({ id: "r", contextSnapshot: { livenessContinuationSourceRunId: "e", livenessContinuationAttempt: 1, livenessContinuationMaxAttempts: 1 } }))
+      .toEqual({ id: "e", attempt: 1, maxAttempts: 1 });
+    expect(legacyDispositionEpisode({ id: "r", contextSnapshot: { livenessContinuationSourceRunId: "e", livenessContinuationAttempt: 1, livenessContinuationMaxAttempts: 9 } }).maxAttempts).toBe(2);
   });
 });

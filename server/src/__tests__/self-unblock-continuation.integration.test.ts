@@ -69,6 +69,7 @@ vi.mock("../adapters/index.ts", async () => {
 import { heartbeatService } from "../services/heartbeat.ts";
 import { issueService } from "../services/issues.ts";
 import { deliverAgentUnblockNotification } from "../services/routable-blocked.ts";
+import { readIssueDurableWaitingPath } from "../services/recovery/disposition-repair.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -165,6 +166,7 @@ describeEmbeddedPostgres("self-unblock continuation (offline integration)", () =
       issue: updated as never,
       wakeup: heartbeat.wakeup as never,
       markNotified: async (at) => { notifiedAt = at; },
+      durableWaitingPath: () => readIssueDurableWaitingPath(db, updated!),
     });
     await notify();
     // A duplicate delivery of the same transition (retry, double click) must
@@ -334,7 +336,7 @@ describeEmbeddedPostgres("self-unblock continuation (offline integration)", () =
       status: "blocked",
       unblockDescriptor: { owner: { agentId }, action: ACTION },
     });
-    await deliverAgentUnblockNotification({ issue: updated as never, wakeup: heartbeatService(db).wakeup as never, markNotified: async () => undefined });
+    await deliverAgentUnblockNotification({ issue: updated as never, wakeup: heartbeatService(db).wakeup as never, markNotified: async () => undefined, durableWaitingPath: () => readIssueDurableWaitingPath(db, updated!) });
     for (let i = 0; i < 200 && turns.seen.length < 2; i += 1) await new Promise((r) => setTimeout(r, 20));
     // The unblock wake ran its own run on issue X while Y was still running.
     expect(turns.seen).toHaveLength(2);

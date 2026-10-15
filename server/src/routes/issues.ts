@@ -324,6 +324,7 @@ import {
 import { externalObjectService } from "../services/external-objects.js";
 import { getExternalChannelBindingSummary } from "../services/chat-channel-binding.js";
 import { deliverAgentUnblockNotification } from "../services/routable-blocked.js";
+import { readIssueDurableWaitingPath } from "../services/recovery/disposition-repair.js";
 import {
   assertIssueReviewVerdictActorAllowed,
   isIssueReviewVerdictInteraction,
@@ -13749,6 +13750,7 @@ export function issueRoutes(
           markNotified: async (blockedOwnerNotifiedAt) => {
             ownerNotifiedAt = blockedOwnerNotifiedAt;
           },
+          durableWaitingPath: () => readIssueDurableWaitingPath(db, blockedIssue),
         });
         if (ownerNotifiedAt) {
           await db

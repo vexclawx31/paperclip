@@ -88,6 +88,7 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { issueService } from "../services/issues.ts";
 import { attentionService } from "../services/attention.ts";
 import { deliverAgentUnblockNotification } from "../services/routable-blocked.ts";
+import { readIssueDurableWaitingPath } from "../services/recovery/disposition-repair.ts";
 import { runningProcesses } from "../adapters/index.ts";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -186,6 +187,7 @@ describeEmbeddedPostgres("failed self-unblock follow-up recovery (offline integr
       markNotified: async (at) => {
         await db.update(issues).set({ blockedOwnerNotifiedAt: at }).where(eq(issues.id, issueId));
       },
+      durableWaitingPath: () => readIssueDurableWaitingPath(db, updated!),
     });
   }
 
@@ -464,5 +466,267 @@ describeEmbeddedPostgres("failed self-unblock follow-up recovery (offline integr
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(wakesAfter);
     expect(await openRecoveryActions(issueId)).toHaveLength(0);
     expect((await issueRow(issueId)).status).toBe("done");
+  }, 120_000);
+
+  // ---------------------------------------------------------------------------
+  // LIT-126 corrections. Same isolated harness; actual routes and recovery tick.
+
+  function boardActor(companyId: string, ownerUserId: string) {
+    return api({
+      type: "board", source: "session", userId: ownerUserId, companyIds: [companyId],
+      memberships: [{ companyId, status: "active", membershipRole: "owner" }], isInstanceAdmin: false,
+    });
+  }
+  function agentActor(companyId: string, agentId: string) {
+    return (runId: string) => api({ type: "agent", source: "agent_key", companyId, agentId, runId });
+  }
+  const ctxOf = (run: { contextSnapshot: unknown }) => run.contextSnapshot as Record<string, unknown>;
+  // Direct, coalesced or deferred-behind-execution unblock wakes alike.
+  const unblockWakes = async (agentId: string) => (await db.select().from(agentWakeupRequests)
+    .where(eq(agentWakeupRequests.agentId, agentId)))
+    .filter((w) => w.reason === "issue_unblock_requested" ||
+      ((w.payload as Record<string, any> | null)?._paperclipWakeContext?.wakeReason === "issue_unblock_requested"));
+  // What an agent's run normally leaves besides its status write.
+  async function runComment(issueId: string, agentId: string, runId: string, body: string) {
+    const current = await issueRow(issueId);
+    await db.insert(issueComments).values({ companyId: current.companyId, issueId, authorAgentId: agentId, authorType: "agent", createdByRunId: runId, body });
+  }
+
+  it("LIT-126 P1: alternating refused launch -> successful recovery -> self-park spends one shared episode, then one board escalation and quiet", async () => {
+    const { companyId, agentId, issueId, ownerUserId } = await seed();
+    // Each recovery turn does no work: it re-parks on its own action (a new
+    // blocked transition, so a new notification) and its follow-up is refused.
+    const repark = async (ctx: unknown) => {
+      await issueService(db).update(issueId, { status: "in_progress" });
+      await selfPark(issueId, agentId, (ctx as AdapterExecutionContext).runId);
+      turns.refuseLaunches = 1;
+      return { summary: "Parked on my own action again." };
+    };
+    const first = await failedFollowup(agentId, issueId, "refused", { refusals: 1, after: [repark, repark, repark, repark, repark] });
+    for (let cycle = 0; cycle < 6; cycle += 1) await recoveryCycle(agentId);
+
+    const runs = (await runsFor(agentId)).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    const initial = runs[0]!;
+    // (The cap wake coalesces into the last recovery run, so filter by lineage.)
+    const followups = runs.filter((r) => ctxOf(r).wakeReason === "issue_unblock_requested" && !r.retryOfRunId);
+    const recoveries = runs.filter((r) => followups.some((f) => f.id === r.retryOfRunId));
+    // One episode, owned by the initial run: follow-ups are its attempts 1 and 2.
+    expect(followups.map((r) => ctxOf(r).livenessContinuationSourceRunId)).toEqual([initial.id, initial.id]);
+    expect(followups.map((r) => r.continuationAttempt)).toEqual([1, 2]);
+    expect(followups.map((r) => r.status)).toEqual(["failed", "failed"]);
+    expect(first.id).toBe(followups[0]!.id);
+    // Each immediate recovery keeps the refused follow-up's episode and spent
+    // allowance, and still carries the bound action.
+    expect(recoveries).toHaveLength(2);
+    expect(recoveries.map((r) => ctxOf(r).livenessContinuationSourceRunId)).toEqual([initial.id, initial.id]);
+    expect(recoveries.map((r) => r.continuationAttempt)).toEqual([1, 2]);
+    expect(recoveries.every((r) => r.status === "succeeded" && ctxOf(r).livenessContinuationState === "unblock_requested")).toBe(true);
+    // At the cap the last self-park's wake opened no further follow-up.
+    expect(ctxOf(recoveries[1]!).selfUnblockFollowupCapReached).toBe(true);
+    // Bounded: the initial turn plus two recovery turns; two refused launches.
+    expect(turns.seen).toHaveLength(3);
+    expect(turns.refused).toBe(2);
+    await expectReachableBoardEscalationThenQuiet(companyId, ownerUserId, agentId, issueId);
+  }, 120_000);
+
+  it("LIT-126 P1: PATCH self-park while a pending interaction waits sends no act-now follow-up; the board's answer resumes once", async () => {
+    const { companyId, agentId, issueId, ownerUserId } = await seed();
+    const asAgent = agentActor(companyId, agentId);
+    const asBoard = boardActor(companyId, ownerUserId);
+    let interactionId = "";
+    let resumedCtx: AdapterExecutionContext | null = null;
+    turns.queue.push(async (ctx) => {
+      const runId = (ctx as AdapterExecutionContext).runId;
+      await runComment(issueId, agentId, runId, "Need the board's decision before the roadmap reconcile.");
+      const created = await request(asAgent(runId)).post(`/api/issues/${issueId}/interactions`).send({
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee",
+        payload: { version: 1, prompt: "Approve the roadmap scope before I reconcile B1/B2?" },
+      });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+      interactionId = created.body.id;
+      const parked = await request(asAgent(runId)).patch(`/api/issues/${issueId}`)
+        .send({ status: "blocked", unblockDescriptor: { owner: { agentId }, action: ACTION } });
+      expect(parked.status, JSON.stringify(parked.body)).toBe(200);
+      return { summary: "Waiting on the board's decision." };
+    });
+    turns.queue.push(async (ctx) => {
+      resumedCtx = ctx as AdapterExecutionContext;
+      const closed = await request(asAgent(resumedCtx.runId)).patch(`/api/issues/${issueId}`).send({ status: "done" });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      return { summary: "Reconciled and closed." };
+    });
+    await start(agentId, issueId);
+    await settle(agentId);
+
+    // The route's notification honored the real wait: no wake, not marked notified.
+    expect(await unblockWakes(agentId)).toHaveLength(0);
+    const parked = await issueRow(issueId);
+    expect(parked.status).toBe("blocked");
+    expect(parked.blockedOwnerNotifiedAt).toBeNull();
+    expect(turns.seen).toHaveLength(1);
+    const runsWhileHeld = (await runsFor(agentId)).length;
+    for (let cycle = 0; cycle < 3; cycle += 1) await recoveryCycle(agentId);
+    expect(turns.seen).toHaveLength(1);
+    expect(await runsFor(agentId)).toHaveLength(runsWhileHeld);
+    expect(await openRecoveryActions(issueId)).toHaveLength(0);
+
+    const accepted = await request(asBoard).post(`/api/issues/${issueId}/interactions/${interactionId}/accept`).send({});
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    await settle(agentId);
+    expect(turns.seen).toHaveLength(2);
+    expect((resumedCtx as unknown as AdapterExecutionContext).context.interactionId).toBe(interactionId);
+    expect((await issueRow(issueId)).status).toBe("done");
+    const again = await request(asBoard).post(`/api/issues/${issueId}/interactions/${interactionId}/accept`).send({});
+    expect(again.status).toBeGreaterThanOrEqual(400);
+    const runsAfter = (await runsFor(agentId)).length;
+    for (let cycle = 0; cycle < 3; cycle += 1) await recoveryCycle(agentId);
+    expect(turns.seen).toHaveLength(2);
+    expect(await runsFor(agentId)).toHaveLength(runsAfter);
+  }, 120_000);
+
+  it("LIT-126 P1 negative control: the same PATCH self-park with nothing waiting delivers the bound action once", async () => {
+    const { companyId, agentId, issueId } = await seed();
+    const asAgent = agentActor(companyId, agentId);
+    let followCtx: AdapterExecutionContext | null = null;
+    turns.queue.push(async (ctx) => {
+      const runId = (ctx as AdapterExecutionContext).runId;
+      await runComment(issueId, agentId, runId, "Blocked with an exact Vex-owned unblock action.");
+      const parked = await request(asAgent(runId)).patch(`/api/issues/${issueId}`)
+        .send({ status: "blocked", unblockDescriptor: { owner: { agentId }, action: ACTION } });
+      expect(parked.status, JSON.stringify(parked.body)).toBe(200);
+      return { summary: "Parked on my own action." };
+    });
+    turns.queue.push(async (ctx) => {
+      followCtx = ctx as AdapterExecutionContext;
+      await runComment(issueId, agentId, followCtx.runId, "Reconciled.");
+      await request(asAgent(followCtx.runId)).patch(`/api/issues/${issueId}`).send({ status: "done" });
+      return { summary: "Done." };
+    });
+    await start(agentId, issueId);
+    await settle(agentId);
+    expect(await unblockWakes(agentId)).toHaveLength(1);
+    expect(turns.seen).toHaveLength(2);
+    expect(ctxOf((await runsFor(agentId)).find((r) => r.id === (followCtx as unknown as AdapterExecutionContext).runId)!).wakeReason).toBe("issue_unblock_requested");
+    expect(renderPaperclipWakePrompt((followCtx as unknown as AdapterExecutionContext).context.paperclipWake)).toContain(`Do this action now: ${ACTION}`);
+    expect((await issueRow(issueId)).status).toBe("done");
+  }, 120_000);
+
+  it("LIT-126 P1: a wait recorded after the self-park notification cancels the queued follow-up at admission; the answer resumes once", async () => {
+    const { companyId, agentId, issueId, ownerUserId } = await seed();
+    const asAgent = agentActor(companyId, agentId);
+    const asBoard = boardActor(companyId, ownerUserId);
+    let interactionId = "";
+    turns.queue.push(async (ctx) => {
+      const runId = (ctx as AdapterExecutionContext).runId;
+      await runComment(issueId, agentId, runId, "Parking, then asking the board first.");
+      // Nothing waits yet: the notification queues a bound follow-up...
+      const parked = await request(asAgent(runId)).patch(`/api/issues/${issueId}`)
+        .send({ status: "blocked", unblockDescriptor: { owner: { agentId }, action: ACTION } });
+      expect(parked.status, JSON.stringify(parked.body)).toBe(200);
+      // ...then the same run records a real human prerequisite and parks on it.
+      const created = await request(asAgent(runId)).post(`/api/issues/${issueId}/interactions`).send({
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee",
+        payload: { version: 1, prompt: "Approve the roadmap scope before I reconcile B1/B2?" },
+      });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+      interactionId = created.body.id;
+      const review = await request(asAgent(runId)).patch(`/api/issues/${issueId}`).send({ status: "in_review" });
+      expect(review.status, JSON.stringify(review.body)).toBe(200);
+      return { summary: "Asked the board first." };
+    });
+    turns.queue.push(async (ctx) => {
+      expect((ctx as AdapterExecutionContext).context.interactionId).toBe(interactionId);
+      await request(asAgent((ctx as AdapterExecutionContext).runId)).patch(`/api/issues/${issueId}`).send({ status: "done" });
+      return { summary: "Reconciled and closed." };
+    });
+    await start(agentId, issueId);
+    await settle(agentId);
+
+    const followups = (await runsFor(agentId)).filter((r) => ctxOf(r).wakeReason === "issue_unblock_requested");
+    expect(followups).toHaveLength(1);
+    expect(followups[0]).toMatchObject({ status: "cancelled", errorCode: "self_unblock_superseded_by_wait" });
+    // Refused before the adapter: only the parking turn ran.
+    expect(turns.seen).toHaveLength(1);
+    for (let cycle = 0; cycle < 3; cycle += 1) await recoveryCycle(agentId);
+    expect(turns.seen).toHaveLength(1);
+    expect(await openRecoveryActions(issueId)).toHaveLength(0);
+
+    const accepted = await request(asBoard).post(`/api/issues/${issueId}/interactions/${interactionId}/accept`).send({});
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    await settle(agentId);
+    expect(turns.seen).toHaveLength(2);
+    expect((await issueRow(issueId)).status).toBe("done");
+    const runsAfter = (await runsFor(agentId)).length;
+    for (let cycle = 0; cycle < 3; cycle += 1) await recoveryCycle(agentId);
+    expect(turns.seen).toHaveLength(2);
+    expect(await runsFor(agentId)).toHaveLength(runsAfter);
+  }, 120_000);
+
+  it("LIT-126 P2: an exhausted native self-park gets exactly one reachable board action, then quiet; the board's restore resumes productive work once", async () => {
+    const { companyId, agentId, issueId, ownerUserId } = await seed();
+    const asAgent = agentActor(companyId, agentId);
+    const asBoard = boardActor(companyId, ownerUserId);
+    await db.update(issues).set({ status: "blocked", unblockDescriptor: { owner: { agentId }, action: ACTION } })
+      .where(eq(issues.id, issueId));
+    // The native run's own continuation decision already reported exhaustion.
+    const nativeRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nativeRunId, companyId, agentId, status: "succeeded", runtimeMode: "native",
+      invocationSource: "automation", triggerDetail: "system", livenessState: "plan_only",
+      livenessReason: "Issue is blocked only on this agent's own unblock action; continuation attempts exhausted",
+      continuationAttempt: 1, startedAt: new Date(), finishedAt: new Date(),
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "run_liveness_continuation", livenessContinuationSourceRunId: nativeRunId },
+    });
+
+    // Negative controls: an unspent allowance, and a real dependency wait.
+    await recoveryCycle(agentId);
+    expect(await openRecoveryActions(issueId)).toHaveLength(0);
+    await db.update(heartbeatRuns).set({ continuationAttempt: 2 }).where(eq(heartbeatRuns.id, nativeRunId));
+    const blockerId = randomUUID();
+    await db.insert(issues).values({ id: blockerId, companyId, title: "Dependency", status: "todo", priority: "high", issueNumber: 2, identifier: `${(await issueRow(issueId)).identifier}-dep` });
+    await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
+    await recoveryCycle(agentId);
+    expect(await openRecoveryActions(issueId)).toHaveLength(0);
+    await db.delete(issueRelations).where(eq(issueRelations.issueId, blockerId));
+
+    // Exhausted, nothing waiting: one board action, reachable, then quiet.
+    expect(turns.seen).toHaveLength(0);
+    await recoveryCycle(agentId);
+    await expectReachableBoardEscalationThenQuiet(companyId, ownerUserId, agentId, issueId);
+    const [action] = await openRecoveryActions(issueId);
+    expect(action!.evidence).toMatchObject({ terminalReason: "self_unblock_continuation_exhausted", latestRunId: nativeRunId });
+    expect(turns.seen).toHaveLength(0);
+
+    // The board restores the original owner through the supported route.
+    let resumedCtx: AdapterExecutionContext | null = null;
+    turns.queue.push(async (ctx) => {
+      resumedCtx = ctx as AdapterExecutionContext;
+      const closed = await request(asAgent(resumedCtx.runId)).patch(`/api/issues/${issueId}`).send({ status: "done" });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      return { summary: "Did the action and closed." };
+    });
+    const restored = await request(asBoard).post(`/api/issues/${issueId}/recovery-actions/resolve`).send({
+      actionId: action!.id, outcome: "restored", sourceIssueStatus: "todo", resolutionNote: "Retry the original owner.",
+    });
+    expect(restored.status, JSON.stringify(restored.body)).toBe(200);
+    await settle(agentId);
+    expect(turns.seen).toHaveLength(1);
+    expect((resumedCtx as unknown as AdapterExecutionContext).context.wakeReason).toBe("issue_recovery_action_restored");
+    expect((await issueRow(issueId)).status).toBe("done");
+    expect(await openRecoveryActions(issueId)).toHaveLength(0);
+
+    const again = await request(asBoard).post(`/api/issues/${issueId}/recovery-actions/resolve`).send({
+      actionId: action!.id, outcome: "restored", sourceIssueStatus: "todo", resolutionNote: "Retry the original owner.",
+    });
+    // A duplicate response is an idempotent replay: no second wake or run.
+    expect(again.status, JSON.stringify(again.body)).toBe(200);
+    await settle(agentId);
+    const runsAfter = (await runsFor(agentId)).length;
+    for (let cycle = 0; cycle < 3; cycle += 1) await recoveryCycle(agentId);
+    expect(turns.seen).toHaveLength(1);
+    expect(await runsFor(agentId)).toHaveLength(runsAfter);
+    expect(await openRecoveryActions(issueId)).toHaveLength(0);
   }, 120_000);
 });
