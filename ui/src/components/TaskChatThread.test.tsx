@@ -3052,6 +3052,34 @@ describe.each([true, false])("Unanswered question history (conversationMode=%s)"
     expect(takeover()?.querySelector('[role="radio"][aria-checked="true"]')?.textContent).toContain("Yes");
   });
 
+  it("cancels the question for good when Cancel can resolve it", async () => {
+    const onCancelInteraction = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatThread {...props} comments={[]} interactions={[old]} onCancelInteraction={onCancelInteraction} />);
+    await click("Cancel");
+    expect(onCancelInteraction).toHaveBeenCalledWith(old);
+    const cancelled = { ...old, status: "cancelled", result: { version: 1, cancellationReason: null } } as IssueThreadInteraction;
+    await act(async () => render(<TaskChatThread {...props} comments={[]} interactions={[cancelled]} onCancelInteraction={onCancelInteraction} />));
+    expect(takeover()).toBeNull();
+    expect(pendingIndicator()).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-unanswered-question"]')).toBeNull();
+  });
+
+  it("cancels a reopened historical question", async () => {
+    const onCancelInteraction = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatThread {...props} comments={movedOn} interactions={[old]} onCancelInteraction={onCancelInteraction} />);
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Answer question: Which color?"]')!.click());
+    await click("Cancel");
+    expect(onCancelInteraction).toHaveBeenCalledWith(old);
+  });
+
+  it("keeps the question open with an error when cancelling fails", async () => {
+    const onCancelInteraction = vi.fn().mockRejectedValue(new Error("Cancel failed"));
+    render(<TaskChatThread {...props} comments={[]} interactions={[old]} onCancelInteraction={onCancelInteraction} />);
+    await click("Cancel");
+    expect(takeover()?.textContent).toContain("Which color?");
+    expect(takeover()?.textContent).toContain("Cancel failed");
+  });
+
   it("keeps multiple historical questions out of the composer after reopening and dismissing one", async () => {
     const anotherOld = questionInteraction("another-old", "Which format?", "2026-08-15T12:00:02Z");
     render(<TaskChatThread {...props} comments={movedOn} interactions={[old, anotherOld]} />);

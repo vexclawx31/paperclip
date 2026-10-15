@@ -2758,6 +2758,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         onAcceptInteraction={onAcceptInteraction}
         onRejectInteraction={onRejectInteraction}
         onSubmitInteractionAnswers={onSubmitInteractionAnswers}
+        onCancelInteraction={onCancelInteraction}
         onSubmitInteractionVerdicts={onSubmitInteractionVerdicts}
         onUploadImage={imageUploadHandler}
         mentions={mentions}

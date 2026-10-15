@@ -51,9 +51,10 @@ export interface QuestionFormProps {
   mentions?: MentionOption[];
   onSubmit: (response: PaperclipQuestionResponse) => void | Promise<void>;
   /**
-   * Resolves the request itself (a timeline card cancelling the interaction).
-   * Inside the composer takeover the form falls back to dismissing the
-   * takeover, which returns the plain composer without touching the request.
+   * Resolves the request itself by cancelling the interaction, so the form
+   * goes away for good. Without it, Cancel inside the composer takeover falls
+   * back to dismissing the takeover, which keeps the request answerable in
+   * the feed. The takeover close (X) always keeps the question in the feed.
    */
   onCancel?: () => void | Promise<void>;
 }

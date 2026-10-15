@@ -1971,9 +1971,7 @@ export function TaskChatCompactInteractionCard({
         <AskUserQuestionsCard
           interaction={interaction}
           onSubmitInteractionAnswers={onSubmitInteractionAnswers}
-          onCancelInteraction={
-            presentation === "timeline" ? onCancelInteraction : undefined
-          }
+          onCancelInteraction={onCancelInteraction}
           errorMessage={errorMessage}
           draftKey={draftKey}
           onUploadImage={onUploadImage}
