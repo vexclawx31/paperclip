@@ -22,6 +22,31 @@ const INTERACTION_CONTINUATION_CONTEXT_KEYS = [
   "newlyResolvedItemIds",
 ] as const;
 
+// Mirrors UNBLOCK_REQUESTED_CONTINUATION_STATE in services/self-owned-unblock.ts.
+export const SELF_UNBLOCK_CONTINUATION_STATE = "unblock_requested";
+const SELF_UNBLOCK_INSTRUCTION_MAX_CHARS = 4000;
+
+/**
+ * An immediate recovery run starts from a fresh context, but an unsuccessful
+ * self-unblock follow-up's action binding must survive into it. Otherwise
+ * recovery relaunches a generic continuation and the owner's action never
+ * reaches a run. Only the exact bound state and instruction carry over.
+ */
+export function inheritedSelfUnblockBinding(finishingRun: {
+  status: string;
+  contextSnapshot: Record<string, unknown>;
+}): Record<string, unknown> {
+  if (finishingRun.status === "succeeded") return {};
+  const context = finishingRun.contextSnapshot;
+  if (readNonEmptyString(context.livenessContinuationState) !== SELF_UNBLOCK_CONTINUATION_STATE) return {};
+  const instruction = readNonEmptyString(context.livenessContinuationInstruction);
+  if (!instruction || instruction.length > SELF_UNBLOCK_INSTRUCTION_MAX_CHARS) return {};
+  return {
+    livenessContinuationState: SELF_UNBLOCK_CONTINUATION_STATE,
+    livenessContinuationInstruction: instruction,
+  };
+}
+
 function deriveTaskKey(
   contextSnapshot: Record<string, unknown> | null | undefined,
   payload: Record<string, unknown> | null | undefined,
