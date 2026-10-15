@@ -346,4 +346,3 @@ describeEmbeddedPostgres("self-unblock continuation (offline integration)", () =
     expect(unblock.map((w) => w.status)).not.toContain("coalesced");
   }, 60_000);
 });
-

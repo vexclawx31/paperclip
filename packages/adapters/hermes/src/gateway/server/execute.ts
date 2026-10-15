@@ -41,6 +41,8 @@ type HermesHttpError = Error & {
   retryNotBefore?: string | null;
   body?: unknown;
   transportCause?: unknown;
+  // Raw receiver reason; only errorResult renders it, after redaction.
+  receiverReason?: string;
 };
 
 type TerminalState = {
@@ -202,12 +204,19 @@ export function wakeReasonEnvValue(value: unknown): string | null {
   return flat ? truncateUtf8(flat, WAKE_REASON_ENV_MAX_BYTES) : null;
 }
 
-function receiverErrorText(body: unknown): string | null {
+function receiverErrorMessage(body: unknown): string | null {
   const record = asRecord(body);
   const error = record?.error;
-  const message = typeof error === "string" ? error : nonEmpty(asRecord(error)?.message) ?? nonEmpty(record?.message);
-  const flat = message ? flattenControlCharacters(message) : "";
-  return flat ? (flat.length <= 300 ? flat : `${flat.slice(0, 297)}...`) : null;
+  return typeof error === "string" ? nonEmpty(error) : nonEmpty(asRecord(error)?.message) ?? nonEmpty(record?.message);
+}
+
+// Redact the complete message before truncating: cutting first would leave a
+// partial echoed secret that no exact match can find. Redaction runs on the
+// flattened text because the redactor also matches every secret's flattened
+// form, which still catches an echo whose whitespace the receiver rewrote.
+function receiverErrorText(message: string, redactText: TextRedactor): string | null {
+  const redacted = redactText(flattenControlCharacters(message));
+  return redacted ? (redacted.length <= 300 ? redacted : `${redacted.slice(0, 297)}...`) : null;
 }
 
 function parseNonNegativeNumber(value: unknown, fallback: number): number {
@@ -295,20 +304,23 @@ function escapeRegExp(value: string): string {
 }
 
 function createTextRedactor(secrets: Array<string | null | undefined>): TextRedactor {
-  const exactSecrets = [...new Set(secrets.filter((secret): secret is string => typeof secret === "string" && secret.length >= 4))]
+  // Also match the flattened form so a secret survives no whitespace rewrite.
+  const configured = secrets.filter((secret): secret is string => typeof secret === "string" && secret.length >= 4);
+  const exactSecrets = [...new Set([...configured, ...configured.map(flattenControlCharacters)].filter((secret) => secret.length >= 4))]
     .sort((a, b) => b.length - a.length)
     .map((secret) => ({
       secret,
       regex: new RegExp(escapeRegExp(secret), "g"),
     }));
 
-  return (value: string) => {
-    let result = sanitizeSensitiveText(value);
-    for (const entry of exactSecrets) {
-      result = result.replace(entry.regex, `[redacted len=${entry.secret.length}]`);
-    }
-    return result;
-  };
+  // The generic patterns stop at whitespace, so they would consume only the
+  // first word of a secret containing whitespace and leave the rest
+  // unmatched; redact those secrets exactly before the patterns run.
+  const spacedSecrets = exactSecrets.filter((entry) => /\s/.test(entry.secret.replace(/^Bearer\s+/i, "")));
+  const redactExact = (value: string, entries: typeof exactSecrets) =>
+    entries.reduce((result, entry) => result.replace(entry.regex, `[redacted len=${entry.secret.length}]`), value);
+
+  return (value: string) => redactExact(sanitizeSensitiveText(redactExact(value, spacedSecrets)), exactSecrets);
 }
 
 function redactForLog(value: unknown, keyPath: string[] = [], depth = 0, redactText: TextRedactor = sanitizeSensitiveText): unknown {
@@ -518,9 +530,9 @@ async function fetchJson(input: RequestInfo | URL, init: RequestInit): Promise<u
   if (!response.ok) {
     const classified = classifyHttpError(response.status);
     // Receipts keep the receiver's reason (e.g. "Run environment denied by
-    // policy"); errorResult redacts the message before it is persisted.
-    const receiverReason = receiverErrorText(body);
-    const err = new Error(`Hermes gateway HTTP ${response.status}${receiverReason ? `: ${receiverReason}` : ""}`) as HermesHttpError;
+    // policy"), but only errorResult renders it, after full redaction.
+    const err = new Error(`Hermes gateway HTTP ${response.status}`) as HermesHttpError;
+    err.receiverReason = receiverErrorMessage(body) ?? undefined;
     err.status = response.status;
     err.code = classified.code;
     err.retryNotBefore = response.headers.get("retry-after");
@@ -897,7 +909,12 @@ async function fetchFinalStatus(input: {
 }
 
 function redactErrorMessage(err: unknown, redactText: TextRedactor = sanitizeSensitiveText): string {
-  if (err instanceof Error) return redactText(err.message);
+  if (err instanceof Error) {
+    const message = redactText(err.message);
+    const reason = (err as HermesHttpError).receiverReason;
+    const receiverReason = reason ? receiverErrorText(reason, redactText) : null;
+    return receiverReason ? `${message}: ${receiverReason}` : message;
+  }
   return redactText(String(err));
 }
 
@@ -943,7 +960,8 @@ function errorResult(err: unknown, baseUrl: URL, redactText: TextRedactor = sani
       // before refusing a later connection. This never proves non-dispatch.
       ...(loopbackRefused ? { category: "gateway_loopback_connection_refused", phase: "create_run" } : {}),
       ...(hermesError.status ? { status: hermesError.status } : {}),
-      ...(hermesError.body ? { body: redactForLog(hermesError.body, [], 0, redactText) as Record<string, unknown> } : {}),
+      // Flattened like the message so a whitespace-rewritten echo still matches.
+      ...(hermesError.body ? { body: redactForLog(hermesError.body, [], 0, (value) => redactText(flattenControlCharacters(value))) as Record<string, unknown> } : {}),
     },
   };
 }
