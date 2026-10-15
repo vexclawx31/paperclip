@@ -989,4 +989,50 @@ describe("scoped run environment", () => {
     expect(JSON.stringify(result)).not.toContain(RUN_JWT);
     expect(JSON.stringify(result)).not.toContain("secret-key");
   });
+
+  // No recognizable 12-character window of a synthetic credential may survive
+  // anywhere in the result or the run log.
+  function expectNoSecretFragments(haystack: string, secrets: string[]) {
+    for (const secret of secrets) {
+      for (let i = 0; i + 12 <= secret.length; i += 6) {
+        expect(haystack).not.toContain(secret.slice(i, i + 12));
+      }
+    }
+  }
+
+  it("redacts long echoed credentials before truncating the receiver reason", async () => {
+    const longKey = `synthetic-only-credential-${"k3y".repeat(140)}`;
+    const longJwt = `synthetic.run-token.${"j0t".repeat(140)}`;
+    // The echo starts well before the 300-character cutoff and runs past it.
+    const echo = `: ${"x".repeat(240)} key=${longKey}\nrun=${longJwt} auth=Bearer ${longKey}`;
+    vi.stubGlobal("fetch", policyReceiver({ reject: true, echoInRejection: echo }));
+    const ctx = scopedCtx({ apiKey: longKey });
+    ctx.authToken = longJwt;
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("Run environment denied by policy");
+    expect(result.errorMessage).not.toMatch(/[\u0000-\u001f\u007f]/);
+    const logs = JSON.stringify((ctx.onLog as ReturnType<typeof vi.fn>).mock.calls);
+    expectNoSecretFragments(`${JSON.stringify(result)}\n${logs}`, [longKey, longJwt]);
+  });
+
+  it("redacts a configured header secret even after control-character flattening reshapes it", async () => {
+    // Whitespace inside the secret is collapsed by flattening, so the exact
+    // configured value no longer appears in the flattened receipt text.
+    const spacedKey = `synthetic\tonly  key ${"s3c".repeat(20)}`;
+    const echoedKey = spacedKey.replace("\t", "\n");
+    vi.stubGlobal("fetch", policyReceiver({ reject: true, echoInRejection: ` header=Bearer ${echoedKey}` }));
+    const ctx = scopedCtx({ apiKey: spacedKey });
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("Run environment denied by policy");
+    const logs = JSON.stringify((ctx.onLog as ReturnType<typeof vi.fn>).mock.calls);
+    expectNoSecretFragments(`${JSON.stringify(result)}\n${logs}`, [
+      spacedKey, echoedKey, spacedKey.replace(/\s+/g, " "),
+    ]);
+  });
 });
