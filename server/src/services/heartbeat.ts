@@ -661,7 +661,7 @@ import {
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
 } from "./recovery/index.js";
-import { selfOwnedUnblockAction } from "./self-owned-unblock.js";
+import { selfOwnedUnblockAction, UNBLOCK_REQUESTED_CONTINUATION_STATE } from "./self-owned-unblock.js";
 import { selfUnblockFollowupContext } from "./recovery/legacy-continuation.js";
 import {
   buildConfigurationIncompleteRecoveryNoticeSeed,
@@ -6593,6 +6593,11 @@ export function heartbeatService(
         issueId,
         comment: decision.comment,
       });
+      // A comment alone is not an actionable escalation for a self-park: the
+      // blocked issue has no other recovery path, so route one board action.
+      if (issue?.status === "blocked") {
+        await recovery.escalateExhaustedNativeSelfPark({ id: issueId, companyId: run.companyId });
+      }
       return;
     }
 
@@ -10807,6 +10812,22 @@ export function heartbeatService(
         return null;
       }
 
+      const supersededBy = await supersededSelfUnblockFollowupReason(run, issueId, context);
+      if (supersededBy) {
+        await cancelQueuedRunForAdmissionGate(run, issueId, {
+          reason:
+            "Cancelled because the issue now has a durable waiting path; that wait owns the next action and wakes the assignee when it resolves",
+          errorCode: "self_unblock_superseded_by_wait",
+          timeoutSource: "self_unblock_wait_gate",
+          payload: { issueId, durablePathReason: supersededBy },
+        });
+        logger.info(
+          { runId: run.id, issueId, durablePathReason: supersededBy },
+          "claimQueuedRun: cancelled self-unblock follow-up behind a real wait",
+        );
+        return null;
+      }
+
       const staleness = await runDispatch.cancelStaleQueuedRun({
         runId: run.id,
         companyId: run.companyId,
@@ -11399,19 +11420,33 @@ export function heartbeatService(
     issueId: string,
     unresolvedBlockerIssueIds: string[],
   ) {
+    return cancelQueuedRunForAdmissionGate(run, issueId, {
+      reason:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+      errorCode: "issue_dependencies_blocked",
+      timeoutSource: "dependency_gate",
+      payload: { issueId, unresolvedBlockerIssueIds },
+    });
+  }
+
+  // Never-started queued run refused at admission: no adapter was entered.
+  async function cancelQueuedRunForAdmissionGate(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueId: string,
+    gate: { reason: string; errorCode: string; timeoutSource: string; payload: Record<string, unknown> },
+  ) {
     const now = new Date();
-    const reason =
-      "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve";
+    const reason = gate.reason;
     const cancelled = await setRunStatus(run.id, "cancelled", {
       finishedAt: now,
       error: reason,
-      errorCode: "issue_dependencies_blocked",
+      errorCode: gate.errorCode,
       resultJson: {
         ...parseObject(run.resultJson),
-        stopReason: "issue_dependencies_blocked",
+        stopReason: gate.errorCode,
         effectiveTimeoutSec: 0,
         timeoutConfigured: false,
-        timeoutSource: "dependency_gate",
+        timeoutSource: gate.timeoutSource,
         timeoutFired: false,
       },
     });
@@ -11443,10 +11478,7 @@ export function heartbeatService(
       stream: "system",
       level: "warn",
       message: reason,
-      payload: {
-        issueId,
-        unresolvedBlockerIssueIds,
-      },
+      payload: gate.payload,
     });
 
     return cancelled;
@@ -11603,6 +11635,31 @@ export function heartbeatService(
     if (!issue || !action || issue.assigneeAgentId !== run.agentId || issue.assigneeUserId) return null;
     const state = await collectDispositionRepairSourceState(db, { issue, excludeRunId: run.id });
     return state.hasDurableWaitingPath ? null : action;
+  }
+
+  // A queued run bound to "do this unblock action now" is admitted only while
+  // that is still true. A wait recorded after the notification (pending
+  // interaction/approval, monitor, execution stage, blocker) or a changed
+  // descriptor owns the next action instead. Interaction answers are new
+  // input and keep their own admission rules.
+  async function supersededSelfUnblockFollowupReason(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
+    issueId: string,
+    context: Record<string, unknown>,
+  ): Promise<string | null> {
+    if (readNonEmptyString(context.livenessContinuationState) !== UNBLOCK_REQUESTED_CONTINUATION_STATE) return null;
+    if (hasInteractionContinuationWakeContext(context)) return null;
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issue || issue.assigneeAgentId !== run.agentId) return null;
+    const state = await collectDispositionRepairSourceState(db, { issue, excludeRunId: run.id });
+    if (state.durablePathReason) return state.durablePathReason;
+    return issue.status === "blocked" && !selfOwnedUnblockAction(issue, run.agentId)
+      ? "unblock_descriptor_changed"
+      : null;
   }
 
   async function buildRunLivenessInput(

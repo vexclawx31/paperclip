@@ -47,6 +47,39 @@ export function inheritedSelfUnblockBinding(finishingRun: {
   };
 }
 
+function nonNegativeCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+/**
+ * An immediate recovery run must also continue the unsuccessful run's bounded
+ * continuation episode: its identity and the allowance already spent. A fresh
+ * episode here would let refused launch -> successful recovery -> self-park
+ * restart the count on every cycle. Model-profile and other recovery fields
+ * stay fresh; only these counters carry over.
+ */
+export function inheritedContinuationEpisode(finishingRun: {
+  status: string;
+  contextSnapshot: Record<string, unknown>;
+}): Record<string, unknown> {
+  if (finishingRun.status === "succeeded") return {};
+  const context = finishingRun.contextSnapshot;
+  const legacy =
+    context.legacyDispositionEpisode && typeof context.legacyDispositionEpisode === "object" && !Array.isArray(context.legacyDispositionEpisode)
+      ? (context.legacyDispositionEpisode as Record<string, unknown>)
+      : null;
+  const legacyId = readNonEmptyString(legacy?.id);
+  const sourceRunId = legacyId ?? readNonEmptyString(context.livenessContinuationSourceRunId);
+  const attempt = nonNegativeCount(legacyId ? legacy?.attempt : context.livenessContinuationAttempt);
+  if (!sourceRunId || attempt < 1) return {};
+  const maxAttempts = nonNegativeCount(legacyId ? legacy?.maxAttempts : context.livenessContinuationMaxAttempts);
+  return {
+    livenessContinuationSourceRunId: sourceRunId,
+    livenessContinuationAttempt: attempt,
+    ...(maxAttempts > 0 ? { livenessContinuationMaxAttempts: maxAttempts } : {}),
+  };
+}
+
 function deriveTaskKey(
   contextSnapshot: Record<string, unknown> | null | undefined,
   payload: Record<string, unknown> | null | undefined,
