@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -87,6 +89,8 @@ import { issueService } from "../services/issues.ts";
 import { attentionService } from "../services/attention.ts";
 import { deliverAgentUnblockNotification } from "../services/routable-blocked.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import { errorHandler } from "../middleware/index.js";
+import { issueRoutes } from "../routes/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -284,8 +288,9 @@ describeEmbeddedPostgres("failed self-unblock follow-up recovery (offline integr
     expect(items).toHaveLength(1);
     expect(items[0]!.subject.id).toBe(actions[0]!.id);
 
-    // Restart / repeated ticks: no new run, wake or escalation; the spent
-    // budget and the hold are never reset automatically.
+    // Repeated recovery ticks (same process; not a server restart): no new
+    // run, wake or escalation; the spent budget and the hold are never reset
+    // automatically.
     const runsBefore = (await runsFor(agentId)).length;
     const wakesBefore = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).length;
     const seenBefore = turns.seen.length;
@@ -362,22 +367,102 @@ describeEmbeddedPostgres("failed self-unblock follow-up recovery (offline integr
     await expectReachableBoardEscalationThenQuiet(companyId, ownerUserId, agentId, issueId);
   }, 120_000);
 
-  it("real human prerequisite: a pending interaction holds recovery; its recorded answer resumes it", async () => {
-    const { companyId, agentId, issueId } = await seed();
-    const interactionId = randomUUID();
-    await failedFollowup(agentId, issueId, "refused", { refusals: 1, after: [async () => {
-      // The recovery launch records a real human prerequisite, then exits.
-      await db.insert(issueThreadInteractions).values({
-        id: interactionId, companyId, issueId, kind: "request_confirmation", status: "pending",
-        createdByUserId: "responsible-user", payload: { prompt: "Approve the roadmap scope" },
-      });
-      return { summary: "Asked the board to approve the roadmap scope." };
-    }] });
-    const seenBefore = turns.seen.length;
+  // The supported HTTP surface (issue routes) with a fixed actor; the same
+  // fake adapter executes whatever the routes wake.
+  function api(actor: Record<string, unknown>) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as any).actor = actor;
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as any));
+    app.use(errorHandler);
+    return app;
+  }
+
+  it("real human prerequisite: recorded interaction holds recovery; the board's recorded answer resumes productive work once", async () => {
+    const { companyId, agentId, issueId, ownerUserId } = await seed();
+    const asAgent = (runId: string) => api({ type: "agent", source: "agent_key", companyId, agentId, runId });
+    const asBoard = api({
+      type: "board", source: "session", userId: ownerUserId, companyIds: [companyId],
+      memberships: [{ companyId, status: "active", membershipRole: "owner" }], isInstanceAdmin: false,
+    });
+    let interactionId = "";
+    let resumedCtx: AdapterExecutionContext | null = null;
+
+    const followup = await failedFollowup(agentId, issueId, "refused", { refusals: 1, after: [
+      // The recovery launch needs a human decision: it records one through the
+      // supported interaction route and parks on it.
+      async (ctx) => {
+        const runId = (ctx as AdapterExecutionContext).runId;
+        const created = await request(asAgent(runId)).post(`/api/issues/${issueId}/interactions`).send({
+          kind: "request_confirmation",
+          continuationPolicy: "wake_assignee",
+          payload: { version: 1, prompt: "Approve the roadmap scope before I reconcile B1/B2?" },
+        });
+        expect(created.status, JSON.stringify(created.body)).toBe(201);
+        interactionId = created.body.id;
+        const parked = await request(asAgent(runId)).patch(`/api/issues/${issueId}`).send({ status: "in_review" });
+        expect(parked.status, JSON.stringify(parked.body)).toBe(200);
+        return { summary: "Asked the board to approve the roadmap scope." };
+      },
+      // The resumed run performs the scripted productive action.
+      async (ctx) => {
+        resumedCtx = ctx as AdapterExecutionContext;
+        const closed = await request(asAgent(resumedCtx.runId)).patch(`/api/issues/${issueId}`).send({ status: "done" });
+        expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+        return { summary: "Reconciled and closed." };
+      },
+    ] });
     for (let cycle = 0; cycle < 3; cycle += 1) await recoveryCycle(agentId);
-    // Held: no further launch and no escalation while the human decides.
-    expect(turns.seen).toHaveLength(seenBefore);
+
+    // The recovery launch ran and recorded a real pending interaction.
+    const recoveryRun = (await runsFor(agentId)).find((r) => r.retryOfRunId === followup.id)!;
+    expect(recoveryRun.status).toBe("succeeded");
+    expect(interactionId).not.toBe("");
+    const [pending] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+    expect(pending).toMatchObject({ status: "pending", sourceRunId: recoveryRun.id, kind: "request_confirmation" });
+
+    // Held: repeated ticks launch nothing and escalate nothing while it waits.
+    const seenWhileHeld = turns.seen.length;
+    const runsWhileHeld = (await runsFor(agentId)).length;
+    for (let cycle = 0; cycle < 3; cycle += 1) await recoveryCycle(agentId);
+    expect(turns.seen).toHaveLength(seenWhileHeld);
+    expect(await runsFor(agentId)).toHaveLength(runsWhileHeld);
     expect(await openRecoveryActions(issueId)).toHaveLength(0);
-    expect((await issueRow(issueId)).status).not.toBe("done");
+    expect((await issueRow(issueId)).status).toBe("in_review");
+
+    // The responsible board user answers through the supported accept route.
+    const accepted = await request(asBoard).post(`/api/issues/${issueId}/interactions/${interactionId}/accept`).send({});
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    const [answered] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+    expect(answered).toMatchObject({ status: "accepted", resolvedByUserId: ownerUserId });
+    expect(answered!.resolvedAt).toBeInstanceOf(Date);
+    await settle(agentId);
+
+    // Wake receipt: the fake runner received the continuation for this answer,
+    // and its scripted productive work completed the issue.
+    expect(turns.seen).toHaveLength(seenWhileHeld + 1);
+    expect(resumedCtx).not.toBeNull();
+    const resumed = resumedCtx as unknown as AdapterExecutionContext;
+    expect(resumed.context.interactionId).toBe(interactionId);
+    const resumedRun = (await runsFor(agentId)).find((r) => r.id === resumed.runId)!;
+    expect(resumedRun.status).toBe("succeeded");
+    expect((resumedRun.contextSnapshot as Record<string, unknown>).interactionId).toBe(interactionId);
+    expect((await issueRow(issueId)).status).toBe("done");
+
+    // Duplicate delivery of the same answer is refused, and further ticks
+    // start no second execution or effect.
+    const runsAfter = (await runsFor(agentId)).length;
+    const wakesAfter = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).length;
+    const again = await request(asBoard).post(`/api/issues/${issueId}/interactions/${interactionId}/accept`).send({});
+    expect(again.status).toBeGreaterThanOrEqual(400);
+    for (let cycle = 0; cycle < 3; cycle += 1) await recoveryCycle(agentId);
+    expect(turns.seen).toHaveLength(seenWhileHeld + 1);
+    expect(await runsFor(agentId)).toHaveLength(runsAfter);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(wakesAfter);
+    expect(await openRecoveryActions(issueId)).toHaveLength(0);
+    expect((await issueRow(issueId)).status).toBe("done");
   }, 120_000);
 });
