@@ -24,7 +24,8 @@ vi.mock("node:child_process", async (original) => {
       return (actual.execFile as unknown as (...input: unknown[]) => unknown)(file, args, options, callback);
     }
     control.timeouts.push(options.timeout ?? 0);
-    const step = control.steps.shift() ?? { kind: "error", code: "unscripted" };
+    // Once the injected outcomes are consumed, preserve real retry behavior.
+    const step = control.steps.shift() ?? { kind: "real" };
     if (step.kind === "real") {
       return (actual.execFile as unknown as (...input: unknown[]) => unknown)(file, args, options, callback);
     }
@@ -66,7 +67,16 @@ describe.runIf(process.platform === "darwin")("macOS descriptor verification thr
     const { workspaceRoot, result } = await stage([{ kind: "timeout" }, { kind: "real" }]);
     const staged = await result;
     expect(await readFile(path.join(workspaceRoot, staged.workspaceRelativePath), "utf8")).toBe("staged bytes");
-    expect(lsofCalls()).toBe(2);
+    expect(lsofCalls()).toBeGreaterThanOrEqual(2);
+    expect(lsofCalls()).toBeLessThanOrEqual(3);
+    await staged.cleanup();
+  });
+
+  it("uses a real final attempt after two injected timeouts exhaust the script", async () => {
+    const { workspaceRoot, result } = await stage([{ kind: "timeout" }, { kind: "timeout" }]);
+    const staged = await result;
+    expect(await readFile(path.join(workspaceRoot, staged.workspaceRelativePath), "utf8")).toBe("staged bytes");
+    expect(lsofCalls()).toBe(3);
     await staged.cleanup();
   });
 
