@@ -166,6 +166,8 @@ export function hasCompanyAccess(req: Request, companyId: string): boolean {
  * handler. Wraps the two-step pattern described on `hasCompanyAccess` so
  * new routes cannot accidentally reintroduce the existence oracle:
  *
+ *   - unauthenticated actor     → throws 401 "Authentication required" for
+ *     every id, before the lookup result is used
  *   - missing resource          → 404 `{ error: notFoundMessage }`, returns null
  *   - exists but cross-tenant   → identical 404, returns null
  *   - accessible                → runs `assertCompanyAccess` (write-path
@@ -186,13 +188,12 @@ export async function getAccessibleResource<T extends { companyId: string }>(
   notFoundMessage: string,
 ): Promise<T | null> {
   // An unauthenticated request (missing or malformed Authorization, e.g. a
-  // token sent without the `Bearer ` prefix) gets 401 for every id, before
-  // any lookup result is used, so it neither reveals existence nor looks
-  // like a missing resource to the caller.
+  // token sent without the `Bearer ` prefix) gets 401 for every id without
+  // waiting for the lookup, so it neither reveals existence nor looks like a
+  // missing resource to the caller.
   if (req.actor.type === "none") {
-    await Promise.resolve(resource).catch(() => undefined);
-    res.status(401).json({ error: "Authentication required: send Authorization: Bearer <token>" });
-    return null;
+    Promise.resolve(resource).catch(() => undefined);
+    throw unauthorized("Authentication required");
   }
   const resolved = await resource;
   if (!resolved || !hasCompanyAccess(req, resolved.companyId)) {
