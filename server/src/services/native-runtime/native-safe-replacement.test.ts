@@ -496,62 +496,6 @@ const support = externalDatabaseUrl
       expect(await getExecutionBlocker(db, other.companyId, other.issueId)).toMatchObject({ runId: other.runId });
     });
 
-    it.each(["receipt", "no-receipt", "changed-since"] as const)(
-      "retires an already-settled operator-delivery block (%s) and restores only an unchanged settle block",
-      async (mode) => {
-        const source = await seed();
-        await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.runId));
-        const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled",
-          errorCode: "operator_interrupted", error: "Interrupted to send queued messages",
-          resultJson: { operatorInterrupted: true, interruptionSource: "issue_comment_interrupt" },
-        }).where(eq(heartbeatRuns.id, source.runId)).returning();
-        // The block an earlier automatic disposition recorded.
-        const [blocked] = await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, source.issueId)).returning();
-        const [hold] = await db.insert(issueRecoveryActions).values({
-          companyId: source.companyId, sourceIssueId: source.issueId, kind: "active_run_watchdog", ownerType: "board",
-          returnOwnerAgentId: source.agentId, cause: "legacy_execution_requires_reconciliation",
-          fingerprint: `legacy-execution:${source.runId}`, status: "resolved", outcome: "blocked",
-          nextAction: "Automatic recovery stopped.",
-          evidence: { runId: source.runId,
-            ...(mode === "no-receipt" ? {} : { legacyFailureBlock: { runId: source.runId, statusVersion: blocked!.statusVersion, previousStatus: "in_progress" } }),
-            automaticRecovery: { policy: "preserve_without_replay_v1", runId: source.runId, replay: "blocked", actionOutcome: "unknown" } },
-        }).returning();
-        if (mode === "changed-since") {
-          await db.update(issues).set({ statusVersion: blocked!.statusVersion + 1 }).where(eq(issues.id, source.issueId));
-        }
-        expect(await getExecutionBlocker(db, source.companyId, source.issueId)).toMatchObject({ runId: source.runId });
-        const promote = vi.fn(async () => {});
-        await settleUnrecoverableExecutions(db, new Date(), { promoteDeferredWakes: promote });
-        const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold!.id));
-        expect(action!.evidence).toMatchObject({ automaticRecovery: { replay: "operator_handoff", previousReplay: "blocked" } });
-        expect(action!.evidence.operatorHandoffNote).toContain("operator interrupted this run");
-        expect(await getExecutionBlocker(db, source.companyId, source.issueId)).toBeNull();
-        const [task] = await db.select().from(issues).where(eq(issues.id, source.issueId));
-        expect(task!.status).toBe(mode === "receipt" ? "todo" : "blocked");
-        expect(promote).toHaveBeenCalledWith({ id: source.runId, companyId: source.companyId });
-        const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.runId));
-        expect(after!.executionStatusDeliveryId).not.toBe(run!.executionStatusDeliveryId);
-        const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, source.runId));
-        expect(events.some(event => event.payload?.replay === "operator_handoff")).toBe(true);
-        // Idempotent: a second sweep changes nothing and promotes nothing.
-        promote.mockClear();
-        await settleUnrecoverableExecutions(db, new Date(), { promoteDeferredWakes: promote });
-        expect(promote).not.toHaveBeenCalled();
-      },
-    );
-
-    it("records a legacy settle receipt so a later retirement can prove the block is unchanged", async () => {
-      const source = await seed();
-      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.runId));
-      const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "failed", errorCode: "adapter_failed", resultJson: {} })
-        .where(eq(heartbeatRuns.id, source.runId)).returning();
-      await terminalizeLegacyExecution({ db, run: run!, status: "failed" });
-      await settleUnrecoverableExecutions(db);
-      const [task] = await db.select().from(issues).where(eq(issues.id, source.issueId));
-      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
-      expect(action!.evidence).toMatchObject({ legacyFailureBlock: { runId: source.runId, statusVersion: task!.statusVersion, previousStatus: "in_progress" } });
-    });
-
     it("does not reopen a reconciled legacy run while continuation is pending", async () => {
       const source = await seed();
       const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled" }).where(eq(heartbeatRuns.id, source.runId)).returning();

@@ -169,18 +169,7 @@ describe("stopped task recovery notice", () => {
     expect(container.querySelector("form")).toBeNull();
     expect(container.textContent).toContain("Reconcile and continue");
   });
-  it("continues a stopped reviewer's hold in review", async () => {
-    vi.mocked(issuesApi.resolveRecoveryAction).mockResolvedValue({} as never);
-    await renderCancelledHold({ continueStatus: "in_review" });
-    await act(async () => buttonByText("Reconcile and continue").click());
-    const form = container.querySelector("form")!;
-    expect(form.textContent).toContain("The review continues with its current reviewer.");
-    await fillValidForm(form);
-    await act(async () => form.querySelector<HTMLButtonElement>('button[type="submit"]')!.click());
-    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
-    expect(issuesApi.resolveRecoveryAction).toHaveBeenCalledWith("task", expect.objectContaining({ sourceIssueStatus: "in_review" }));
-  });
-  it("requires workspace repair evidence for an unsafe workspace restore hold", async () => {
+  it("requires workspace repair evidence when the server reports a workspace restore failure", async () => {
     vi.mocked(issuesApi.resolveRecoveryAction).mockResolvedValue({} as never);
     await renderCancelledHold({ workspaceRepairRequired: true });
     await act(async () => buttonByText("Reconcile and continue").click());

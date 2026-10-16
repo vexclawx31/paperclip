@@ -5,8 +5,6 @@ export interface ExecutionBlocker {
   agentId: string | null;
   cause: string;
   nextAction: string;
-  /** Task status a board reconciliation restores: in_review for a stopped review participant. */
-  continueStatus?: "todo" | "in_review";
   /** The stopped run's workspace restore was unsafe; reconciliation needs workspace repair evidence. */
   workspaceRepairRequired?: boolean;
 }

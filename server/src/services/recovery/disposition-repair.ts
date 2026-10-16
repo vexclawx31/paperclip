@@ -19,6 +19,7 @@ import { deriveCommentId } from "../../modules/run-dispatch/domain/wake-context.
 import {
   dispositionRepairQuietEligible,
   isBoundLegacyDispositionRepairRun,
+  legacyDispositionEpisode,
   legacyDispositionRepairSourceRunId,
   repairRunOwnsCurrentStatus,
 } from "./legacy-continuation.js";
@@ -150,54 +151,64 @@ export async function readIssueDurableWaitingPath(
   return (await collectDispositionRepairSourceState(db, { issue: current })).durablePathReason;
 }
 
-const MAX_REPAIR_SOURCE_HOPS = 8;
-
 function readRunString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-/** A server-scheduled disposition repair (episode or fingerprint) or its infrastructure retry. */
-function isDispositionRepairContext(context: Record<string, unknown>): boolean {
-  const episode = context.legacyDispositionEpisode;
-  return Boolean(readRunString(context.dispositionRepairFingerprint) ||
-    (episode && typeof episode === "object" && readRunString((episode as Record<string, unknown>).id)));
+/**
+ * The run a disposition repair was scheduled from, or the run itself when it
+ * is not a repair. An episode repair names its source run in the persisted
+ * episode. A fingerprint repair names it in retryOfRunId. Returns null when
+ * the source cannot be named without walking further.
+ */
+function dispositionRepairSourceRunId(run: { id: string; contextSnapshot?: unknown }): string | null {
+  const context = (run.contextSnapshot ?? {}) as Record<string, unknown>;
+  if (legacyDispositionRepairSourceRunId(run)) {
+    const episodeId = legacyDispositionEpisode(run).id;
+    return isUuidLike(episodeId) ? episodeId : null;
+  }
+  if (readRunString(context.dispositionRepairFingerprint)) {
+    const sourceId = readRunString(context.retryOfRunId);
+    return sourceId && isUuidLike(sourceId) ? sourceId : null;
+  }
+  return run.id;
 }
 
 /**
  * A pending question card is no longer the task's wait when the agent already
- * acted on a newer operator comment. This walks from the issue's latest run
- * for its assignee back through disposition repairs to the original source
- * run. That run must be legacy and succeeded, and it must have been woken
- * (issue_commented) by a live user comment. The issue must still be todo or
- * in_progress. Returns that comment's creation time, or null.
+ * acted on a newer operator comment. The rule reads the issue's latest
+ * assignee run, the disposition-repair source it names, and the waking
+ * comment: at most three indexed lookups. The source run must be legacy and
+ * succeeded, and it must have been woken (issue_commented) by a live user
+ * comment. Returns that comment's creation time, or null.
  *
- * Every disposition decision reads the wait through
- * collectDispositionRepairSourceState, so recovery scheduling, dispatch
- * admission and quiet presentation agree on this rule.
+ * Disposition repair applies it while the issue is todo or in_progress. The
+ * board's retry of an escalated repair also allows blocked, the status that
+ * escalation set. Every caller uses this one helper, so recovery scheduling,
+ * dispatch admission, quiet presentation and the board retry agree.
  */
 export async function staleQuestionCutoffForIssue(
   db: Db,
   issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "assigneeAgentId">,
+  options: { allowBlocked?: boolean } = {},
 ): Promise<Date | null> {
-  if (!["todo", "in_progress"].includes(issue.status) || !issue.assigneeAgentId) return null;
-  const agentId = issue.assigneeAgentId;
-  const runOnIssue = (runId?: string) => db.select().from(heartbeatRuns).where(and(
+  const statuses = options.allowBlocked ? ["todo", "in_progress", "blocked"] : ["todo", "in_progress"];
+  if (!statuses.includes(issue.status) || !issue.assigneeAgentId) return null;
+  const [latest] = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId),
-    eq(heartbeatRuns.agentId, agentId),
-    sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId') = ${issue.id}`,
-    runId ? eq(heartbeatRuns.id, runId) : undefined,
-  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1).then((rows) => rows[0] ?? null);
-  let run = await runOnIssue();
-  for (let hop = 0; run && isDispositionRepairContext(run.contextSnapshot ?? {}); hop += 1) {
-    if (hop >= MAX_REPAIR_SOURCE_HOPS) return null;
-    const context = run.contextSnapshot ?? {};
-    const sourceId = readRunString(context.dispositionRepairSourceRunId) ?? readRunString(context.retryOfRunId);
-    if (!sourceId || !isUuidLike(sourceId) || sourceId === run.id) return null;
-    run = await runOnIssue(sourceId);
-  }
-  if (!run || run.runtimeMode !== "legacy" || run.status !== "succeeded") return null;
-  const context = run.contextSnapshot ?? {};
-  if (context.wakeReason !== "issue_commented") return null;
+    eq(heartbeatRuns.agentId, issue.assigneeAgentId),
+    sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  if (!latest) return null;
+  const sourceId = dispositionRepairSourceRunId(latest);
+  if (!sourceId) return null;
+  const [source] = sourceId === latest.id ? [latest] : await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sourceId),
+  )).limit(1);
+  if (!source || source.agentId !== issue.assigneeAgentId || source.runtimeMode !== "legacy" ||
+      source.status !== "succeeded") return null;
+  const context = source.contextSnapshot ?? {};
+  if (context.issueId !== issue.id || context.wakeReason !== "issue_commented") return null;
   const commentId = deriveCommentId(context);
   if (!commentId || !isUuidLike(commentId)) return null;
   const [comment] = await db.select({ createdAt: issueComments.createdAt }).from(issueComments).where(and(
@@ -210,6 +221,14 @@ export async function staleQuestionCutoffForIssue(
     isNull(issueComments.deletedAt),
   )).limit(1);
   return comment?.createdAt ?? null;
+}
+
+/** Pending ask_user_questions cards older than the cutoff are not a wait. */
+export function isStaleQuestion(
+  row: { kind: string; createdAt: Date },
+  cutoff: Date | null,
+): boolean {
+  return Boolean(cutoff && row.kind === "ask_user_questions" && row.createdAt.getTime() < cutoff.getTime());
 }
 
 export async function collectDispositionRepairSourceState(
@@ -333,8 +352,7 @@ export async function collectDispositionRepairSourceState(
     ? await staleQuestionCutoffForIssue(db, issue)
     : null;
   const pendingInteraction = interactions.some((row) => row.status === "pending" &&
-    !(staleQuestionCutoff && row.kind === "ask_user_questions" &&
-      row.createdAt.getTime() < staleQuestionCutoff.getTime()));
+    !isStaleQuestion(row, staleQuestionCutoff));
   const pendingApproval = linkedApprovals.some((row) =>
     row.status === "pending" || row.status === "revision_requested",
   );

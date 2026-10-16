@@ -105,13 +105,12 @@ function ReconcileRunForm({ issueId, blocker, onCancel, onReconciled }: {
   const [outcomeEvidence, setOutcomeEvidence] = useState("");
   const [workspaceRepairEvidence, setWorkspaceRepairEvidence] = useState("");
   const [providerStopped, setProviderStopped] = useState(false);
-  const continueStatus = blocker.continueStatus === "in_review" ? "in_review" : "todo";
   const needsWorkspaceRepair = blocker.workspaceRepairRequired === true;
   const reconcile = useMutation({
     mutationFn: () => issuesApi.resolveRecoveryAction(issueId, {
       actionId: blocker.recoveryActionId!,
       outcome: "restored",
-      sourceIssueStatus: continueStatus,
+      sourceIssueStatus: "todo",
       executionReconciliation: {
         runId: blocker.runId!,
         providerStopped: true,
@@ -132,9 +131,7 @@ function ReconcileRunForm({ issueId, blocker, onCancel, onReconciled }: {
       onSubmit={(event) => { event.preventDefault(); if (canSubmit) reconcile.mutate(); }}
     >
       <p className="text-muted-foreground">
-        Record what the stopped run did. {continueStatus === "in_review"
-          ? "The review continues with its current reviewer."
-          : "The task returns to To do and its agent continues from there."} Actions are not repeated.
+        Record what the stopped run did. The task returns to To do and its agent continues from there. Actions are not repeated.
         {blocker.agentId && blocker.runId && (
           <> <Link className="underline" to={`/agents/${blocker.agentId}/runs/${blocker.runId}`}>Inspect run</Link></>
         )}
