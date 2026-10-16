@@ -22,6 +22,64 @@ const INTERACTION_CONTINUATION_CONTEXT_KEYS = [
   "newlyResolvedItemIds",
 ] as const;
 
+// Mirrors UNBLOCK_REQUESTED_CONTINUATION_STATE in services/self-owned-unblock.ts.
+export const SELF_UNBLOCK_CONTINUATION_STATE = "unblock_requested";
+const SELF_UNBLOCK_INSTRUCTION_MAX_CHARS = 4000;
+
+/**
+ * An immediate recovery run starts from a fresh context, but an unsuccessful
+ * self-unblock follow-up's action binding must survive into it. Otherwise
+ * recovery relaunches a generic continuation and the owner's action never
+ * reaches a run. Only the exact bound state and instruction carry over.
+ */
+export function inheritedSelfUnblockBinding(finishingRun: {
+  status: string;
+  contextSnapshot: Record<string, unknown>;
+}): Record<string, unknown> {
+  if (finishingRun.status === "succeeded") return {};
+  const context = finishingRun.contextSnapshot;
+  if (readNonEmptyString(context.livenessContinuationState) !== SELF_UNBLOCK_CONTINUATION_STATE) return {};
+  const instruction = readNonEmptyString(context.livenessContinuationInstruction);
+  if (!instruction || instruction.length > SELF_UNBLOCK_INSTRUCTION_MAX_CHARS) return {};
+  return {
+    livenessContinuationState: SELF_UNBLOCK_CONTINUATION_STATE,
+    livenessContinuationInstruction: instruction,
+  };
+}
+
+function nonNegativeCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+/**
+ * An immediate recovery run must also continue the unsuccessful run's bounded
+ * continuation episode: its identity and the allowance already spent. A fresh
+ * episode here would let refused launch -> successful recovery -> self-park
+ * restart the count on every cycle. Model-profile and other recovery fields
+ * stay fresh; only these counters carry over.
+ */
+export function inheritedContinuationEpisode(finishingRun: {
+  status: string;
+  contextSnapshot: Record<string, unknown>;
+}): Record<string, unknown> {
+  if (finishingRun.status === "succeeded") return {};
+  const context = finishingRun.contextSnapshot;
+  const legacy =
+    context.legacyDispositionEpisode && typeof context.legacyDispositionEpisode === "object" && !Array.isArray(context.legacyDispositionEpisode)
+      ? (context.legacyDispositionEpisode as Record<string, unknown>)
+      : null;
+  const legacyId = readNonEmptyString(legacy?.id);
+  const sourceRunId = legacyId ?? readNonEmptyString(context.livenessContinuationSourceRunId);
+  const attempt = nonNegativeCount(legacyId ? legacy?.attempt : context.livenessContinuationAttempt);
+  if (!sourceRunId || attempt < 1) return {};
+  const maxAttempts = nonNegativeCount(legacyId ? legacy?.maxAttempts : context.livenessContinuationMaxAttempts);
+  return {
+    livenessContinuationSourceRunId: sourceRunId,
+    livenessContinuationAttempt: attempt,
+    ...(maxAttempts > 0 ? { livenessContinuationMaxAttempts: maxAttempts } : {}),
+  };
+}
+
 function deriveTaskKey(
   contextSnapshot: Record<string, unknown> | null | undefined,
   payload: Record<string, unknown> | null | undefined,

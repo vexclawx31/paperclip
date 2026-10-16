@@ -168,7 +168,7 @@ import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { nativeRetryCancellationCommitCondition, rethrowNativeCancellationLockConflict, claimCancellationRequest, startupCancellationFence } from "./native-runtime/native-cancellation-request.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
-import { resolveDispositionOnlyRecoveryQuiet } from "./recovery/disposition-repair.js";
+import { collectDispositionRepairSourceState, resolveDispositionOnlyRecoveryQuiet } from "./recovery/disposition-repair.js";
 
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { restoreNativeWorkspaceBestEffort } from "./native-runtime/native-workspace-best-effort.js";
@@ -661,6 +661,8 @@ import {
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
 } from "./recovery/index.js";
+import { selfOwnedUnblockAction, UNBLOCK_REQUESTED_CONTINUATION_STATE } from "./self-owned-unblock.js";
+import { selfUnblockFollowupContext } from "./recovery/legacy-continuation.js";
 import {
   buildConfigurationIncompleteRecoveryNoticeSeed,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
@@ -1344,6 +1346,9 @@ const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set([
   "approval_approved",
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   "issue_recovery_action_restored",
+  // A blocked transition made inside the owner's own run must not be marked
+  // delivered into that exiting run; it needs one queued follow-up.
+  "issue_unblock_requested",
 ]);
 
 const SESSIONED_LOCAL_ADAPTERS = new Set([
@@ -2522,11 +2527,29 @@ export function resolvedInteractionCheckoutExpectedStatuses() {
   return ["in_progress", "in_review"] as const;
 }
 
+/**
+ * A self-unblock wake that lands while the owner's own run on the issue is
+ * running becomes a follow-up that continues that run's bounded episode, so
+ * park -> self-wake -> park cannot loop. At the cap it is not queued: it
+ * coalesces, and the running run's continuation decision escalates.
+ */
+export function applySelfUnblockFollowupEpisode(
+  contextSnapshot: Record<string, unknown>,
+  runningRun: { id: string; status: string; contextSnapshot?: unknown; continuationAttempt?: number | null } | null,
+) {
+  if (!runningRun || runningRun.status !== "running") return;
+  if (readNonEmptyString(contextSnapshot.wakeReason) !== "issue_unblock_requested") return;
+  const followup = selfUnblockFollowupContext(runningRun);
+  if (followup) Object.assign(contextSnapshot, followup);
+  else contextSnapshot.selfUnblockFollowupCapReached = true;
+}
+
 export function shouldQueueFollowupForRunningIssueWake(input: {
   contextSnapshot: Record<string, unknown> | null | undefined;
   wakeCommentId: string | null;
 }) {
   if (input.wakeCommentId) return true;
+  if (input.contextSnapshot?.selfUnblockFollowupCapReached === true) return false;
   // A structured interaction response is new input just like a comment. It
   // must run after the turn that created the interaction instead of being
   // merged into that still-running turn.
@@ -6556,6 +6579,9 @@ export function heartbeatService(
       nextAction: run.nextAction,
       budgetBlocked: Boolean(budgetBlock),
       idempotentWakeExists: Boolean(existingWake),
+      selfParkedOnOwnUnblockAction:
+        issue?.status === "blocked" &&
+        (await selfParkedUnblockActionForRun(run, issueId)) !== null,
     });
 
     if (decision.kind === "exhausted") {
@@ -6567,6 +6593,17 @@ export function heartbeatService(
         issueId,
         comment: decision.comment,
       });
+      // A comment alone is not an actionable escalation for a self-park: the
+      // blocked issue has no other recovery path, so route one board action.
+      if (issue?.status === "blocked") {
+        // Never let an escalation write failure abort this succeeded run's
+        // finalization; the recovery tick re-evaluates and escalates.
+        try {
+          await recovery.escalateExhaustedNativeSelfPark({ id: issueId, companyId: run.companyId });
+        } catch (err) {
+          logger.warn({ err, runId: run.id, issueId }, "inline native self-park escalation failed; deferring to recovery tick");
+        }
+      }
       return;
     }
 
@@ -10781,6 +10818,22 @@ export function heartbeatService(
         return null;
       }
 
+      const supersededBy = await supersededSelfUnblockFollowupReason(run, issueId, context);
+      if (supersededBy) {
+        await cancelQueuedRunForAdmissionGate(run, issueId, {
+          reason:
+            "Cancelled because the issue now has a durable waiting path; that wait owns the next action and wakes the assignee when it resolves",
+          errorCode: "self_unblock_superseded_by_wait",
+          timeoutSource: "self_unblock_wait_gate",
+          payload: { issueId, durablePathReason: supersededBy },
+        });
+        logger.info(
+          { runId: run.id, issueId, durablePathReason: supersededBy },
+          "claimQueuedRun: cancelled self-unblock follow-up behind a real wait",
+        );
+        return null;
+      }
+
       const staleness = await runDispatch.cancelStaleQueuedRun({
         runId: run.id,
         companyId: run.companyId,
@@ -11373,19 +11426,33 @@ export function heartbeatService(
     issueId: string,
     unresolvedBlockerIssueIds: string[],
   ) {
+    return cancelQueuedRunForAdmissionGate(run, issueId, {
+      reason:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+      errorCode: "issue_dependencies_blocked",
+      timeoutSource: "dependency_gate",
+      payload: { issueId, unresolvedBlockerIssueIds },
+    });
+  }
+
+  // Never-started queued run refused at admission: no adapter was entered.
+  async function cancelQueuedRunForAdmissionGate(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueId: string,
+    gate: { reason: string; errorCode: string; timeoutSource: string; payload: Record<string, unknown> },
+  ) {
     const now = new Date();
-    const reason =
-      "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve";
+    const reason = gate.reason;
     const cancelled = await setRunStatus(run.id, "cancelled", {
       finishedAt: now,
       error: reason,
-      errorCode: "issue_dependencies_blocked",
+      errorCode: gate.errorCode,
       resultJson: {
         ...parseObject(run.resultJson),
-        stopReason: "issue_dependencies_blocked",
+        stopReason: gate.errorCode,
         effectiveTimeoutSec: 0,
         timeoutConfigured: false,
-        timeoutSource: "dependency_gate",
+        timeoutSource: gate.timeoutSource,
         timeoutFired: false,
       },
     });
@@ -11417,10 +11484,7 @@ export function heartbeatService(
       stream: "system",
       level: "warn",
       message: reason,
-      payload: {
-        issueId,
-        unresolvedBlockerIssueIds,
-      },
+      payload: gate.payload,
     });
 
     return cancelled;
@@ -11558,6 +11622,53 @@ export function heartbeatService(
       if (!latest || parsed.getTime() > latest.getTime()) latest = parsed;
     }
     return latest;
+  }
+
+  // A blocked issue counts as a real wait unless its only waiting path is the
+  // run agent's own unblock descriptor. Real waits reuse the disposition
+  // repair source-state rules (blockers, interactions, approvals, monitor,
+  // execution stage, user owner); descriptors never count there.
+  async function selfParkedUnblockActionForRun(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
+    issueId: string,
+  ): Promise<string | null> {
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)))
+      .then((rows) => rows[0] ?? null);
+    const action = selfOwnedUnblockAction(issue, run.agentId);
+    if (!issue || !action || issue.assigneeAgentId !== run.agentId || issue.assigneeUserId) return null;
+    const state = await collectDispositionRepairSourceState(db, { issue, excludeRunId: run.id });
+    return state.hasDurableWaitingPath ? null : action;
+  }
+
+  // A queued run bound to "do this unblock action now" is admitted only while
+  // that is still true. A wait recorded after the notification (pending
+  // interaction/approval, monitor, execution stage, blocker) or a changed
+  // descriptor owns the next action instead. Interaction answers are new
+  // input and keep their own admission rules.
+  async function supersededSelfUnblockFollowupReason(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
+    issueId: string,
+    context: Record<string, unknown>,
+  ): Promise<string | null> {
+    if (readNonEmptyString(context.livenessContinuationState) !== UNBLOCK_REQUESTED_CONTINUATION_STATE) return null;
+    if (hasInteractionContinuationWakeContext(context)) return null;
+    // The unblock wake never carries a comment. A comment wake it coalesced
+    // into still owes that comment a run, so never cancel it here.
+    if (readNonEmptyString(context.wakeCommentId) || readNonEmptyString(context.commentId)) return null;
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issue || issue.assigneeAgentId !== run.agentId) return null;
+    const state = await collectDispositionRepairSourceState(db, { issue, excludeRunId: run.id });
+    if (state.durablePathReason) return state.durablePathReason;
+    return issue.status === "blocked" && !selfOwnedUnblockAction(issue, run.agentId)
+      ? "unblock_descriptor_changed"
+      : null;
   }
 
   async function buildRunLivenessInput(
@@ -11705,9 +11816,14 @@ export function heartbeatService(
         ),
       );
 
+    const selfParkedAction =
+      contextIssueId && issue?.status === "blocked"
+        ? await selfParkedUnblockActionForRun(run, contextIssueId)
+        : null;
+
     return {
       runStatus: run.status,
-      issue,
+      issue: issue ? { ...issue, selfOwnedUnblockAction: selfParkedAction } : null,
       resultJson: resultJson ?? run.resultJson ?? null,
       issueCommentBodies,
       continuationSummaryBody: continuationSummary?.body ?? null,
@@ -21937,6 +22053,9 @@ export function heartbeatService(
           }
 
           if (activeExecutionRun) {
+            if (activeExecutionRun.agentId === agentId) {
+              applySelfUnblockFollowupEpisode(enrichedContextSnapshot, activeExecutionRun);
+            }
             // The resolved action is already a durable retry outbox. Do not merge
             // its fresh-session contract into unrelated work or create a second
             // deferred wake that could later replay the same reconciliation.
@@ -22296,7 +22415,8 @@ export function heartbeatService(
                   )
                 : enrichedContextSnapshot,
               sessionIdBefore: explicitContinuation ? null : sessionBefore,
-              continuationAttempt,
+              // Re-read: a self-unblock follow-up may have continued an episode.
+              continuationAttempt: readContinuationAttempt(enrichedContextSnapshot.livenessContinuationAttempt),
               ...(reconciledSourceRunId
                 ? { retryOfRunId: reconciledSourceRunId }
                 : {}),
@@ -22422,6 +22542,7 @@ export function heartbeatService(
         candidate.status === "running" &&
         isSameTaskScope(runTaskKey(candidate), taskKey),
     );
+    applySelfUnblockFollowupEpisode(enrichedContextSnapshot, sameScopeRunningRun ?? null);
     const shouldQueueFollowupForRunningWake =
       Boolean(sameScopeRunningRun) &&
       !sameScopeQueuedRun &&
@@ -22562,7 +22683,8 @@ export function heartbeatService(
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
-          continuationAttempt,
+          // Re-read: a self-unblock follow-up may have continued an episode.
+          continuationAttempt: readContinuationAttempt(enrichedContextSnapshot.livenessContinuationAttempt),
         })
         .returning()
         .then((rows) => rows[0]);

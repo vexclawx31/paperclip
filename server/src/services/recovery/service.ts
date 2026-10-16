@@ -7,9 +7,11 @@ import { executionRetryAccounting } from "../execution-recovery-attempt.js";
 import { isExplicitContinuationRetryClaim } from "../explicit-continuation-retry-claim.js";
 import {
   decideLegacyContinuation, legacyDispositionEpisode, legacyDispositionFingerprint,
-  LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
+  legacyDispositionRepairInstruction, type LegacyDispositionEpisode,
 } from "./legacy-continuation.js";
 import { hasLiveLegacyController } from "../legacy-controller-lease.js";
+import { selfOwnedUnblockAction } from "../self-owned-unblock.js";
+import { DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS, readContinuationAttempt } from "./run-liveness-continuations.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { isWaitingConversation, settleConversationTurn, deliverConversationComments } from "../agent-conversations.js";
 import {
@@ -3170,7 +3172,7 @@ export function recoveryService(
         } : {}),
         bypassContinuationSummaryPark: true,
         dispositionRepairInstruction:
-          input.legacyEpisode ? LEGACY_DISPOSITION_REPAIR_INSTRUCTION : "Revalidate the issue and replace the invalid parked summary with a durable disposition. Continue productive work when appropriate.",
+          input.legacyEpisode ? legacyDispositionRepairInstruction(input.issue, agentId) : "Revalidate the issue and replace the invalid parked summary with a durable disposition. Continue productive work when appropriate.",
       },
       "normal_model",
     );
@@ -3561,129 +3563,256 @@ export function recoveryService(
     attemptCount: number;
     terminalReason: string;
     legacyEpisode?: LegacyDispositionEpisode;
+    /** The caller admitted escalation only because no recovery action was active. */
+    requireNoActiveAction?: boolean;
   }) {
-    const action = await ensureDispositionRepairAction({
-      issue: input.issue,
-      latestRun: input.latestRun,
-      fingerprint: input.fingerprint,
-      attemptCount: input.attemptCount,
-      legacyEpisode: input.legacyEpisode,
-    });
-    const now = new Date();
-    await db
-      .update(issueRecoveryActions)
-      .set({
-        status: "active",
-        ownerType: "board",
-        ownerAgentId: null,
-        ownerUserId: null,
-        maxAttempts: null,
-        evidence: {
-          ...action.evidence,
-          latestRunId: input.latestRun?.id ?? null,
-          latestRunStatus: input.latestRun?.status ?? null,
-          latestRunErrorCode: input.latestRun?.errorCode ?? null,
-          terminalReason: input.terminalReason,
-          sourceAttemptCount: input.attemptCount,
-          sourceMaxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
-          routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
-        },
-        nextAction:
-          "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.",
-        wakePolicy: {
-          type: "board_escalation",
-          reason: input.terminalReason,
-          preservesSourceAssignee: true,
-        },
-        timeoutAt: null,
-        resolutionNote: input.terminalReason,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issueRecoveryActions.id, action.id),
-          eq(issueRecoveryActions.companyId, input.issue.companyId),
-        ),
-      );
+    const publications: ActivityPublication[] = [];
+    const postCommitActions: IssuePostCommitAction[] = [];
+    let escalated: {
+      updated: NonNullable<Awaited<ReturnType<typeof issuesSvc.update>>>;
+      sourceAssigneePreserved: boolean;
+    } | null;
+    try {
+      escalated = await db.transaction(async (tx) => {
+        // Same fence as the board's recovery-action resolution: the source issue
+        // row lock. Inline and tick escalators, and a board response, serialize
+        // here; a decision made from a snapshot that has since changed (status,
+        // status version, owner) is stale and writes nothing.
+        const current = await tx
+          .select()
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, input.issue.companyId),
+              eq(issues.id, input.issue.id),
+            ),
+          )
+          .for("update")
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (
+          !current ||
+          current.status === "done" ||
+          current.status === "cancelled" ||
+          current.status !== input.issue.status ||
+          current.statusVersion !== input.issue.statusVersion ||
+          current.assigneeAgentId !== input.issue.assigneeAgentId ||
+          current.assigneeUserId !== input.issue.assigneeUserId
+        )
+          return null;
 
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-    });
-    if (!updated) return null;
-    const sourceAssigneePreserved =
-      updated.assigneeAgentId === input.issue.assigneeAgentId &&
-      updated.assigneeUserId === input.issue.assigneeUserId;
+        let active = await recoveryActionsSvc.getActiveForIssue(
+          current.companyId,
+          current.id,
+          tx,
+        );
+        if (active && input.requireNoActiveAction) return null;
+        if (
+          active &&
+          (active.kind !== "deliberate_wait_without_target" ||
+            active.fingerprint !== input.fingerprint)
+        ) {
+          await recoveryActionsSvc.resolveActiveForIssue(
+            {
+              companyId: current.companyId,
+              sourceIssueId: current.id,
+              actionId: active.id,
+              status: "cancelled",
+              outcome: "cancelled",
+              resolutionNote: "source_state_changed",
+            },
+            tx,
+          );
+          await logActivity(
+            tx as unknown as Db,
+            {
+              companyId: current.companyId,
+              actorType: "system",
+              actorId: "recovery",
+              agentId: null,
+              runId: input.latestRun?.id ?? null,
+              action: "issue.disposition_repair_fingerprint_reset",
+              entityType: "issue_recovery_action",
+              entityId: active.id,
+              details: {
+                sourceIssueId: current.id,
+                previousFingerprint: active.fingerprint,
+                nextFingerprint: input.fingerprint,
+                terminalReason: "source_state_changed",
+              },
+            },
+            publications,
+          );
+          active = null;
+        }
+        // Another escalator already committed this escalation: one notice.
+        if (active?.wakePolicy?.type === "board_escalation") return null;
 
-    await issuesSvc.addComment(
-      input.issue.id,
-      [
-        "Paperclip exhausted the bounded original-owner disposition repair without a durable source-state change.",
-        "",
-        `- Attempts: ${input.attemptCount}/${input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
-        `- Terminal reason: \`${input.terminalReason}\``,
-        "- Recovery owner: board",
-        "- Source ownership: unchanged; reassignment requires an explicit decision or a policy-defined serious failure.",
-        "",
-        "Next action: repair the liveness disposition or request an explicit source-owner decision.",
-      ].join("\n"),
-      {},
-      {
-        authorType: "system",
-        presentation: compactRecoveryPresentation(
-          "Agent needs attention",
-        ),
-        metadata: {
-          ...recoveryNoticeMetadata({
-            cause: "deliberate_wait_without_target",
-            latestRun: input.latestRun,
-            recoveryActionId: action.id,
-            previousStatus: input.issue.status,
-            recoveryOwner: null,
-          }),
-          recovery: {
-            kind: "disposition_repair_escalated",
-            actionId: action.id,
-            attemptCount: input.attemptCount,
-            maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
-            reason: input.terminalReason,
-            assigneeAgentId: input.issue.assigneeAgentId,
+        const now = new Date();
+        const escalation = {
+          status: "active" as const,
+          ownerType: "board" as const,
+          ownerAgentId: null,
+          ownerUserId: null,
+          returnOwnerAgentId:
+            current.assigneeAgentId ?? active?.returnOwnerAgentId ?? null,
+          maxAttempts: null,
+          evidence: {
+            ...(active?.evidence ?? {}),
+            sourceIssueId: current.id,
+            sourceIdentifier: current.identifier,
+            sourceStateFingerprint: input.fingerprint,
+            latestRunId: input.latestRun?.id ?? null,
+            latestRunStatus: input.latestRun?.status ?? null,
+            latestRunErrorCode: input.latestRun?.errorCode ?? null,
+            terminalReason: input.terminalReason,
+            sourceAttemptCount: input.attemptCount,
+            sourceMaxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
+            routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
           },
-        },
-      },
-    );
+          nextAction:
+            "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.",
+          wakePolicy: {
+            type: "board_escalation",
+            reason: input.terminalReason,
+            preservesSourceAssignee: true,
+          },
+          attemptCount: Math.max(active?.attemptCount ?? 0, input.attemptCount),
+          timeoutAt: null,
+          lastAttemptAt: now,
+          resolutionNote: input.terminalReason,
+          updatedAt: now,
+        };
+        const [action] = active
+          ? await tx
+            .update(issueRecoveryActions)
+            .set(escalation)
+            .where(
+              and(
+                eq(issueRecoveryActions.id, active.id),
+                eq(issueRecoveryActions.companyId, current.companyId),
+                inArray(issueRecoveryActions.status, ["active", "escalated"]),
+              ),
+            )
+            .returning()
+          : await tx
+            .insert(issueRecoveryActions)
+            .values({
+              ...escalation,
+              companyId: current.companyId,
+              sourceIssueId: current.id,
+              kind: "deliberate_wait_without_target",
+              cause: "deliberate_wait_without_target",
+              fingerprint: input.fingerprint,
+              previousOwnerAgentId: current.assigneeAgentId,
+            })
+            .returning();
+        if (!action) return null;
 
-    await logActivity(db, {
-      companyId: input.issue.companyId,
-      actorType: "system",
-      actorId: "recovery",
-      agentId: null,
-      runId: input.latestRun?.id ?? null,
-      action: "issue.disposition_repair_escalated",
-      entityType: "issue",
-      entityId: input.issue.id,
-      details: {
-        identifier: input.issue.identifier,
-        status: "blocked",
-        previousStatus: input.issue.status,
-        sourceStateFingerprint: input.fingerprint,
-        attemptCount: input.attemptCount,
-        maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
-        terminalReason: input.terminalReason,
-        recoveryActionId: action.id,
-        recoveryOwnerAgentId: null,
-        recoveryOwnerType: "board",
-        routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
-        sourceAssigneeBefore: {
-          agentId: input.issue.assigneeAgentId,
-          userId: input.issue.assigneeUserId,
-        },
-        sourceAssigneeAfter: {
-          agentId: updated.assigneeAgentId,
-          userId: updated.assigneeUserId,
-        },
-        sourceAssigneePreserved,
-      },
-    });
+        const updated = await issuesSvc.update(
+          current.id,
+          { status: "blocked" },
+          tx,
+          publications,
+          postCommitActions,
+        );
+        if (!updated) return null;
+        const sourceAssigneePreserved =
+          updated.assigneeAgentId === input.issue.assigneeAgentId &&
+          updated.assigneeUserId === input.issue.assigneeUserId;
+
+        await issuesSvc.addComment(
+          current.id,
+          [
+            "Paperclip exhausted the bounded original-owner disposition repair without a durable source-state change.",
+            "",
+            `- Attempts: ${input.attemptCount}/${input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
+            `- Terminal reason: \`${input.terminalReason}\``,
+            "- Recovery owner: board",
+            "- Source ownership: unchanged; reassignment requires an explicit decision or a policy-defined serious failure.",
+            "",
+            "Next action: repair the liveness disposition or request an explicit source-owner decision.",
+          ].join("\n"),
+          {},
+          {
+            authorType: "system",
+            presentation: compactRecoveryPresentation(
+              "Agent needs attention",
+            ),
+            metadata: {
+              ...recoveryNoticeMetadata({
+                cause: "deliberate_wait_without_target",
+                latestRun: input.latestRun,
+                recoveryActionId: action.id,
+                previousStatus: input.issue.status,
+                recoveryOwner: null,
+              }),
+              recovery: {
+                kind: "disposition_repair_escalated",
+                actionId: action.id,
+                attemptCount: input.attemptCount,
+                maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
+                reason: input.terminalReason,
+                assigneeAgentId: input.issue.assigneeAgentId,
+              },
+            },
+          },
+          tx,
+        );
+
+        await logActivity(
+          tx as unknown as Db,
+          {
+            companyId: input.issue.companyId,
+            actorType: "system",
+            actorId: "recovery",
+            agentId: null,
+            runId: input.latestRun?.id ?? null,
+            action: "issue.disposition_repair_escalated",
+            entityType: "issue",
+            entityId: input.issue.id,
+            details: {
+              identifier: input.issue.identifier,
+              status: "blocked",
+              previousStatus: input.issue.status,
+              sourceStateFingerprint: input.fingerprint,
+              attemptCount: input.attemptCount,
+              maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
+              terminalReason: input.terminalReason,
+              recoveryActionId: action.id,
+              recoveryOwnerAgentId: null,
+              recoveryOwnerType: "board",
+              routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
+              sourceAssigneeBefore: {
+                agentId: input.issue.assigneeAgentId,
+                userId: input.issue.assigneeUserId,
+              },
+              sourceAssigneeAfter: {
+                agentId: updated.assigneeAgentId,
+                userId: updated.assigneeUserId,
+              },
+              sourceAssigneePreserved,
+            },
+          },
+          publications,
+        );
+        return { updated, sourceAssigneePreserved };
+      });
+    } catch (error) {
+      // A recovery writer outside this fence inserted the source's active
+      // action first. Nothing here committed; the next tick re-evaluates.
+      const failure = error as { code?: string; cause?: { code?: string } } | null;
+      if (failure?.code !== "23505" && failure?.cause?.code !== "23505") throw error;
+      logger.warn(
+        { issueId: input.issue.id },
+        "disposition repair escalation lost the active recovery action race",
+      );
+      return null;
+    }
+    if (!escalated) return null;
+    for (const publication of publications) publishActivity(publication);
+    await executeIssuePostCommitActions(db, postCommitActions);
+    const { updated, sourceAssigneePreserved } = escalated;
     if (!sourceAssigneePreserved) {
       logger.error(
         {
@@ -3742,6 +3871,78 @@ export function recoveryService(
         agentInvokable: Boolean(agent && await isAgentInvokable(agent) && isHeartbeatWakeOnDemandEnabled(agent)),
       },
     });
+  }
+
+  /**
+   * Native runs never enter legacy disposition repair, and the stranded sweep
+   * skips blocked issues. A native self-park (blocked only on the assignee's
+   * own unblock action, nothing real waiting) whose bounded continuation is
+   * spent therefore needs this explicit board escalation: exactly one
+   * board-owned recovery action, assignee unchanged, then quiet.
+   */
+  async function escalateExhaustedNativeSelfPark(issueRef: { id: string; companyId: string }): Promise<boolean> {
+    const [issue] = await db.select().from(issues)
+      .where(and(eq(issues.id, issueRef.id), eq(issues.companyId, issueRef.companyId))).limit(1);
+    if (!issue || issue.status !== "blocked" || !issue.assigneeAgentId || issue.assigneeUserId || issue.hiddenAt) return false;
+    if (!selfOwnedUnblockAction(issue, issue.assigneeAgentId)) return false;
+    const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+    if (!latestRun || latestRun.agentId !== issue.assigneeAgentId || latestRun.status !== "succeeded") return false;
+    const [run] = await db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, latestRun.id), eq(heartbeatRuns.companyId, issue.companyId))).limit(1);
+    if (!run || run.runtimeMode !== "native") return false;
+    if (run.livenessState !== "plan_only" && run.livenessState !== "empty_response") return false;
+    const attempt = readContinuationAttempt(run.continuationAttempt);
+    if (attempt < DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS) return false;
+    if (await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id)) return false;
+    if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) return false;
+    const state = await collectDispositionRepairSourceState(db, { issue, excludeRunId: run.id });
+    if (state.hasDurableWaitingPath || state.hasActiveExecutionPath) return false;
+    const episode = legacyDispositionEpisode(run);
+    const fingerprint = legacyDispositionFingerprint(issue.companyId, issue.id, issue.assigneeAgentId, episode.id);
+    // One escalation per episode: once the board has resolved this episode's
+    // action (for example, kept the issue blocked), stay quiet until a new
+    // episode begins rather than re-escalating on every tick.
+    const [priorEscalation] = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, issue.companyId),
+        eq(issueRecoveryActions.sourceIssueId, issue.id),
+        eq(issueRecoveryActions.fingerprint, fingerprint),
+      ))
+      .limit(1);
+    if (priorEscalation) return false;
+    const escalated = await escalateDispositionRepair({
+      issue,
+      latestRun,
+      fingerprint,
+      attemptCount: attempt,
+      terminalReason: "self_unblock_continuation_exhausted",
+      legacyEpisode: { id: episode.id, attempt, maxAttempts: DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS },
+      requireNoActiveAction: true,
+    });
+    return Boolean(escalated);
+  }
+
+  async function reconcileExhaustedNativeSelfParks(opts?: { issueCreatedAtGte?: Date | null }) {
+    const candidates = await db
+      .select({ id: issues.id, companyId: issues.companyId })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "blocked"),
+          sql`${issues.assigneeAgentId} is not null`,
+          isNull(issues.assigneeUserId),
+          isNull(issues.hiddenAt),
+          sql`${issues.unblockDescriptor} -> 'owner' ->> 'agentId' = ${issues.assigneeAgentId}::text`,
+          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+        ),
+      );
+    const issueIds: string[] = [];
+    for (const candidate of candidates) {
+      if (await escalateExhaustedNativeSelfPark(candidate)) issueIds.push(candidate.id);
+    }
+    return issueIds;
   }
 
   async function legacyRepairDispatchBlock(runId: string): Promise<string | null> {
@@ -5545,6 +5746,10 @@ export function recoveryService(
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
 
+    const nativeSelfParkEscalations = await reconcileExhaustedNativeSelfParks(opts);
+    result.escalated += nativeSelfParkEscalations.length;
+    result.issueIds.push(...nativeSelfParkEscalations);
+
     const activeRecovery = await reconcileActiveRecoveryActions();
     result.continuationRequeued += activeRecovery.requeued;
     result.escalated += activeRecovery.escalated;
@@ -6272,6 +6477,7 @@ export function recoveryService(
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
     reconcileLegacyContinuation,
+    escalateExhaustedNativeSelfPark,
     legacyRepairDispatchBlock,
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,

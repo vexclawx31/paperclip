@@ -133,6 +133,20 @@ export async function resolveDispositionOnlyRecoveryQuiet(
   });
 }
 
+/**
+ * The issue's current durable waiting path, read from committed state, or
+ * null when nothing real is waiting (descriptors never count).
+ */
+export async function readIssueDurableWaitingPath(
+  db: Db,
+  issue: { id: string; companyId: string },
+): Promise<string | null> {
+  const [current] = await db.select().from(issues)
+    .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).limit(1);
+  if (!current) return null;
+  return (await collectDispositionRepairSourceState(db, { issue: current })).durablePathReason;
+}
+
 export async function collectDispositionRepairSourceState(
   db: Db,
   input: {

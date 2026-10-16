@@ -78,6 +78,16 @@ Entering `blocked` requires a routable waiting path. An issue may transition int
 
 When a structured unblock descriptor is the waiting path, Paperclip immediately notifies the named owner: an agent owner gets a wake, a user or board owner gets an inbox notification. Prose-only blocked — free-text that names an owner or action in a comment without any of the paths above — routes to nobody. It is rejected at the API or auto-classified as `needs_attention` with a board notification, never silently accepted as a healthy waiting state.
 
+A descriptor whose owner is the assigned agent itself is that agent's own pending work, not an external wait. Agents can only name themselves as descriptor owners, so this is the common agent-created shape. Paperclip treats it as follows:
+
+- The owner wake carries the descriptor `action` into the next run's wake prompt; the wake payload is a receipt only.
+- If the owner's own run on the issue is still running, the wake is held behind it as one follow-up rather than merged into the exiting run. A duplicate delivery merges into that follow-up.
+- The follow-up continues the source run's bounded continuation episode (the same counter as legacy disposition repair and native liveness continuation). Re-parking on the agent's own action therefore cannot loop: once the episode is exhausted, Paperclip opens a board-owned recovery action and leaves the assignee unchanged.
+- If that follow-up fails, ordinary failed-run recovery applies. An attempt that may have reached the provider opens a board-owned reconciliation action and is never replayed. A launch refused before the adapter started gets the bounded immediate recovery run, which keeps the same bound action in its wake prompt and continues the same episode (identity and spent attempts). If that run also fails, or the owner is no longer invokable, Paperclip opens one board-owned recovery action in the board attention inbox. Neither path resets the retry budget, so alternating refused launches, successful recovery runs and re-parks stay inside one episode.
+- On native runs, an exhausted self-park episode also opens exactly one board-owned recovery action in the board attention inbox; a comment alone is not the escalation. Restoring the original owner through that action resumes the assignee once.
+- Run liveness classifies such a run as `plan_only` with the action as `nextAction`, even if the run posted a comment. It is not `blocked`.
+- Every real waiting path still wins: unresolved blocker issues, pending interactions or approvals, a scheduled monitor, a pending execution stage, a user owner, pause/stop holds, budget, and recovery ownership. With any of these present the issue stays a normal blocked wait. The owner wake is not sent, and a follow-up already queued with the bound action is cancelled before launch if such a wait was recorded after the notification; that wait's own resolution wakes the assignee. Another agent named by the board still gets its routing wake, without the bound action.
+
 Ordinary task questions are current input waits only while they still belong to
 the current human direction. A newer non-deleted human message on the same task
 makes an earlier ordinary question historical, without answering, cancelling,

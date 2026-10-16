@@ -92,6 +92,8 @@ export function decideRunLivenessContinuation(input: {
   budgetBlocked: boolean;
   idempotentWakeExists: boolean;
   maxAttempts?: number;
+  /** Caller-proven: blocked only on the run agent's own unblock action, no real wait. */
+  selfParkedOnOwnUnblockAction?: boolean;
 }): RunContinuationDecision {
   const {
     run,
@@ -116,7 +118,8 @@ export function decideRunLivenessContinuation(input: {
   if (issue.assigneeAgentId !== run.agentId) {
     return { kind: "skip", reason: "issue is no longer assigned to the source run agent" };
   }
-  if (!CONTINUATION_ACTIVE_ISSUE_STATUSES.has(issue.status)) {
+  const selfParked = issue.status === "blocked" && input.selfParkedOnOwnUnblockAction === true;
+  if (!CONTINUATION_ACTIVE_ISSUE_STATUSES.has(issue.status) && !selfParked) {
     return { kind: "skip", reason: `issue status ${issue.status} is not continuable` };
   }
   if (issue.executionState) {

@@ -41,6 +41,8 @@ type HermesHttpError = Error & {
   retryNotBefore?: string | null;
   body?: unknown;
   transportCause?: unknown;
+  // Raw receiver reason; only errorResult renders it, after redaction.
+  receiverReason?: string;
 };
 
 type TerminalState = {
@@ -167,6 +169,56 @@ function nonEmpty(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+// The receiver rejects any env value containing a control character
+// (gateway/runtime_context.py validate_environment), so a multi-line wake
+// reason would deny the whole run. The env var is a hint only: keep safe
+// machine values, otherwise send flattened, bounded text. The full reason
+// still reaches the agent through the run input (paperclipWake.reason).
+const SAFE_MACHINE_WAKE_REASON = /^[A-Za-z0-9_.:-]{1,128}$/;
+const WAKE_REASON_ENV_MAX_BYTES = 512;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g;
+
+function flattenControlCharacters(value: string): string {
+  return value.replace(CONTROL_CHARACTERS, " ").replace(/\s+/g, " ").trim();
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const suffix = "...";
+  let out = "";
+  let bytes = Buffer.byteLength(suffix, "utf8");
+  for (const char of value) {
+    const size = Buffer.byteLength(char, "utf8");
+    if (bytes + size > maxBytes) break;
+    out += char;
+    bytes += size;
+  }
+  return `${out.trimEnd()}${suffix}`;
+}
+
+export function wakeReasonEnvValue(value: unknown): string | null {
+  const raw = nonEmpty(value);
+  if (!raw) return null;
+  if (SAFE_MACHINE_WAKE_REASON.test(raw)) return raw;
+  const flat = flattenControlCharacters(raw);
+  return flat ? truncateUtf8(flat, WAKE_REASON_ENV_MAX_BYTES) : null;
+}
+
+function receiverErrorMessage(body: unknown): string | null {
+  const record = asRecord(body);
+  const error = record?.error;
+  return typeof error === "string" ? nonEmpty(error) : nonEmpty(asRecord(error)?.message) ?? nonEmpty(record?.message);
+}
+
+// Redact the complete message before truncating: cutting first would leave a
+// partial echoed secret that no exact match can find. Redaction runs on the
+// flattened text because the redactor also matches every secret's flattened
+// form, which still catches an echo whose whitespace the receiver rewrote.
+function receiverErrorText(message: string, redactText: TextRedactor): string | null {
+  const redacted = redactText(flattenControlCharacters(message));
+  return redacted ? (redacted.length <= 300 ? redacted : `${redacted.slice(0, 297)}...`) : null;
+}
+
 function parseNonNegativeNumber(value: unknown, fallback: number): number {
   const parsed = typeof value === "number"
     ? value
@@ -252,20 +304,23 @@ function escapeRegExp(value: string): string {
 }
 
 function createTextRedactor(secrets: Array<string | null | undefined>): TextRedactor {
-  const exactSecrets = [...new Set(secrets.filter((secret): secret is string => typeof secret === "string" && secret.length >= 4))]
+  // Also match the flattened form so a secret survives no whitespace rewrite.
+  const configured = secrets.filter((secret): secret is string => typeof secret === "string" && secret.length >= 4);
+  const exactSecrets = [...new Set([...configured, ...configured.map(flattenControlCharacters)].filter((secret) => secret.length >= 4))]
     .sort((a, b) => b.length - a.length)
     .map((secret) => ({
       secret,
       regex: new RegExp(escapeRegExp(secret), "g"),
     }));
 
-  return (value: string) => {
-    let result = sanitizeSensitiveText(value);
-    for (const entry of exactSecrets) {
-      result = result.replace(entry.regex, `[redacted len=${entry.secret.length}]`);
-    }
-    return result;
-  };
+  // The generic patterns stop at whitespace, so they would consume only the
+  // first word of a secret containing whitespace and leave the rest
+  // unmatched; redact those secrets exactly before the patterns run.
+  const spacedSecrets = exactSecrets.filter((entry) => /\s/.test(entry.secret.replace(/^Bearer\s+/i, "")));
+  const redactExact = (value: string, entries: typeof exactSecrets) =>
+    entries.reduce((result, entry) => result.replace(entry.regex, `[redacted len=${entry.secret.length}]`), value);
+
+  return (value: string) => redactExact(sanitizeSensitiveText(redactExact(value, spacedSecrets)), exactSecrets);
 }
 
 function redactForLog(value: unknown, keyPath: string[] = [], depth = 0, redactText: TextRedactor = sanitizeSensitiveText): unknown {
@@ -404,7 +459,7 @@ function buildRunBody(ctx: AdapterExecutionContext, sessionKey: string | null): 
       PAPERCLIP_AGENT_ID: ctx.agent.id,
       PAPERCLIP_COMPANY_ID: ctx.agent.companyId,
       ...(issueIdFromContext(ctx) ? { PAPERCLIP_TASK_ID: issueIdFromContext(ctx)! } : {}),
-      ...(nonEmpty(ctx.context.wakeReason) ? { PAPERCLIP_WAKE_REASON: nonEmpty(ctx.context.wakeReason)! } : {}),
+      ...(wakeReasonEnvValue(ctx.context.wakeReason) ? { PAPERCLIP_WAKE_REASON: wakeReasonEnvValue(ctx.context.wakeReason)! } : {}),
     };
     return { ...payloadTemplate, environment, required_environment_capability: "trusted-local-foreground-v1", input: buildInput({ ...ctx, runtime: { ...ctx.runtime, sessionId: null } }, paperclipApiUrl), instructions: nonEmpty(ctx.config.instructions) ?? "Follow the assigned Paperclip task using the run-scoped environment. Never expose credentials." };
   }
@@ -474,7 +529,10 @@ async function fetchJson(input: RequestInfo | URL, init: RequestInit): Promise<u
   }
   if (!response.ok) {
     const classified = classifyHttpError(response.status);
+    // Receipts keep the receiver's reason (e.g. "Run environment denied by
+    // policy"), but only errorResult renders it, after full redaction.
     const err = new Error(`Hermes gateway HTTP ${response.status}`) as HermesHttpError;
+    err.receiverReason = receiverErrorMessage(body) ?? undefined;
     err.status = response.status;
     err.code = classified.code;
     err.retryNotBefore = response.headers.get("retry-after");
@@ -851,7 +909,12 @@ async function fetchFinalStatus(input: {
 }
 
 function redactErrorMessage(err: unknown, redactText: TextRedactor = sanitizeSensitiveText): string {
-  if (err instanceof Error) return redactText(err.message);
+  if (err instanceof Error) {
+    const message = redactText(err.message);
+    const reason = (err as HermesHttpError).receiverReason;
+    const receiverReason = reason ? receiverErrorText(reason, redactText) : null;
+    return receiverReason ? `${message}: ${receiverReason}` : message;
+  }
   return redactText(String(err));
 }
 
@@ -897,7 +960,8 @@ function errorResult(err: unknown, baseUrl: URL, redactText: TextRedactor = sani
       // before refusing a later connection. This never proves non-dispatch.
       ...(loopbackRefused ? { category: "gateway_loopback_connection_refused", phase: "create_run" } : {}),
       ...(hermesError.status ? { status: hermesError.status } : {}),
-      ...(hermesError.body ? { body: redactForLog(hermesError.body, [], 0, redactText) as Record<string, unknown> } : {}),
+      // Flattened like the message so a whitespace-rewritten echo still matches.
+      ...(hermesError.body ? { body: redactForLog(hermesError.body, [], 0, (value) => redactText(flattenControlCharacters(value))) as Record<string, unknown> } : {}),
     },
   };
 }

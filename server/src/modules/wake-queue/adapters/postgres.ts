@@ -692,6 +692,8 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: finishingRun.id,
+          // The episode counter the next continuation decision reads.
+          continuationAttempt: readContinuationAttempt(contextSnapshot.livenessContinuationAttempt),
           updatedAt: now,
         })
         .returning()

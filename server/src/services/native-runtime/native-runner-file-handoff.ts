@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, type ExecFileException } from "node:child_process";
 import { constants } from "node:fs";
 import type { Stats } from "node:fs";
 import {
@@ -239,19 +239,56 @@ async function assertNoSymlinkComponents(
   }
 }
 
+// lsof can be starved past its per-attempt budget under heavy load. Only a
+// positively identified timeout kill with no output is retried, within a fixed
+// attempt count and total deadline; every other outcome stays unverifiable.
+// Callers hold `fd` open throughout, so each attempt inspects the same file.
+const LSOF_ATTEMPT_TIMEOUT_MS = 1_000;
+const LSOF_MAX_ATTEMPTS = 3;
+const LSOF_TOTAL_DEADLINE_MS = 3_000;
+
+function runLsof(
+  fd: number,
+  timeout: number,
+): Promise<{ error: ExecFileException | null; stdout: Buffer }> {
+  return new Promise((resolve) => {
+    execFile(
+      "/usr/sbin/lsof",
+      ["-a", "-p", String(process.pid), "-d", String(fd), "-F0n"],
+      { encoding: "buffer", maxBuffer: 16_384, timeout },
+      (error, stdout) => resolve({ error, stdout: Buffer.from(stdout) }),
+    );
+  });
+}
+
+function isLsofTimeoutKill(error: ExecFileException, stdout: Buffer): boolean {
+  return (
+    error.killed === true &&
+    error.signal === "SIGTERM" &&
+    error.code == null &&
+    stdout.length === 0
+  );
+}
+
+async function lsofDescriptorOutput(fd: number): Promise<Buffer | null> {
+  const deadline = Date.now() + LSOF_TOTAL_DEADLINE_MS;
+  for (let attempt = 1; attempt <= LSOF_MAX_ATTEMPTS; attempt += 1) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    const result = await runLsof(
+      fd,
+      Math.min(LSOF_ATTEMPT_TIMEOUT_MS, remaining),
+    ).catch(() => null);
+    if (!result) return null;
+    if (!result.error) return result.stdout;
+    if (!isLsofTimeoutKill(result.error, result.stdout)) return null;
+  }
+  return null;
+}
+
 async function openedFilePath(fd: number): Promise<string> {
   if (process.platform === "darwin") {
-    const output = await new Promise<Buffer>((resolve, reject) => {
-      execFile(
-        "/usr/sbin/lsof",
-        ["-a", "-p", String(process.pid), "-d", String(fd), "-F0n"],
-        { encoding: "buffer", maxBuffer: 16_384, timeout: 1_000 },
-        (error, stdout) => {
-          if (error) reject(error);
-          else resolve(Buffer.from(stdout));
-        },
-      );
-    }).catch(() => null);
+    const output = await lsofDescriptorOutput(fd);
     const paths = output
       ? output
           .toString("utf8")
