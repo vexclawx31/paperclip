@@ -16,15 +16,22 @@ afterEach(() => stopTaskDrain());
 describe("idle admission", () => {
   it("tracks a mounted Connect-style app (Vite dev middleware) as one handler", async () => {
     const server = app();
-    // Shape of a Connect app: a function with a `stack` of layers whose
-    // `route` is a string, and a string `route` of its own.
+    const gate = deferred();
+    // Shape of a Connect app: a function carrying `handle`/`use`, a string
+    // `route`, and a `stack` of layers whose `route` is a string.
     const connectApp = Object.assign(
-      (_req: unknown, res: { status(code: number): { end(): void } }) => { res.status(204).end(); },
-      { route: "/", stack: [{ route: "/__open-in-editor", handle: () => {} }] },
+      async (_req: unknown, res: { status(code: number): { end(): void } }) => { await gate.promise; res.status(204).end(); },
+      { route: "/", handle() {}, use() {}, stack: [{ route: "/__open-in-editor", handle: () => {} }] },
     );
     server.use(connectApp as unknown as express.RequestHandler);
     expect(() => trackIdleRequestHandlers(server)).not.toThrow();
-    await request(server).get("/anything").expect(204);
+    const connectLayer = (server.router.stack as Array<{ handle: unknown }>).at(-1)!;
+    expect(connectLayer.handle).not.toBe(connectApp);
+    const pending = request(server).get("/anything").then((res) => res.status);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(idleWorkSnapshot().active).toBeGreaterThan(0);
+    gate.resolve();
+    expect(await pending).toBe(204);
     expect(idleWorkSnapshot().active).toBe(0);
   });
 
