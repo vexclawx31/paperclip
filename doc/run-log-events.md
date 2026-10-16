@@ -230,6 +230,31 @@ control channels keep their authoritative failure messages. These diagnostics
 stay in the instance's run records and configured run-log storage. They add no
 Paperclip Telemetry or OpenTelemetry export.
 
+## Adapter Approval Routing Events
+
+The `hermes_gateway` adapter writes these events while it answers Hermes
+`approval.request` events (see `packages/adapters/hermes/README.md`). Every
+request goes to the board.
+
+- `adapter.approval.requested`: the request id, Hermes run id, the command's
+  SHA-256 and whether it is shown in full, and the redacted command and
+  description.
+- `adapter.approval.timeout_capped`: the board wait was shortened to fit the
+  run's `timeoutSec`.
+- `adapter.approval.resolved`: the decision, who decided it (`board` or
+  `system`), the approval id, and the choice sent to Hermes (`once` or
+  `deny`).
+- `adapter.approval.answer_failed`: Hermes did not accept the answer, for
+  example `approval_not_pending` after its own `approvals.timeout`.
+- `adapter.approval.abandoned`: Hermes stopped waiting (the run ended, or a
+  status poll no longer shows `waiting_for_approval`) before a decision.
+
+The matching activity entries are `approval.created`,
+`adapter_approval.board_resolved`, `adapter_approval.delivered`,
+`adapter_approval.not_delivered`, `adapter_approval.approved_too_late`,
+`adapter_approval.timed_out`, `adapter_approval.abandoned` and
+`adapter_approval.hash_mismatch`.
+
 ## Related instrumentation
 
 The sandbox duplex transport also writes one run-log event as one of its three

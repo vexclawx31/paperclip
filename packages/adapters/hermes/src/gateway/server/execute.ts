@@ -25,6 +25,13 @@ import {
   isRemotePlainHttp,
   remotePlainHttpDeniedMessage,
 } from "./transport-security.js";
+import {
+  createApprovalRouter,
+  PROVIDER_RUN_ENDED,
+  readApprovalRoutingConfig,
+  type ApprovalRouter,
+} from "./approval-routing.js";
+import { redactCredentialPatterns } from "./credential-redaction.js";
 
 type SessionKeyStrategy = "issue" | "agent" | "run" | "none";
 
@@ -57,6 +64,7 @@ type ExecutionState = {
   terminal: TerminalState | null;
   resolveTerminal: (state: TerminalState) => void;
   terminalPromise: Promise<TerminalState>;
+  approvals?: ApprovalRouter | null;
 };
 
 type TextRedactor = (value: string) => string;
@@ -224,10 +232,12 @@ function stringifyForLog(value: unknown, maxChars = 4_000): string {
 }
 
 function sanitizeSensitiveText(value: string): string {
-  return value
+  // One path: the session/header patterns below plus the shared credential
+  // patterns that approval commands also use.
+  return redactCredentialPatterns(value
     .replace(BEARER_TOKEN_PATTERN, "Bearer [redacted]")
     .replace(HERMES_SESSION_KEY_HEADER_PATTERN, "$1[redacted]")
-    .replace(PAPERCLIP_SESSION_KEY_PATTERN, "[redacted-session-key]");
+    .replace(PAPERCLIP_SESSION_KEY_PATTERN, "[redacted-session-key]"));
 }
 
 function escapeRegExp(value: string): string {
@@ -570,6 +580,8 @@ async function handleEvent(
     await ctx.onLog("stdout", sanitizedDelta);
   }
 
+  if (eventName === "approval.request") state.approvals?.handle(parsed, state.runId);
+
   const status = extractStatus(parsed) ?? (eventName?.startsWith("run.") ? eventName.slice(4) : null);
   if (status && TERMINAL_STATUSES.has(status)) {
     markTerminal(state, {
@@ -610,12 +622,19 @@ async function pollStatus(input: {
     await delay(input.intervalMs, input.signal);
     if (input.signal.aborted || input.state.terminal) break;
     try {
+      const pollStartedAt = Date.now();
       const status = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.state.runId)}`), {
         method: "GET",
         headers: input.headers,
         signal: input.signal,
       });
       const normalized = extractStatus(status);
+      // A pending approval is also visible on the status record, which covers
+      // an approval.request frame lost to an event-stream disconnect.
+      if (normalized === "waiting_for_approval") input.state.approvals?.handle(asRecord(status)?.approval, input.state.runId);
+      // Hermes stopped waiting (its own approvals.timeout, a stop, or another
+      // answer): withdraw the request so the board record is closed.
+      input.state.approvals?.observeStatus(normalized, nonEmpty(asRecord(asRecord(status)?.approval)?.request_id), pollStartedAt);
       if (normalized && TERMINAL_STATUSES.has(normalized)) {
         markTerminal(input.state, {
           runId: input.state.runId,
@@ -969,6 +988,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // This adapter has no local child process, so crossing into the first
     // remote create request is its dispatch boundary. Report it before the
     // request can block so continuation gates may release their issue lock.
+    // Opt in to host cancellation: a Stop aborts ctx.signal, and execute()
+    // then denies pending approvals and stops the Hermes run before settling.
+    await ctx.onCancellationReady?.();
+    if (ctx.signal?.aborted) {
+      return { exitCode: 1, signal: "SIGTERM", timedOut: false, errorCode: "hermes_gateway_cancelled", errorMessage: "Paperclip run was cancelled before dispatch." };
+    }
     ctx.onDispatch?.();
     const created = await fetchJson(createRunUrl, {
       method: "POST",
@@ -998,6 +1023,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const state = createExecutionState(runId);
   const controller = new AbortController();
+  const approvalController = new AbortController();
+  let cancelled = false;
+  let resolveCancelled!: (value: "cancelled") => void;
+  const cancelledPromise = new Promise<"cancelled">((resolve) => {
+    resolveCancelled = resolve;
+  });
+  const onRunAbort = () => {
+    cancelled = true;
+    resolveCancelled("cancelled");
+  };
+  if (ctx.signal?.aborted) onRunAbort();
+  else ctx.signal?.addEventListener("abort", onRunAbort, { once: true });
+  const approvalHeaders = runHeaders;
+  state.approvals = createApprovalRouter({
+    ctx,
+    config: readApprovalRoutingConfig(ctx.config),
+    runDeadlineAt: timeoutMs > 0 ? Date.now() + timeoutMs : null,
+    signal: approvalController.signal,
+    redactText,
+    postDecision: async ({ runId: hermesRunId, requestId, choice }) => {
+      try {
+        await fetchJson(apiUrl(baseUrl, `/v1/runs/${encodeURIComponent(hermesRunId)}/approval`), {
+          method: "POST",
+          headers: approvalHeaders,
+          body: JSON.stringify({ choice, request_id: requestId }),
+          signal: AbortSignal.timeout(15_000),
+        });
+        return { delivered: true };
+      } catch (err) {
+        const body = asRecord((err as HermesHttpError).body);
+        const code = nonEmpty(asRecord(body?.error)?.code) ?? nonEmpty(body?.code);
+        return { delivered: false, reason: code ?? redactErrorMessage(err, redactText) };
+      }
+    },
+  });
   void consumeEvents({
     ctx,
     baseUrl,
@@ -1023,9 +1083,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     timeoutTimer = setTimeout(() => resolve("timeout"), timeoutMs);
   });
 
-  const outcome = await Promise.race([state.terminalPromise, timeoutPromise]);
+  const outcome = await Promise.race([state.terminalPromise, timeoutPromise, cancelledPromise]);
   if (timeoutTimer) clearTimeout(timeoutTimer);
+  ctx.signal?.removeEventListener("abort", onRunAbort);
+  // Withdraw pending decisions. When Hermes is still running (timeout or
+  // Paperclip cancellation) the router answers "deny" before we stop the run.
+  approvalController.abort(outcome === "timeout" || outcome === "cancelled" || cancelled ? "run_stopped" : PROVIDER_RUN_ENDED);
+  await state.approvals.settle();
   controller.abort();
+
+  if (outcome === "cancelled") {
+    await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
+    const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+    return {
+      exitCode: 1,
+      signal: "SIGTERM",
+      timedOut: false,
+      errorCode: "hermes_gateway_cancelled",
+      errorMessage: "Paperclip run was cancelled.",
+      provider: "hermes_gateway",
+      resultJson: {
+        run_id: runId,
+        status: extractStatus(finalStatus) ?? "cancelled",
+        last_event: state.lastEventName,
+        final_status: redactForLog(finalStatus, [], 0, redactText),
+      },
+      sessionParams: { hermesRunId: runId, strategy },
+      sessionDisplayId: sessionKey ? redactText(sessionKey) : null,
+    };
+  }
 
   if (outcome === "timeout") {
     await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });

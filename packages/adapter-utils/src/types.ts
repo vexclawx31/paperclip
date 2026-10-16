@@ -194,6 +194,56 @@ export interface AdapterRuntimeEvent {
   payload?: Record<string, unknown>;
 }
 
+/**
+ * A provider-side request for operator consent (for example a Hermes
+ * `approval.request`) that the adapter routes to the host. Every request is a
+ * board decision; the host owns the durable record and its audit trail. Every
+ * text field is already redacted by the adapter.
+ */
+export interface AdapterApprovalRequest {
+  /** Provider request id; the host uses it as an idempotency key. */
+  requestId: string;
+  /** Provider run id the request belongs to. */
+  providerRunId: string;
+  /** Display copy; may differ from the provider command when redacted. */
+  command: string;
+  /** SHA-256 (hex) of the exact command text the provider sent. */
+  commandSha256: string;
+  /** False when `command` is redacted or truncated relative to the provider text. */
+  commandComplete: boolean;
+  description: string;
+  /** Upper bound the host may wait for a board decision. */
+  timeoutMs: number;
+  /**
+   * Aborted when the provider run ends, the provider stops waiting for this
+   * request, or the Paperclip run is cancelled.
+   */
+  signal: AbortSignal;
+}
+
+export interface AdapterApprovalDelivery {
+  /** True only when the provider accepted the answer. */
+  delivered: boolean;
+  choice: "once" | "deny";
+  /** Why an answer was not delivered (for example "approval_not_pending"). */
+  reason?: string | null;
+}
+
+export interface AdapterApprovalDecision {
+  decision: "approved" | "denied" | "timeout" | "cancelled" | "unavailable";
+  decidedBy: "board" | "system";
+  approvalId?: string | null;
+  note?: string | null;
+  /** Echo of the decided request; an approval without a matching echo is treated as a denial. */
+  requestId?: string | null;
+  commandSha256?: string | null;
+  /**
+   * Called once after the adapter tried to answer the provider, so the host
+   * can close a record whose answer never took effect.
+   */
+  onDelivery?: (delivery: AdapterApprovalDelivery) => Promise<void>;
+}
+
 export interface AdapterExecutionContext {
   /** Run-scoped operator cancellation; adapters must settle before returning. */
   signal?: AbortSignal;
@@ -226,6 +276,11 @@ export interface AdapterExecutionContext {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
+  /**
+   * Host-owned routing for provider approval requests. Absent on hosts that do
+   * not support it; adapters must then deny (fail closed).
+   */
+  onApprovalRequest?: (request: AdapterApprovalRequest) => Promise<AdapterApprovalDecision>;
   onRuntimeProgress?: RuntimeStatusSink;
   /**
    * Reports that execution has crossed the adapter's dispatch boundary.

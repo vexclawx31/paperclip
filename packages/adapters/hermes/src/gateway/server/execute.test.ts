@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import type { AdapterApprovalDecision, AdapterApprovalDelivery, AdapterApprovalRequest, AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
 import { execute, mapFinalResultForTest, parseSseFramesForTest, resolveSessionKey } from "./execute.js";
 import { testEnvironment } from "./test.js";
@@ -1034,5 +1034,228 @@ describe("scoped run environment", () => {
     expectNoSecretFragments(`${JSON.stringify(result)}\n${logs}`, [
       spacedKey, echoedKey, spacedKey.replace(/\s+/g, " "),
     ]);
+  });
+});
+
+describe("approval routing", () => {
+  function approvalHarness(options: { statusApproval?: boolean; notPending?: boolean } = {}) {
+    let push!: (text: string) => void;
+    let close!: () => void;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (text) => controller.enqueue(new TextEncoder().encode(text));
+        close = () => controller.close();
+      },
+    });
+    const approvalEvent = {
+      event: "approval.request",
+      run_id: "run-hermes-1",
+      timestamp: 1,
+      command: "launchctl kickstart -k gui/501/ai.paperclip --token ghp_abcdefghijklmnopqrstuvwxyz0123",
+      pattern_key: "stop/restart hermes launchd service (kills running agents)",
+      pattern_keys: ["stop/restart hermes launchd service (kills running agents)"],
+      description: "stop/restart hermes launchd service (kills running agents)",
+      allow_permanent: true,
+      allow_session: true,
+      request_id: "req-1",
+      choices: ["once", "session", "always", "deny"],
+    };
+    const approvalPosts: Array<Record<string, unknown>> = [];
+    let answered = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) {
+        return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started" }), { status: 200 });
+      }
+      if (url.endsWith("/events")) {
+        if (!options.statusApproval) {
+          queueMicrotask(() => push(`event: approval.request\ndata: ${JSON.stringify(approvalEvent)}\n\n`));
+        }
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (url.endsWith("/approval")) {
+        expect(init?.method).toBe("POST");
+        approvalPosts.push(JSON.parse(String(init?.body)));
+        answered = true;
+        queueMicrotask(() => {
+          push(`event: run.completed\ndata: ${JSON.stringify({ status: "completed", output: "done" })}\n\n`);
+          close();
+        });
+        if (options.notPending) {
+          return new Response(JSON.stringify({ error: { message: "Run has no pending approval", code: "approval_not_pending" } }), { status: 409 });
+        }
+        return new Response(JSON.stringify({ object: "hermes.run.approval_response", resolved: 1 }), { status: 200 });
+      }
+      if (options.statusApproval && !answered) {
+        return new Response(JSON.stringify({ status: "waiting_for_approval", approval: approvalEvent }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: answered ? "completed" : "running", output: "done" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return { approvalPosts };
+  }
+
+  it("routes an approval.request to the host board decision and posts the answer back", async () => {
+    const { approvalPosts } = approvalHarness();
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30, pollIntervalMs: 250 });
+    const onEvent = vi.fn(async () => undefined);
+    const onApprovalRequest = vi.fn(async (request: AdapterApprovalRequest) => ({
+      decision: "approved" as const,
+      decidedBy: "board" as const,
+      approvalId: "appr-1",
+      requestId: request.requestId,
+      commandSha256: request.commandSha256,
+    }));
+    ctx.onEvent = onEvent;
+    ctx.onApprovalRequest = onApprovalRequest;
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(onApprovalRequest).toHaveBeenCalledTimes(1);
+    const request = (onApprovalRequest.mock.calls[0] as unknown as [Record<string, unknown>])[0];
+    expect(request).toMatchObject({ requestId: "req-1", providerRunId: "run-hermes-1", commandComplete: false });
+    expect(String(request.command)).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123");
+    expect(approvalPosts).toEqual([{ choice: "once", request_id: "req-1" }]);
+    const eventTypes = (onEvent.mock.calls as unknown as Array<[{ eventType: string }]>).map(([event]) => event.eventType);
+    expect(eventTypes).toEqual(expect.arrayContaining(["adapter.approval.requested", "adapter.approval.resolved"]));
+    // The per-event stream log line carries the frame, but never the raw token.
+    const logged = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls.map((call) => String(call[1])).join("");
+    expect(logged).toContain("event=approval.request");
+    expect(logged).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123");
+  });
+
+  it("denies a pending approval and stops the run when the Paperclip run is cancelled", async () => {
+    const { approvalPosts } = approvalHarness();
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30 });
+    const runAbort = new AbortController();
+    ctx.signal = runAbort.signal;
+    const onCancellationReady = vi.fn(async () => undefined);
+    ctx.onCancellationReady = onCancellationReady;
+    ctx.onApprovalRequest = vi.fn((request: AdapterApprovalRequest) => {
+      setTimeout(() => runAbort.abort(), 5);
+      return new Promise<AdapterApprovalDecision>((resolve) => {
+        request.signal.addEventListener("abort", () => resolve({ decision: "cancelled", decidedBy: "system" }));
+      });
+    });
+
+    const result = await execute(ctx);
+
+    expect(onCancellationReady).toHaveBeenCalledTimes(1);
+    expect(result.errorCode).toBe("hermes_gateway_cancelled");
+    expect(approvalPosts).toEqual([{ choice: "deny", request_id: "req-1" }]);
+    const urls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((call) => String(call[0]));
+    expect(urls.findIndex((url) => url.endsWith("/approval"))).toBeLessThan(urls.findIndex((url) => url.endsWith("/stop")));
+  });
+
+  it("redacts approval commands in the status record that reaches final_status", async () => {
+    const token = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+    const approval = { event: "approval.request", request_id: "req-7", command: `deploy --token ${token}`, nested: [{ command: `x --token ${token}` }] };
+    let stopped = false;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) return new Response(JSON.stringify({ run_id: "run-hermes-1" }), { status: 200 });
+      if (url.endsWith("/events")) {
+        return new Response(sseStream(`event: approval.request\ndata: ${JSON.stringify(approval)}\n\n`), { status: 200 });
+      }
+      if (url.endsWith("/approval")) return new Response(JSON.stringify({ resolved: 1 }), { status: 200 });
+      if (url.endsWith("/stop")) {
+        stopped = true;
+        return new Response(JSON.stringify({ status: "stopping" }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: stopped ? "cancelled" : "waiting_for_approval", approval }), { status: 200 });
+    }));
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 1, pollIntervalMs: 250 });
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("hermes_gateway_timeout");
+    expect(JSON.stringify(result.resultJson?.final_status)).toContain("[redacted]");
+    expect(JSON.stringify(result)).not.toContain(token);
+    const logged = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls.map((call) => String(call[1])).join("");
+    expect(logged).not.toContain(token);
+  });
+
+  it("reports approval_not_pending from Hermes as an undelivered answer", async () => {
+    approvalHarness({ notPending: true });
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30 });
+    const onDelivery = vi.fn(async (_delivery: AdapterApprovalDelivery) => undefined);
+    ctx.onApprovalRequest = vi.fn(async (request: AdapterApprovalRequest) => ({
+      decision: "approved" as const,
+      decidedBy: "board" as const,
+      requestId: request.requestId,
+      commandSha256: request.commandSha256,
+      onDelivery,
+    }));
+
+    await execute(ctx);
+
+    expect(onDelivery).toHaveBeenCalledWith({ delivered: false, choice: "once", reason: "approval_not_pending" });
+  });
+
+  it("denies a board timeout with the deny choice", async () => {
+    const { approvalPosts } = approvalHarness();
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30, approvalBoardTimeoutSec: 10 });
+    ctx.onApprovalRequest = vi.fn(async (request) => {
+      expect(request.timeoutMs).toBe(10_000);
+      return { decision: "timeout" as const, decidedBy: "system" as const, note: "No board decision before the approval timeout" };
+    });
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(approvalPosts).toEqual([{ choice: "deny", request_id: "req-1" }]);
+  });
+
+  it("picks up a pending approval from the status poll when the stream misses it", async () => {
+    const { approvalPosts } = approvalHarness({ statusApproval: true });
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30, pollIntervalMs: 250 });
+    const onApprovalRequest = vi.fn(async (_request: AdapterApprovalRequest) => ({ decision: "denied" as const, decidedBy: "board" as const }));
+    ctx.onApprovalRequest = onApprovalRequest;
+
+    await execute(ctx);
+
+    expect(onApprovalRequest).toHaveBeenCalledTimes(1);
+    expect(approvalPosts).toEqual([{ choice: "deny", request_id: "req-1" }]);
+  });
+
+  it("withdraws a pending host decision when the Hermes run ends first", async () => {
+    let push!: (text: string) => void;
+    let close!: () => void;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (text) => controller.enqueue(new TextEncoder().encode(text));
+        close = () => controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) return new Response(JSON.stringify({ run_id: "run-hermes-1" }), { status: 200 });
+      if (url.endsWith("/events")) {
+        queueMicrotask(() => {
+          push(`event: approval.request\ndata: ${JSON.stringify({ event: "approval.request", request_id: "req-9", command: "sudo ls" })}\n\n`);
+          setTimeout(() => {
+            push(`event: run.cancelled\ndata: ${JSON.stringify({ status: "cancelled" })}\n\n`);
+            close();
+          }, 20);
+        });
+        return new Response(stream, { status: 200 });
+      }
+      if (url.endsWith("/approval")) throw new Error("must not answer after the run ended");
+      return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+    }));
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30 });
+    let sawAbort = false;
+    ctx.onApprovalRequest = vi.fn((request: AdapterApprovalRequest) => new Promise<AdapterApprovalDecision>((resolve) => {
+      request.signal.addEventListener("abort", () => {
+        sawAbort = true;
+        resolve({ decision: "cancelled" as const, decidedBy: "system" as const });
+      });
+    }));
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("hermes_gateway_cancelled");
+    expect(sawAbort).toBe(true);
   });
 });
