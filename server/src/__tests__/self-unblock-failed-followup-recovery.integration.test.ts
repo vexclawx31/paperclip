@@ -664,6 +664,43 @@ describeEmbeddedPostgres("failed self-unblock follow-up recovery (offline integr
     expect(await runsFor(agentId)).toHaveLength(runsAfter);
   }, 120_000);
 
+  it("a board comment wake that absorbed the self-park notification is still delivered when a wait appears before claim", async () => {
+    const { companyId, agentId, issueId, ownerUserId } = await seed();
+    const asAgent = agentActor(companyId, agentId);
+    const asBoard = boardActor(companyId, ownerUserId);
+    let boardCommentId = "";
+    turns.queue.push(async (ctx) => {
+      const runId = (ctx as AdapterExecutionContext).runId;
+      // The board comments while this run is still active, so its wake waits.
+      const commented = await request(asBoard).post(`/api/issues/${issueId}/comments`).send({ body: "Please also check the B2 totals." });
+      expect(commented.status, JSON.stringify(commented.body)).toBe(201);
+      boardCommentId = commented.body.id;
+      await runComment(issueId, agentId, runId, "Parking, then asking the board first.");
+      const parked = await request(asAgent(runId)).patch(`/api/issues/${issueId}`)
+        .send({ status: "blocked", unblockDescriptor: { owner: { agentId }, action: ACTION } });
+      expect(parked.status, JSON.stringify(parked.body)).toBe(200);
+      const created = await request(asAgent(runId)).post(`/api/issues/${issueId}/interactions`).send({
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee",
+        payload: { version: 1, prompt: "Approve the roadmap scope before I reconcile B1/B2?" },
+      });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+      return { summary: "Asked the board first." };
+    });
+    turns.queue.push(async () => ({ summary: "Read the board comment." }));
+    await start(agentId, issueId);
+    await settle(agentId);
+
+    const commentRuns = (await runsFor(agentId)).filter((r) => {
+      const ctx = ctxOf(r);
+      return ctx.wakeCommentId === boardCommentId || ctx.commentId === boardCommentId;
+    });
+    expect(commentRuns.length).toBeGreaterThan(0);
+    for (const run of commentRuns) expect(run.errorCode).not.toBe("self_unblock_superseded_by_wait");
+    expect(commentRuns.some((r) => r.status === "succeeded")).toBe(true);
+    expect(turns.seen).toHaveLength(2);
+  }, 120_000);
+
   it("LIT-126 P2: an exhausted native self-park gets exactly one reachable board action, then quiet; the board's restore resumes productive work once", async () => {
     const { companyId, agentId, issueId, ownerUserId } = await seed();
     const asAgent = agentActor(companyId, agentId);

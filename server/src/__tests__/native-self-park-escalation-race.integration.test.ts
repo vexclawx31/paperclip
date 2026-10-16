@@ -277,4 +277,26 @@ describeEmbeddedPostgres("exhausted native self-park escalation races (offline i
     expect(await escalationActivities(issueId)).toHaveLength(1);
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   }, 60_000);
+
+  it("stays quiet after the board resolves the episode's escalation and keeps the issue blocked", async () => {
+    const { issueId, companyId, ownerUserId } = await seedExhaustedSelfPark();
+
+    await tick();
+    const [action] = await openRecoveryActions(issueId);
+    expect(action).toMatchObject({ ownerType: "board" });
+    const resolved = await request(boardApi(companyId, ownerUserId)).post(`/api/issues/${issueId}/recovery-actions/resolve`).send({
+      actionId: action!.id, outcome: "blocked", sourceIssueStatus: "blocked", resolutionNote: "Keep it parked for now.",
+    });
+    expect(resolved.status, JSON.stringify(resolved.body)).toBe(200);
+    expect((await issueRow(issueId)).status).toBe("blocked");
+
+    // The same exhausted episode must not be escalated again on later ticks.
+    await tick();
+    await tick();
+    expect(await inlineEscalator().escalateExhaustedNativeSelfPark({ id: issueId, companyId })).toBe(false);
+    expect(await openRecoveryActions(issueId)).toHaveLength(0);
+    expect(await escalationNotices(issueId)).toHaveLength(1);
+    expect(await escalationActivities(issueId)).toHaveLength(1);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  }, 60_000);
 });

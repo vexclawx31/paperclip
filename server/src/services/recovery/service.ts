@@ -3887,10 +3887,24 @@ export function recoveryService(
     const state = await collectDispositionRepairSourceState(db, { issue, excludeRunId: run.id });
     if (state.hasDurableWaitingPath || state.hasActiveExecutionPath) return false;
     const episode = legacyDispositionEpisode(run);
+    const fingerprint = legacyDispositionFingerprint(issue.companyId, issue.id, issue.assigneeAgentId, episode.id);
+    // One escalation per episode: once the board has resolved this episode's
+    // action (for example, kept the issue blocked), stay quiet until a new
+    // episode begins rather than re-escalating on every tick.
+    const [priorEscalation] = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, issue.companyId),
+        eq(issueRecoveryActions.sourceIssueId, issue.id),
+        eq(issueRecoveryActions.fingerprint, fingerprint),
+      ))
+      .limit(1);
+    if (priorEscalation) return false;
     const escalated = await escalateDispositionRepair({
       issue,
       latestRun,
-      fingerprint: legacyDispositionFingerprint(issue.companyId, issue.id, issue.assigneeAgentId, episode.id),
+      fingerprint,
       attemptCount: attempt,
       terminalReason: "self_unblock_continuation_exhausted",
       legacyEpisode: { id: episode.id, attempt, maxAttempts: DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS },
