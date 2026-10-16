@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { issueService } from "../services/issues.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
@@ -7243,6 +7244,47 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(await heartbeat.getRun(runId)).toMatchObject({ status: "cancelled", errorCode: "operator_interrupted" });
     expect(await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, issueId),
       eq(issueRecoveryActions.cause, "legacy_execution_requires_reconciliation")))).toEqual([]);
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    const [updated] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id));
+    expect(updated!.runId).toBeTruthy();
+    expect(updated!.runId).not.toBe(runId);
+    expect((await heartbeat.getRun(updated!.runId!))!.contextSnapshot?.wakeCommentIds).toEqual([comment!.id]);
+    await heartbeat.drainActiveRunExecutions();
+    // The successor turn is told to check completed side effects, not replay them.
+    const successorInput = mockAdapterExecute.mock.calls.map(call => call[0] as { runId?: string; context?: Record<string, any> })
+      .find(input => input.runId === updated!.runId);
+    expect(successorInput?.context?.executionContinuation).toMatchObject({
+      interruptedRunId: runId,
+      operatorInterruptNotice: "Your previous turn was interrupted to deliver this message. Before repeating any action from it, check what already completed (files, commits, external calls) and do not redo completed side effects.",
+    });
+  });
+
+  it("promotes the saved operator message after retiring an already-settled operator-delivery block", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      runtimeMode: "legacy", adapterType: "process", agentStatus: "idle", runStatus: "failed",
+    });
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "operator_interrupted", error: "Interrupted to send queued messages",
+      finishedAt: new Date(), resultJson: { operatorInterrupted: true, interruptionSource: "issue_comment_interrupt" } })
+      .where(eq(heartbeatRuns.id, runId));
+    const [blocked] = await db.update(issues).set({ status: "blocked", executionRunId: null, checkoutRunId: null })
+      .where(eq(issues.id, issueId)).returning();
+    await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", ownerType: "board", returnOwnerAgentId: agentId,
+      cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+      status: "resolved", outcome: "blocked", nextAction: "Automatic recovery stopped.",
+      evidence: { runId, legacyFailureBlock: { runId, statusVersion: blocked!.statusVersion, previousStatus: "in_progress" },
+        automaticRecovery: { policy: "preserve_without_replay_v1", runId, replay: "blocked", actionOutcome: "unknown" } },
+    });
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "responsible-user", body: "here is my answer" }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId, agentId, source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId, commentId: comment!.id, _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [comment!.id] } },
+    }).returning();
+    const heartbeat = heartbeatService(db);
+    expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ runId });
+    await settleUnrecoverableExecutions(db, new Date(), { promoteDeferredWakes: run => heartbeat.promoteDeferredLegacyWakes(run) });
+    await heartbeat.drainActiveRunExecutions();
     expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
     const [updated] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id));
     expect(updated!.runId).toBeTruthy();

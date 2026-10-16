@@ -3910,6 +3910,24 @@ describe("wake continuation comment ownership", () => {
     expect(prompt).not.toContain("comment-a at");
   });
 
+  it("renders the operator-interrupt notice for the turn after an operator-delivery interrupt", () => {
+    const notice = "Your previous turn was interrupted to deliver this message. Before repeating any action from it, check what already completed (files, commits, external calls) and do not redo completed side effects.";
+    const base = {
+      reason: "issue_commented",
+      issue: { id: "issue-1", identifier: "PAP-1", title: "Task", description: null },
+      comments: [{ id: "comment-new", body: "Here is my answer" }],
+      commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+      fallbackFetchNeeded: false,
+    };
+    const prompt = renderPaperclipWakePrompt({ ...base,
+      executionContinuation: { ...continuation([message("comment-new", "Here is my answer")]), interruptedRunId: "run-old", operatorInterruptNotice: notice },
+    });
+    expect(prompt).toContain(notice);
+    expect(renderPaperclipWakePrompt({ ...base,
+      executionContinuation: continuation([message("comment-new", "Here is my answer")]),
+    })).not.toContain(notice);
+  });
+
   it("does not suppress a current comment absent from the rendered resume delta", () => {
     const prompt = renderPaperclipWakePrompt({
       reason: "issue_commented",

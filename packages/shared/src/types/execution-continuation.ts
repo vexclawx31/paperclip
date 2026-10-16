@@ -51,6 +51,8 @@ export interface ExecutionContinuationEnvelope {
   completedWork: string | null;
   /** Start a new turn from history; never replay prior tool calls automatically. */
   interruptedRunId?: string;
+  /** Present when the operator interrupted the previous turn to deliver a message. */
+  operatorInterruptNotice?: string;
   /** Completed mutations are context, never instructions to replay them. */
   completedActions?: Array<{
     runId: string;
