@@ -203,6 +203,33 @@ function claudeResultIndicatesAuthFailure(parsed: Record<string, unknown>): bool
   return extractClaudeErrorMessages(parsed).length > 0;
 }
 
+// Login-prompt markers are matched against Claude CLI status output only
+// (allowlist): non-JSON stdout lines, and the CLI's own synthetic auth-error
+// assistant event (`error: "authentication_failed"` and similar). All other
+// stream-json events (result, system, assistant, user, tool results, future
+// types) carry model, tool or workspace text and are ignored here.
+function loginPromptStdoutLines(stdout: string): string[] {
+  const lines: string[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (!trimmed.startsWith("{")) {
+      lines.push(trimmed);
+      continue;
+    }
+    const event = parseJson(trimmed);
+    if (!event) {
+      lines.push(trimmed);
+      continue;
+    }
+    const error = asString(event.error, "").trim().toLowerCase();
+    if (event.type === "assistant" && (error.includes("auth") || error.includes("login"))) {
+      lines.push(...extractClaudeErrorMessages(event), JSON.stringify(event.message ?? ""));
+    }
+  }
+  return lines;
+}
+
 export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
@@ -211,10 +238,18 @@ export function detectClaudeLoginRequired(input: {
   const parsed = input.parsed ?? null;
   const resultText = asString(parsed?.result, "").trim();
 
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // Login-prompt markers match Claude's own error output only. A run whose
+  // parsed result clearly succeeded never reads its result text or transcript,
+  // and transcript events in stdout (assistant/user messages, tool results) are
+  // never scanned: agents working on auth code routinely print "unauthorized" or
+  // "authentication required" there.
+  const runFailed = parsed === null || claudeResultIndicatesAuthFailure(parsed);
+  const promptLines = [
+    runFailed ? resultText : "",
+    ...extractClaudeErrorMessages(parsed ?? {}),
+    ...loginPromptStdoutLines(input.stdout),
+    input.stderr,
+  ]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -231,7 +266,7 @@ export function detectClaudeLoginRequired(input: {
 
   return {
     requiresLogin: loginPrompt || tokenFailure,
-    loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
+    loginUrl: extractClaudeLoginUrl([...loginPromptStdoutLines(input.stdout), input.stderr].join("\n")),
   };
 }
 
