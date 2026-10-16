@@ -185,6 +185,15 @@ export async function getAccessibleResource<T extends { companyId: string }>(
   resource: T | null | undefined | Promise<T | null | undefined>,
   notFoundMessage: string,
 ): Promise<T | null> {
+  // An unauthenticated request (missing or malformed Authorization, e.g. a
+  // token sent without the `Bearer ` prefix) gets 401 for every id, before
+  // any lookup result is used, so it neither reveals existence nor looks
+  // like a missing resource to the caller.
+  if (req.actor.type === "none") {
+    await Promise.resolve(resource).catch(() => undefined);
+    res.status(401).json({ error: "Authentication required: send Authorization: Bearer <token>" });
+    return null;
+  }
   const resolved = await resource;
   if (!resolved || !hasCompanyAccess(req, resolved.companyId)) {
     res.status(404).json({ error: notFoundMessage });
