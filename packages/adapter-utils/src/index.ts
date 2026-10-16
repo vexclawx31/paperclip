@@ -9,6 +9,7 @@ export type {
   AdapterRuntimeEvent,
   AdapterApprovalRequest,
   AdapterApprovalDecision,
+  AdapterApprovalDelivery,
   AdapterRuntimeMcpServer,
   AdapterRuntimeMcpAccess,
   AdapterExecutionContext,

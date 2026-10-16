@@ -625,6 +625,7 @@ async function pollStatus(input: {
     await delay(input.intervalMs, input.signal);
     if (input.signal.aborted || input.state.terminal) break;
     try {
+      const pollStartedAt = Date.now();
       const status = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.state.runId)}`), {
         method: "GET",
         headers: input.headers,
@@ -634,6 +635,9 @@ async function pollStatus(input: {
       // A pending approval is also visible on the status record, which covers
       // an approval.request frame lost to an event-stream disconnect.
       if (normalized === "waiting_for_approval") input.state.approvals?.handle(asRecord(status)?.approval, input.state.runId);
+      // Hermes stopped waiting (its own approvals.timeout, a stop, or another
+      // answer): withdraw the request so the board record is closed.
+      input.state.approvals?.observeStatus(normalized, pollStartedAt);
       if (normalized && TERMINAL_STATUSES.has(normalized)) {
         markTerminal(input.state, {
           runId: input.state.runId,
@@ -1042,12 +1046,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     signal: approvalController.signal,
     redactText,
     postDecision: async ({ runId: hermesRunId, requestId, choice }) => {
-      await fetchJson(apiUrl(baseUrl, `/v1/runs/${encodeURIComponent(hermesRunId)}/approval`), {
-        method: "POST",
-        headers: approvalHeaders,
-        body: JSON.stringify({ choice, request_id: requestId }),
-        signal: AbortSignal.timeout(15_000),
-      });
+      try {
+        await fetchJson(apiUrl(baseUrl, `/v1/runs/${encodeURIComponent(hermesRunId)}/approval`), {
+          method: "POST",
+          headers: approvalHeaders,
+          body: JSON.stringify({ choice, request_id: requestId }),
+          signal: AbortSignal.timeout(15_000),
+        });
+        return { delivered: true };
+      } catch (err) {
+        const body = asRecord((err as HermesHttpError).body);
+        const code = nonEmpty(asRecord(body?.error)?.code) ?? nonEmpty(body?.code);
+        return { delivered: false, reason: code ?? redactErrorMessage(err, redactText) };
+      }
     },
   });
   void consumeEvents({

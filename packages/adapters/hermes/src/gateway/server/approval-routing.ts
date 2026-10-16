@@ -1,25 +1,28 @@
 import { createHash } from "node:crypto";
 import type {
   AdapterApprovalDecision,
-  AdapterApprovalRequest,
   AdapterExecutionContext,
 } from "@paperclipai/adapter-utils";
-import { analyzeCommand, DEFAULT_SAFE_ROOTS, readSafeRoots, type SafeCategory } from "./approval-classifier.js";
 
-// Hermes emits `approval.request` when its approval gate (smart or manual)
-// escalates a flagged command to a human, then blocks the agent until
+// Hermes emits `approval.request` when its approval gate (smart guardian or
+// manual) escalates a flagged command to a human, then blocks the agent until
 // `POST /v1/runs/{run_id}/approval` answers it or `approvals.timeout` elapses.
-// This module parses those events, classifies them conservatively, routes them
-// through the host, and answers Hermes with the narrowest possible scope.
+// Green and yellow judgement belongs to Hermes' guardian: every request that
+// reaches Paperclip goes to the board. This module parses those events, hands
+// them to the host, and answers Hermes with the narrowest possible scope.
 
-// Below the default run timeoutSec (600) minus the 15 s answer reserve, so the
-// default pairing never caps the board wait.
-export const DEFAULT_APPROVAL_BOARD_TIMEOUT_SEC = 540;
+// Below Hermes' default `approvals.timeout` (300 s), so by default Paperclip
+// answers before Hermes gives up.
+export const DEFAULT_APPROVAL_BOARD_TIMEOUT_SEC = 270;
 const MIN_APPROVAL_BOARD_TIMEOUT_SEC = 10;
 const MAX_APPROVAL_BOARD_TIMEOUT_SEC = 24 * 60 * 60;
 // Leave the adapter time to answer Hermes before its own run deadline.
 export const RUN_DEADLINE_RESERVE_MS = 15_000;
 const MAX_APPROVAL_TEXT_CHARS = 2_000;
+
+/** Abort reasons for which Hermes is no longer waiting, so nothing is answered. */
+export const PROVIDER_RUN_ENDED = "provider_run_ended";
+export const PROVIDER_NOT_PENDING = "provider_not_pending";
 
 export type HermesApprovalRequest = {
   requestId: string;
@@ -31,24 +34,12 @@ export type HermesApprovalRequest = {
   smartDenied: boolean;
 };
 
-export type ApprovalTier = "red" | "yellow";
-
-export type ApprovalClassification = {
-  tier: ApprovalTier;
-  reasons: string[];
-  /** Known-safe categories the whole command matched (yellow only). */
-  categories: SafeCategory[];
-};
-
 export type ApprovalRoutingConfig = {
   enabled: boolean;
-  supervisorAgentId: string | null;
   boardTimeoutMs: number;
-  safeRoots: string[];
 };
 
-/** Abort reason that means Hermes already finished the run; nothing to answer. */
-export const PROVIDER_RUN_ENDED = "provider_run_ended";
+export type ApprovalAnswerResult = { delivered: true } | { delivered: false; reason: string };
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -85,7 +76,7 @@ export function parseHermesApprovalRequest(value: unknown, fallbackRunId: string
 }
 
 // ---------------------------------------------------------------------------
-// Redaction
+// Redaction and integrity
 // ---------------------------------------------------------------------------
 
 const TOKEN_REDACTIONS: Array<[RegExp, string]> = [
@@ -106,58 +97,16 @@ export function redactApprovalText(value: string, redactText?: (value: string) =
   return out.length <= MAX_APPROVAL_TEXT_CHARS ? out : `${out.slice(0, MAX_APPROVAL_TEXT_CHARS)}... [truncated]`;
 }
 
-export function commandSha256(command: string): string {
-  return createHash("sha256").update(command, "utf8").digest("hex");
+// Hermes' own redaction markers (`***`, `«redacted…»`) and truncation markers.
+const PROVIDER_INCOMPLETE_MARKERS = /\*\*\*|«redacted|\[redacted|\[truncated|…\s*$/i;
+
+/** True when the board would not see the exact command Hermes will run. */
+export function isCommandIncomplete(rawCommand: string, displayCommand: string): boolean {
+  return !rawCommand.trim() || displayCommand !== rawCommand || PROVIDER_INCOMPLETE_MARKERS.test(rawCommand);
 }
 
-// ---------------------------------------------------------------------------
-// Classification
-// ---------------------------------------------------------------------------
-
-type Rule = { id: string; test: (text: string) => boolean };
-
-// Vetoes over the command, description and pattern keys. They only add red
-// reasons; a command is yellow only through analyzeCommand's safe categories.
-const RED_VETOES: Rule[] = [
-  { id: "credentials", test: (t) => /\b(credentials?|secrets?|tokens?|oauth|keychain|api[_-]?keys?|passwords?|passwd|private[_ -]?keys?|ssh[_-]?keys?|ssh-keygen|gpg|auth\.json)\b|\bsecurity\s+(find|add|delete|dump)-|\.ssh\/|\.netrc|\.npmrc|\.pypirc|\.env\b|\.hermes\/(config|\.env|auth)/i.test(t) },
-  { id: "service_control", test: (t) => /\b(launchctl|systemctl|service\s+\S+\s+(start|stop|restart|reload)|brew\s+services|pm2|supervisorctl|hermes\s+(gateway|update)|shutdown|reboot|poweroff)\b|system service|launchd service|hermes gateway|self-termination|container lifecycle|kill all processes/i.test(t) },
-  { id: "deploy", test: (t) => /\b(deploy(ment)?s?|kubectl|helm|terraform|pulumi|docker|podman|flyctl|vercel|railway|heroku|gcloud|aws)\b|remote daemon|daemon redirect/i.test(t) },
-  { id: "remote_code", test: (t) => /remote content|remote script|possible command obfuscation/i.test(t) },
-  { id: "money", test: (t) => /\b(stripe|payments?|paypal|braintree|invoice|purchase|billing|refund|subscription|spend[_ -]?limit|budget)\b/i.test(t) },
-  { id: "external_comms", test: (t) => /\b(e-?mail|sendmail|smtp|mailgun|sendgrid|postmark|slack|discord|telegram|twilio|whatsapp|imessage|tweet|twitter|linkedin|webhooks?|publish)\b/i.test(t) },
-  { id: "destructive_sql", test: (t) => /\b(drop\s+(table|database|schema|index|view|owner|role|user)|truncate(\s+table)?\s+\w+|dropdb|flushall|flushdb)\b|\bdelete\s+from\s+[\w."]+\s*(;|$|"|')|sql drop|sql truncate|sql delete without where/i.test(t) },
-  { id: "disk_destruction", test: (t) => /block device|root filesystem|system directory|home directory|root path|fork bomb|system config|system file/i.test(t) },
-  { id: "cross_tenant", test: (t) => /\b(other|another|different)\s+(company|tenant|customer)\b/i.test(t) },
-  { id: "disable_safety", test: (t) => /--dangerously|--yolo|\byolo\b|approvals?\.(mode|timeout)|approval[_ -]?(policy|mode)|disable[-_ ]?(safety|approvals?|audit|guard(ian)?|backups?)|--no-verify|ngrok|cloudflared/i.test(t) },
-];
-
-const INCOMPLETE_MARKERS = /\*\*\*|«redacted|\[redacted|\[truncated|…\s*$/i;
-
-/**
- * Fail-safe classifier. A request is "yellow" (delegable) only when the whole
- * command matches known-safe categories, nothing in it is redacted or
- * truncated, Hermes' guardian did not deny it, and no veto matches. Anything
- * else is "red" (human only).
- */
-export function classifyApprovalRequest(
-  request: Pick<HermesApprovalRequest, "command" | "description" | "patternKeys" | "smartDenied">,
-  safeRoots: string[] = DEFAULT_SAFE_ROOTS,
-): ApprovalClassification {
-  const command = request.command.trim();
-  const text = [command, request.description, ...request.patternKeys].join("\n");
-  const reasons: string[] = [];
-  if (!command) reasons.push("unclassifiable");
-  if (request.smartDenied) reasons.push("guardian_denied");
-  if (INCOMPLETE_MARKERS.test(command)) reasons.push("redacted_or_truncated");
-  for (const rule of RED_VETOES) {
-    if (rule.test(text)) reasons.push(rule.id);
-  }
-  const analysis = command ? analyzeCommand(command, safeRoots) : null;
-  if (analysis && !analysis.safe) reasons.push(...analysis.reasons);
-  if (reasons.length > 0 || !analysis?.safe) {
-    return { tier: "red", reasons: [...new Set(reasons.length > 0 ? reasons : ["unclassifiable"])], categories: [] };
-  }
-  return { tier: "yellow", reasons: analysis.categories.map((category) => `safe:${category}`), categories: analysis.categories };
+export function commandSha256(command: string): string {
+  return createHash("sha256").update(command, "utf8").digest("hex");
 }
 
 // ---------------------------------------------------------------------------
@@ -173,9 +122,7 @@ export function readApprovalRoutingConfig(config: Record<string, unknown>): Appr
   const timeoutSec = parsePositiveNumber(config.approvalBoardTimeoutSec) ?? DEFAULT_APPROVAL_BOARD_TIMEOUT_SEC;
   return {
     enabled: config.approvalRouting !== false,
-    supervisorAgentId: nonEmpty(config.approvalSupervisorAgentId),
     boardTimeoutMs: Math.round(Math.min(MAX_APPROVAL_BOARD_TIMEOUT_SEC, Math.max(MIN_APPROVAL_BOARD_TIMEOUT_SEC, timeoutSec)) * 1000),
-    safeRoots: readSafeRoots(config.approvalScratchRoots),
   };
 }
 
@@ -190,16 +137,28 @@ export type ApprovalRouterInput = {
   config: ApprovalRoutingConfig;
   /** Absolute epoch ms of the adapter run deadline, or null when unbounded. */
   runDeadlineAt: number | null;
-  /** Aborted when the run ends. Reason PROVIDER_RUN_ENDED skips the answer. */
+  /**
+   * Aborted when the run ends or is stopping. Reason PROVIDER_RUN_ENDED skips
+   * the answer; any other reason answers "deny".
+   */
   signal: AbortSignal;
   redactText: (value: string) => string;
-  postDecision: (input: { runId: string; requestId: string; choice: "once" | "deny" }) => Promise<void>;
+  postDecision: (input: { runId: string; requestId: string; choice: "once" | "deny" }) => Promise<ApprovalAnswerResult>;
+  now?: () => number;
 };
 
 export type ApprovalRouter = {
   handle: (raw: unknown, fallbackRunId: string) => void;
+  /**
+   * Report a Hermes run status fetched by a poll that started at `pollStartedAt`.
+   * A request first seen before the poll started is withdrawn when the status
+   * is no longer `waiting_for_approval`: Hermes stopped waiting for it.
+   */
+  observeStatus: (status: string | null, pollStartedAt: number) => void;
   settle: () => Promise<void>;
 };
+
+type PendingRequest = { seenAt: number; controller: AbortController };
 
 /**
  * Create a per-run router. `handle` is fire-and-forget so the event stream
@@ -207,7 +166,9 @@ export type ApprovalRouter = {
  * in-flight request after the run's signal has been aborted.
  */
 export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter {
+  const now = input.now ?? Date.now;
   const seen = new Set<string>();
+  const pending = new Map<string, PendingRequest>();
   const inFlight = new Set<Promise<void>>();
 
   const emit = async (eventType: string, level: "info" | "warn", message: string, payload: Record<string, unknown>) => {
@@ -215,44 +176,31 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
     await input.ctx.onEvent?.({ eventType, stream: "system", level, message, payload });
   };
 
-  async function route(request: HermesApprovalRequest): Promise<void> {
+  async function route(request: HermesApprovalRequest, entry: PendingRequest): Promise<void> {
     const command = redactApprovalText(request.command, input.redactText);
     const description = redactApprovalText(request.description, input.redactText);
-    const classification = classifyApprovalRequest(request, input.config.safeRoots);
-    // The board must see exactly what it approves. If display redaction or
-    // truncation changed the command, it can never be delegated.
-    const commandComplete = command === request.command && !classification.reasons.includes("redacted_or_truncated");
-    if (!commandComplete && classification.tier === "yellow") {
-      classification.tier = "red";
-      classification.reasons = ["redacted_or_truncated"];
-      classification.categories = [];
-    }
+    const commandComplete = !isCommandIncomplete(request.command, command);
     const sha = commandSha256(request.command);
+    // One signal for "stop waiting": the run ended or stopped, or Hermes
+    // withdrew this request.
+    const requestSignal = entry.controller.signal;
+    const onRunAbort = () => entry.controller.abort(input.signal.reason);
+    if (input.signal.aborted) onRunAbort();
+    else input.signal.addEventListener("abort", onRunAbort, { once: true });
+
     const base = {
       hermesRunId: request.runId,
       requestId: request.requestId,
-      tier: classification.tier,
-      reasons: classification.reasons,
-      categories: classification.categories,
       commandSha256: sha,
       commandComplete,
+      smartDenied: request.smartDenied,
       command,
       description,
     };
-    const supervisorAgentId = input.config.supervisorAgentId;
-    const route: AdapterApprovalRequest["route"] =
-      classification.tier === "yellow" && supervisorAgentId && supervisorAgentId !== input.ctx.agent.id
-        ? "supervisor"
-        : "board";
-    await emit(
-      "adapter.approval.requested",
-      "info",
-      `request ${request.requestId} classified ${classification.tier} (${classification.reasons.join(", ")}); routing to ${route}`,
-      { ...base, route, ...(route === "supervisor" ? { supervisorAgentId } : {}) },
-    );
+    await emit("adapter.approval.requested", "info", `request ${request.requestId} sent to the board for a decision`, base);
 
-    const timeoutMs = effectiveBoardTimeoutMs(input.config.boardTimeoutMs, input.runDeadlineAt);
-    if (route === "board" && timeoutMs < input.config.boardTimeoutMs) {
+    const timeoutMs = effectiveBoardTimeoutMs(input.config.boardTimeoutMs, input.runDeadlineAt, now());
+    if (timeoutMs < input.config.boardTimeoutMs) {
       await emit(
         "adapter.approval.timeout_capped",
         "warn",
@@ -271,17 +219,12 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
         decision = await input.ctx.onApprovalRequest({
           requestId: request.requestId,
           providerRunId: request.runId,
-          tier: classification.tier,
-          route,
-          supervisorAgentId: route === "supervisor" ? supervisorAgentId : null,
-          categories: classification.categories,
           command,
           commandSha256: sha,
           commandComplete,
           description,
-          reasons: classification.reasons,
           timeoutMs,
-          signal: input.signal,
+          signal: requestSignal,
         });
       } catch (err) {
         decision = {
@@ -291,49 +234,75 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
         };
       }
     }
+    input.signal.removeEventListener("abort", onRunAbort);
+    pending.delete(request.requestId);
 
     // An approval must be for this exact request and command.
     if (decision.decision === "approved" && (decision.requestId !== request.requestId || decision.commandSha256 !== sha)) {
-      decision = { decision: "denied", decidedBy: "system", note: "The approval did not match this request id and command hash." };
+      decision = { ...decision, decision: "denied", decidedBy: "system", note: "The approval did not match this request id and command hash." };
     }
 
-    if (input.signal.aborted && decision.decision !== "approved") {
-      if (input.signal.reason === PROVIDER_RUN_ENDED) {
-        await emit("adapter.approval.abandoned", "warn", `request ${request.requestId} abandoned: the Hermes run ended before a decision`, { ...base, decision: decision.decision });
-        return;
-      }
-      decision = { decision: "cancelled", decidedBy: "system", note: "The Paperclip run was cancelled or timed out before a decision." };
-    }
-
-    const choice = decision.decision === "approved" ? "once" : "deny";
-    const outcome = {
+    const outcomeBase = {
       ...base,
-      decision: decision.decision,
       decidedBy: decision.decidedBy,
-      choice,
       ...(decision.approvalId ? { approvalId: decision.approvalId } : {}),
-      ...(decision.supervisorAgentId ? { supervisorAgentId: decision.supervisorAgentId } : {}),
+    };
+    const report = async (delivered: boolean, choice: "once" | "deny", reason: string | null) => {
+      try {
+        await decision.onDelivery?.({ delivered, choice, reason });
+      } catch {
+        // Recording delivery is best effort; the run log below is authoritative.
+      }
+    };
+
+    const abortReason = requestSignal.aborted ? String(requestSignal.reason ?? "") : null;
+    if (abortReason === PROVIDER_RUN_ENDED || abortReason === PROVIDER_NOT_PENDING) {
+      await report(false, "deny", abortReason);
+      await emit("adapter.approval.abandoned", "warn", `request ${request.requestId} abandoned: Hermes is no longer waiting for it (${abortReason})`, {
+        ...outcomeBase,
+        decision: decision.decision,
+        reason: abortReason,
+      });
+      return;
+    }
+
+    let choice: "once" | "deny" = decision.decision === "approved" ? "once" : "deny";
+    // Re-check immediately before answering: never approve once the run is
+    // stopping or the request was withdrawn.
+    if (choice === "once" && (input.signal.aborted || requestSignal.aborted)) {
+      choice = "deny";
+      decision = { ...decision, decision: "cancelled", note: "The run was stopping when the approval arrived; the command was denied." };
+    }
+    const summary =
+      decision.decision === "approved"
+        ? "approved by the board"
+        : decision.decision === "denied"
+          ? `denied${decision.decidedBy === "board" ? " by the board" : `: ${decision.note ?? "denied"}`}`
+          : decision.decision === "timeout"
+            ? "denied: no board decision before the approval timeout"
+            : `denied: ${decision.note ?? decision.decision}`;
+    const outcome = {
+      ...outcomeBase,
+      decision: decision.decision,
+      choice,
       ...(decision.note ? { note: redactApprovalText(decision.note, input.redactText) } : {}),
     };
-    const summary =
-      decision.decision === "approved" && decision.decidedBy === "supervisor_policy"
-        ? `approved under delegated supervisor policy (${classification.categories.join("+")})`
-        : decision.decision === "approved"
-          ? "approved by the board"
-          : decision.decision === "denied"
-            ? `denied${decision.decidedBy === "board" ? " by the board" : `: ${decision.note ?? "denied"}`}`
-            : decision.decision === "timeout"
-              ? "denied: no board decision before the approval timeout"
-              : `denied: ${decision.note ?? decision.decision}`;
+
+    let result: ApprovalAnswerResult;
     try {
-      await input.postDecision({ runId: request.runId, requestId: request.requestId, choice });
-      await emit("adapter.approval.resolved", choice === "once" ? "info" : "warn", `request ${request.requestId} ${summary}; answered Hermes with "${choice}"`, outcome);
+      result = await input.postDecision({ runId: request.runId, requestId: request.requestId, choice });
     } catch (err) {
+      result = { delivered: false, reason: input.redactText(err instanceof Error ? err.message : String(err)) };
+    }
+    await report(result.delivered, choice, result.delivered ? null : result.reason);
+    if (result.delivered) {
+      await emit("adapter.approval.resolved", choice === "once" ? "info" : "warn", `request ${request.requestId} ${summary}; answered Hermes with "${choice}"`, outcome);
+    } else {
       await emit(
         "adapter.approval.answer_failed",
         "warn",
-        `request ${request.requestId} ${summary}, but Hermes did not accept the answer: ${input.redactText(err instanceof Error ? err.message : String(err))}`,
-        outcome,
+        `request ${request.requestId} ${summary}, but Hermes did not accept the answer (${result.reason}); the command did not run`,
+        { ...outcome, reason: result.reason },
       );
     }
   }
@@ -343,10 +312,19 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
       const request = parseHermesApprovalRequest(raw, fallbackRunId);
       if (!request || seen.has(request.requestId)) return;
       seen.add(request.requestId);
-      const task = route(request)
+      const entry: PendingRequest = { seenAt: now(), controller: new AbortController() };
+      pending.set(request.requestId, entry);
+      const task = route(request, entry)
         .catch(() => undefined)
         .finally(() => inFlight.delete(task));
       inFlight.add(task);
+    },
+    observeStatus(status, pollStartedAt) {
+      if (!status || status === "waiting_for_approval") return;
+      for (const entry of pending.values()) {
+        // A poll that started before we saw the request may predate it.
+        if (entry.seenAt < pollStartedAt) entry.controller.abort(PROVIDER_NOT_PENDING);
+      }
     },
     async settle() {
       while (inFlight.size > 0) await Promise.allSettled([...inFlight]);

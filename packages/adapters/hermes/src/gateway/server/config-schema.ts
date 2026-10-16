@@ -71,26 +71,14 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Route Hermes approval requests",
         type: "toggle",
         default: true,
-        hint: "Answer Hermes approval.request events. A request is delegable only when the whole command matches a known-safe category (git, workspace package installs, test/build/lint, files inside a safe root); everything else becomes a board approval in the inbox. Off denies every request immediately.",
-      },
-      {
-        key: "approvalSupervisorAgentId",
-        label: "Approval supervisor agent ID",
-        type: "text",
-        hint: "Board-only setting. Optional idle or running agent in this company whose delegated policy approves known-safe requests. Leave empty to send every request to the board. Agents cannot set or change this key.",
+        hint: "Answer Hermes approval.request events. Every request becomes a board approval in the inbox; Paperclip answers Hermes with the board's decision. Off denies every request immediately.",
       },
       {
         key: "approvalBoardTimeoutSec",
         label: "Board approval timeout seconds",
         type: "number",
         default: DEFAULT_APPROVAL_BOARD_TIMEOUT_SEC,
-        hint: "How long to wait for a board decision before denying. The wait is capped at timeoutSec minus 15 seconds. Hermes approvals.timeout must be at least this long.",
-      },
-      {
-        key: "approvalScratchRoots",
-        label: "Approval safe roots",
-        type: "textarea",
-        hint: "Optional comma-separated absolute directories (added to /tmp and /private/tmp) where file reads, writes and deletes count as known-safe. A relative path is only placed inside a root when the command first cds into it.",
+        hint: "How long to wait for a board decision before denying. Capped at timeoutSec minus 15 seconds. To raise it above 270, first raise Hermes approvals.timeout (default 300) above the new value.",
       },
       {
         key: "instructions",

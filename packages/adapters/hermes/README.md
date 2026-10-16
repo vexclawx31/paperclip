@@ -164,55 +164,26 @@ When Hermes escalates a flagged command to a human, it emits an
 `approval.request` event (also visible as `approval` on a
 `waiting_for_approval` run status) and blocks the agent until
 `POST /v1/runs/{run_id}/approval` answers it with `{ "choice", "request_id" }`.
-The adapter answers every such request.
 
-**Classification fails safe.** A request is yellow (delegable) only when the
-whole command parses and every part of it matches a known-safe category:
+Green and yellow judgement belongs to Hermes' own smart guardian. Every
+request that reaches Paperclip is a human decision:
 
-- `git`: local git operations and pushes. Force-pushes to `main`, `master` or
-  an unnamed branch, remote branch deletion, `git -c` and unknown subcommands
-  are red.
-- `package_install`: `pnpm`/`npm`/`yarn`/`bun` installs into the workspace
-  (no `-g`, no `file:`/URL sources, no custom registry), `uv`, `poetry`,
-  `cargo fetch`/`add`, `go mod`, `pip install -r`/`-e`.
-- `test_build_lint`: test, build, lint, typecheck and format scripts, and
-  known tools (`vitest`, `jest`, `tsc`, `eslint`, `prettier`, `pytest`,
-  `cargo test`, `go test`, `make test`, ...).
-- `workspace_files`: reads, writes and deletes whose paths resolve inside a
-  safe root (`/tmp`, `/private/tmp` and `approvalScratchRoots`).
-
-The parser strips leading backslashes and `command`/`builtin`/`env`, and
-tracks every `cd`. Hermes does not report the shell's working directory and
-keeps it between tool calls, so a relative path is inside a safe root only
-after the same command `cd`s into one. Everything else is red: `$`/backtick
-expansion, subshells, heredocs, background jobs, `sh -c`, `eval`, `xargs`,
-`base64 -d`, inline interpreter code (`python -c`, `node -e`), `find -delete`
-or `-exec`, unknown programs, and anything that does not parse. Vetoes for
-credentials, service control and deploys, money, external messages,
-destructive SQL and disabling safety controls, a Hermes guardian denial, or a
-redacted or truncated command also make a request red.
-
-**Routing.**
-
-1. Yellow requests go to `approvalSupervisorAgentId` when it names an idle or
-   running agent in the same company that is not the running agent, and the
-   command is shown in full. Paperclip approves them "under delegated
-   supervisor policy" without a model call. The activity entry names the safe
-   category.
-2. Everything else becomes a `request_board_approval` approval, linked to the
-   run's issue, in the board's attention inbox with Approve / Reject. The
-   approval stores the command's SHA-256. If the displayed command is
-   redacted or truncated, the approval says so ("full command not shown").
-   An approval is used only when it echoes the same `request_id` and hash.
-3. Approval answers Hermes with `once` (never `session` or `always`). A
-   rejection, a revision request, a timeout, a disabled router, a host without
-   approval support or a cancelled Paperclip run answers `deny`. Every exit
-   without an approve or reject decision cancels the approval record.
-
-`approvalSupervisorAgentId` is board-only. The server rejects an agent
-caller that sets or changes it on agent create, hire, update or rollback
-(403). Removing it is allowed, because that only sends more requests to the
-board.
+1. Paperclip creates a `request_board_approval` approval, linked to the run's
+   issue, in the board's attention inbox with Approve / Reject. The command is
+   redacted for display. If redaction or truncation changed it, the approval
+   says "full command not shown". The approval stores the SHA-256 of the exact
+   command, and an approval is used only when it echoes the same `request_id`
+   and hash.
+2. Approval answers Hermes with `once` (never `session` or `always`).
+   Rejection, a revision request, a timeout, a disabled router, a host without
+   approval support, or a stopping or cancelled Paperclip run answers `deny`.
+   The adapter re-checks the run's stop signal immediately before it answers,
+   and never sends `once` once the run is stopping.
+3. The record never says Approved for a command that did not run. Every exit
+   without an in-time decision cancels the approval. An approval that lands
+   after the deadline is closed as too late. If Hermes is no longer waiting
+   (the answer returns `approval_not_pending`, or a later status poll no
+   longer shows `waiting_for_approval`), the approval is cancelled or closed.
 
 Every step writes `adapter.approval.*` run-log events and activity entries.
 Commands are redacted before they are logged or stored, including in the
@@ -221,21 +192,18 @@ per-event stream log line.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `approvalRouting` | `true` | `false` denies every request immediately. |
-| `approvalSupervisorAgentId` | unset | Board-only. Agent whose delegated policy approves known-safe requests. |
-| `approvalBoardTimeoutSec` | `540` | How long to wait for a board decision before denying (10 s to 24 h). |
-| `approvalScratchRoots` | unset | Extra absolute safe roots, comma-separated, added to `/tmp` and `/private/tmp`. |
+| `approvalBoardTimeoutSec` | `270` | How long to wait for a board decision before denying (10 s to 24 h). |
 
 The effective board wait is `min(approvalBoardTimeoutSec, remaining
-timeoutSec - 15 s)`. The default of 540 s fits inside the default
-`timeoutSec` of 600 s. When the wait is capped, the run log gets an
-`adapter.approval.timeout_capped` warning. To wait longer, raise both
-values together.
+timeoutSec - 15 s)`. When the run timeout caps it, the run log gets an
+`adapter.approval.timeout_capped` warning.
 
-Hermes has its own timeout, which must be raised separately in the Hermes
-profile: `approvals.timeout` (seconds, default 300 in current releases) must
-be at least `approvalBoardTimeoutSec`. Otherwise Hermes denies the command
-first, and the late answer from Paperclip fails with `approval_not_pending`;
-the adapter logs this as `adapter.approval.answer_failed`.
+The default of 270 s stays below Hermes' default `approvals.timeout` of
+300 s, so Paperclip answers before Hermes gives up. To give the board longer,
+raise Hermes' `approvals.timeout` (in the Hermes profile) above the new value
+first, then raise `approvalBoardTimeoutSec`, and keep `timeoutSec` above both.
+If Hermes times out first, the late answer fails with `approval_not_pending`;
+the adapter logs `adapter.approval.answer_failed` and the approval is closed.
 
 ### Compatibility with the old gateway package
 

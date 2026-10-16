@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import type { AdapterApprovalDecision, AdapterApprovalRequest, AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import type { AdapterApprovalDecision, AdapterApprovalDelivery, AdapterApprovalRequest, AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
 import { execute, mapFinalResultForTest, parseSseFramesForTest, resolveSessionKey } from "./execute.js";
 import { testEnvironment } from "./test.js";
@@ -1038,7 +1038,7 @@ describe("scoped run environment", () => {
 });
 
 describe("approval routing", () => {
-  function approvalHarness(options: { statusApproval?: boolean } = {}) {
+  function approvalHarness(options: { statusApproval?: boolean; notPending?: boolean } = {}) {
     let push!: (text: string) => void;
     let close!: () => void;
     const stream = new ReadableStream<Uint8Array>({
@@ -1081,6 +1081,9 @@ describe("approval routing", () => {
           push(`event: run.completed\ndata: ${JSON.stringify({ status: "completed", output: "done" })}\n\n`);
           close();
         });
+        if (options.notPending) {
+          return new Response(JSON.stringify({ error: { message: "Run has no pending approval", code: "approval_not_pending" } }), { status: 409 });
+        }
         return new Response(JSON.stringify({ object: "hermes.run.approval_response", resolved: 1 }), { status: 200 });
       }
       if (options.statusApproval && !answered) {
@@ -1092,7 +1095,7 @@ describe("approval routing", () => {
     return { approvalPosts };
   }
 
-  it("routes a red approval.request to the host board decision and posts the answer back", async () => {
+  it("routes an approval.request to the host board decision and posts the answer back", async () => {
     const { approvalPosts } = approvalHarness();
     const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30, pollIntervalMs: 250 });
     const onEvent = vi.fn(async () => undefined);
@@ -1111,8 +1114,7 @@ describe("approval routing", () => {
     expect(result.exitCode).toBe(0);
     expect(onApprovalRequest).toHaveBeenCalledTimes(1);
     const request = (onApprovalRequest.mock.calls[0] as unknown as [Record<string, unknown>])[0];
-    expect(request).toMatchObject({ requestId: "req-1", providerRunId: "run-hermes-1", tier: "red", route: "board" });
-    expect(request.reasons).toContain("service_control");
+    expect(request).toMatchObject({ requestId: "req-1", providerRunId: "run-hermes-1", commandComplete: false });
     expect(String(request.command)).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123");
     expect(approvalPosts).toEqual([{ choice: "once", request_id: "req-1" }]);
     const eventTypes = (onEvent.mock.calls as unknown as Array<[{ eventType: string }]>).map(([event]) => event.eventType);
@@ -1144,6 +1146,23 @@ describe("approval routing", () => {
     expect(approvalPosts).toEqual([{ choice: "deny", request_id: "req-1" }]);
     const urls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((call) => String(call[0]));
     expect(urls.findIndex((url) => url.endsWith("/approval"))).toBeLessThan(urls.findIndex((url) => url.endsWith("/stop")));
+  });
+
+  it("reports approval_not_pending from Hermes as an undelivered answer", async () => {
+    approvalHarness({ notPending: true });
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30 });
+    const onDelivery = vi.fn(async (_delivery: AdapterApprovalDelivery) => undefined);
+    ctx.onApprovalRequest = vi.fn(async (request: AdapterApprovalRequest) => ({
+      decision: "approved" as const,
+      decidedBy: "board" as const,
+      requestId: request.requestId,
+      commandSha256: request.commandSha256,
+      onDelivery,
+    }));
+
+    await execute(ctx);
+
+    expect(onDelivery).toHaveBeenCalledWith({ delivered: false, choice: "once", reason: "approval_not_pending" });
   });
 
   it("denies a board timeout with the deny choice", async () => {

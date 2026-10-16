@@ -196,22 +196,15 @@ export interface AdapterRuntimeEvent {
 
 /**
  * A provider-side request for operator consent (for example a Hermes
- * `approval.request`) that the adapter routes to the host. The adapter has
- * already classified it; the host owns the durable decision record and its
- * audit trail. Every text field is already redacted by the adapter.
+ * `approval.request`) that the adapter routes to the host. Every request is a
+ * board decision; the host owns the durable record and its audit trail. Every
+ * text field is already redacted by the adapter.
  */
 export interface AdapterApprovalRequest {
   /** Provider request id; the host uses it as an idempotency key. */
   requestId: string;
   /** Provider run id the request belongs to. */
   providerRunId: string;
-  /** "red" may only be decided by a human; "yellow" may be delegated. */
-  tier: "red" | "yellow";
-  /** "supervisor" asks the host to apply the delegated supervisor policy. */
-  route: "board" | "supervisor";
-  supervisorAgentId?: string | null;
-  /** Known-safe categories the whole command matched; empty unless yellow. */
-  categories: string[];
   /** Display copy; may differ from the provider command when redacted. */
   command: string;
   /** SHA-256 (hex) of the exact command text the provider sent. */
@@ -219,23 +212,36 @@ export interface AdapterApprovalRequest {
   /** False when `command` is redacted or truncated relative to the provider text. */
   commandComplete: boolean;
   description: string;
-  /** Classifier rule ids that produced the tier. */
-  reasons: string[];
   /** Upper bound the host may wait for a board decision. */
   timeoutMs: number;
-  /** Aborted when the provider run ends or the Paperclip run is cancelled. */
+  /**
+   * Aborted when the provider run ends, the provider stops waiting for this
+   * request, or the Paperclip run is cancelled.
+   */
   signal: AbortSignal;
+}
+
+export interface AdapterApprovalDelivery {
+  /** True only when the provider accepted the answer. */
+  delivered: boolean;
+  choice: "once" | "deny";
+  /** Why an answer was not delivered (for example "approval_not_pending"). */
+  reason?: string | null;
 }
 
 export interface AdapterApprovalDecision {
   decision: "approved" | "denied" | "timeout" | "cancelled" | "unavailable";
-  decidedBy: "board" | "supervisor_policy" | "system";
+  decidedBy: "board" | "system";
   approvalId?: string | null;
-  supervisorAgentId?: string | null;
   note?: string | null;
   /** Echo of the decided request; an approval without a matching echo is treated as a denial. */
   requestId?: string | null;
   commandSha256?: string | null;
+  /**
+   * Called once after the adapter tried to answer the provider, so the host
+   * can close a record whose answer never took effect.
+   */
+  onDelivery?: (delivery: AdapterApprovalDelivery) => Promise<void>;
 }
 
 export interface AdapterExecutionContext {
