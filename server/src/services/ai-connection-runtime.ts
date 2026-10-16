@@ -68,12 +68,14 @@ export function stripAiAuthBindings(env: unknown): Record<string, unknown> {
 }
 const PROJECT_AUTH_PATTERN =
   /apiKeyHelper|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENAI_API_KEY|model_provider\s*=|env_key\s*=|experimental_bearer_token|cli_auth_credentials_store/;
-const CLAUDE_AUTH_ENV_KEYS = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY"];
+// Top-level Claude settings keys that supply credentials or pick the login path.
+const CLAUDE_AUTH_SETTING_KEYS = ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "forceLoginMethod"];
 
 // A settings file conflicts only when it actually configures authentication.
-// Claude settings are JSON: only `apiKeyHelper` or an auth variable under `env`
-// counts, not a mention of a variable name in unrelated text (for example an
-// auto-mode environment description). TOML comments are ignored. Anything that
+// Claude settings are JSON: a credential/login key (CLAUDE_AUTH_SETTING_KEYS) or
+// an auth binding under `env` (AI_AUTH_ENV_KEYS) counts, not a mention of a
+// variable name in unrelated text (for example an auto-mode environment
+// description). TOML comments are ignored. Anything that
 // cannot be parsed keeps the strict textual check.
 export function projectFileConfiguresAuth(relative: string, content: string): boolean {
   if (relative.endsWith(".json")) {
@@ -85,10 +87,12 @@ export function projectFileConfiguresAuth(relative: string, content: string): bo
     }
     if (!settings || typeof settings !== "object" || Array.isArray(settings)) return PROJECT_AUTH_PATTERN.test(content);
     const record = settings as Record<string, unknown>;
-    if (record.apiKeyHelper !== undefined && record.apiKeyHelper !== null && record.apiKeyHelper !== "") return true;
+    if (CLAUDE_AUTH_SETTING_KEYS.some((key) => record[key] !== undefined && record[key] !== null && record[key] !== "")) return true;
     const env = record.env;
-    return Boolean(env && typeof env === "object" && !Array.isArray(env) &&
-      CLAUDE_AUTH_ENV_KEYS.some((key) => Object.prototype.hasOwnProperty.call(env, key)));
+    if (env === undefined || env === null) return false;
+    // An `env` of an unexpected shape keeps the strict textual check.
+    if (typeof env !== "object" || Array.isArray(env)) return PROJECT_AUTH_PATTERN.test(content);
+    return AI_AUTH_ENV_KEYS.some((key) => Object.prototype.hasOwnProperty.call(env, key));
   }
   const withoutComments = content
     .split("\n")
