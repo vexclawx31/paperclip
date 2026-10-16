@@ -35,4 +35,12 @@ describe("native mode preparation",()=>{
  it("managed mode never falls back to local",async()=>{
   await expect(prepareManagedAiRuntime({} as Db,{...base,config:{...base.config,localClaudeLogin:false}})).rejects.toThrow("managed selection must not run");expect(select).toHaveBeenCalled();
  });
+ it("accepts native settings that only mention auth names and refuses real competing auth",async()=>{
+  await fs.mkdir(path.join(home, ".claude"), { recursive: true });
+  await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({ autoMode: { environment: ["Agents never read ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN from the shell."] } }));
+  const result = await prepareManagedAiRuntime({} as Db, base);
+  await result.cleanup();
+  await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({ apiKeyHelper: "/synthetic/bin/helper" }));
+  await expect(prepareManagedAiRuntime({} as Db, base)).rejects.toThrow("competing authentication configuration");
+ });
 });

@@ -249,7 +249,7 @@ export async function prepareManagedAiRuntime(
     for (const file of ["settings.json", "settings.local.json"]) {
       try {
         const settings = await readFile(path.join(localTarget.configDir, file), "utf8");
-        if (/apiKeyHelper|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN/.test(settings)) {
+        if (projectFileConfiguresAuth(file, settings)) {
           throw unprocessable("Native Claude settings contain competing authentication configuration");
         }
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
