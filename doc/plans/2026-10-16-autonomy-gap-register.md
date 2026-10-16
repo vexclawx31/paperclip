@@ -34,12 +34,13 @@ Status values: **open** (not started), **in progress**, **fixed (master)**,
 |---|-----|----------|-------|--------|
 | A1 | Paperclip runs for Hermes agents used the restricted Slack task-bridge key, not the per-run key (403 on company reads). | LIT-129 | Paperclip agent config plus Hermes profile | fixed (live) for Nox — make `scopedRunEnvironment` and `run_environment_allowlist` the default for every `hermes_gateway` agent |
 | A2 | Hermes approval requests from Paperclip runs have no approver: they are denied after a 60-second timeout. | LIT-129 | Paperclip Hermes adapter | open — phase 2: route yellow-tier requests to Vex and red-tier requests to the human |
-| A3 | Hermes redacts `Bearer ` as `***` in session history. The model copies that into code and sends a malformed Authorization header. | LIT-133 | Hermes | open — the owner is Hermes redaction; mitigated by Vex's instructions |
+| A3 | Hermes redacts `Bearer ` as `***` in session history. The model copies that into code and sends a malformed Authorization header. | LIT-133 | Hermes | open (Hermes owner) — mitigated: Vex uses the `paperclip-api` helper (`~/.hermes/bin`), which builds the Bearer header from the run environment, so agents never hand-write it |
 | A4 | An unauthenticated request got a disguised 404 ("Issue not found"), hiding auth mistakes. | LIT-133 | Paperclip authz | fixed (live line, not deployed) — PR #15. Routes that use their own access check still return 404 (deferred) |
 | A5 | The AI-connection auth check flagged any mention of auth variable names, including in prose, and blocked `claude_local`. | LIT-131 / LIT-132 | Paperclip AI connections | fixed (live) — PRs #12, #13, #14. The remote sandbox path is still textual (deferred) |
 | A6 | Claudy (`claude_local`) and Clipy (`codex_local`) run with all permission checks bypassed, which is broader than any Hermes channel. | Channel review | Agent configuration | open — bring them under the risk tiers |
 | A7 | The guardian gates by syntax (heredoc, `-c`, `node -e`), not by effect, which escalates routine work. | LIT-129 | Hermes guardian policy | open — phase 3 |
 | A8 | Red-tier actions are not enforced as hard floors that no agent can approve. | Policy | Hermes plus Paperclip | open — phase 4 |
+| A9 | Agents that run as the operator's OS user can reach the operator's board CLI login (`~/.local/bin/paperclipai` with its stored context), which would let them act as the board. | LIT-134 | Host isolation plus agent instructions | open — instructions forbid it; durable fix: run agents as separate OS users or keep the board CLI context out of agent reach |
 
 ## External tool access (Apex as the reference workload)
 
