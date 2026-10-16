@@ -183,10 +183,21 @@ async function runExecutor(
 ) {
   // Skill reconciliation must never inspect or modify the developer's real
   // Gemini home. Keep one private home across this test's resumed turns.
+  // The engine also probes `gemini --version` (up to 2s per run); answer it
+  // from a private fake CLI so the host's real gemini never sets the timing.
   const configuredEnv = config.env as Record<string, unknown> | undefined;
   if (config.agent === "gemini" && !(typeof configuredEnv?.HOME === "string" && configuredEnv.HOME.trim())) {
-    defaultGeminiTestHome ??= await makeTempRoot();
-    config = { ...config, env: { ...configuredEnv, HOME: defaultGeminiTestHome } };
+    if (!defaultGeminiTestHome) {
+      defaultGeminiTestHome = await makeTempRoot();
+      const binDir = path.join(defaultGeminiTestHome, "bin");
+      await fs.mkdir(binDir, { recursive: true });
+      await fs.writeFile(path.join(binDir, "gemini"), `#!/bin/sh\necho "0.38.2"\n`, { mode: 0o755 });
+    }
+    const hasPath = typeof configuredEnv?.PATH === "string" && configuredEnv.PATH.trim();
+    config = { ...config, env: {
+      ...configuredEnv, HOME: defaultGeminiTestHome,
+      ...(hasPath ? {} : { PATH: [path.join(defaultGeminiTestHome, "bin"), process.env.PATH ?? ""].filter(Boolean).join(path.delimiter) }),
+    } };
   }
   const runtimeOptions: Record<string, unknown>[] = [];
   const configOptions: Array<{ key: string; value: string }> = [];
