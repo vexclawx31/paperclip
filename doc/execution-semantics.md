@@ -88,18 +88,6 @@ A descriptor whose owner is the assigned agent itself is that agent's own pendin
 - Run liveness classifies such a run as `plan_only` with the action as `nextAction`, even if the run posted a comment. It is not `blocked`.
 - Every real waiting path still wins: unresolved blocker issues, pending interactions or approvals, a scheduled monitor, a pending execution stage, a user owner, pause/stop holds, budget, and recovery ownership. With any of these present the issue stays a normal blocked wait. The owner wake is not sent, and a follow-up already queued with the bound action is cancelled before launch if such a wait was recorded after the notification; that wait's own resolution wakes the assignee. Another agent named by the board still gets its routing wake, without the bound action.
 
-Ordinary task questions are current input waits only while they still belong to
-the current human direction. In the task chat, a newer non-deleted human message
-on the same task makes an earlier ordinary question historical, without
-answering, cancelling, or accepting it. Agent-authored, run-attributed,
-derived-agent, untrusted, and system-notice comments do not establish that
-direction. A historical question stays pending and answerable from a compact
-feed row, but it does not take over the composer, reopen itself, or count as a
-pending composer input. Cancel on a question resolves it as cancelled; closing
-the form only defers it. The classifier lives in
-`packages/shared/src/task-questions.ts`. On this release line server-side task
-context, completion, and wait gating are unchanged.
-
 A permission denial is not, by itself, a blocker. If an instructed step is denied at an authorization boundary but the issue's own deliverable is complete, the right disposition is `done`, not `blocked` (see the review-delegation rules in §6).
 
 This requirement is prospective-only on rollout: it applies to transitions into `blocked` made after the feature ships, gated on the blocked-transition timestamp against the rollout marker, not on issue `createdAt`. Issues already blocked at upgrade time are untouched — no backfilled notifications, no retroactive validation, no `needs_attention` storm on deploy. Triage of pre-existing prose-blocked issues is a one-time opt-in digest, not a default.

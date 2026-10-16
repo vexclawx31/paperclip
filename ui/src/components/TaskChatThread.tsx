@@ -9,7 +9,6 @@ import type { ActivityEvent, TaskBrowser } from "@paperclipai/shared";
 import { useProjectCreatedItems } from "@/hooks/useProjectCreatedItems";
 import { skillCreatedItems } from "@/components/task-chat/skill-created-items";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
-import { isHistoricalTaskQuestion, isOrdinaryTaskQuestion, latestHumanDirectionComment } from "@paperclipai/shared";
 import { TaskChatExpansionState } from "@/components/task-chat/expansion-state";
 import { TaskChatScrollReady } from "@/components/task-chat/scroll-navigation";
 import {
@@ -2442,26 +2441,23 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     return result;
   }, [interactions, pendingRuntimeRequest]);
-  const latestUserComment = useMemo(() => latestHumanDirectionComment(comments), [comments]);
-  const latestUserCommentId = latestUserComment?.id ?? null;
-  // A newer human message makes an earlier ordinary question historical
-  // (doc/execution-semantics.md). It stays pending and answerable from its
-  // feed row, but never takes over, reopens, or counts toward the composer.
-  const historicalQuestionIds = useMemo(() => new Set((interactions ?? [])
-    .filter(interaction => interaction.status === "pending" && isHistoricalTaskQuestion(interaction, latestUserComment))
-    .map(interaction => interaction.id)), [interactions, latestUserComment]);
-  const isHistoricalInput = useCallback((input: PendingComposerInput) =>
-    input.kind === "durable" && historicalQuestionIds.has(input.interaction.id), [historicalQuestionIds]);
   // Agent Chat questions already have an answerable history card, including
   // when the user dismisses a fresh form without sending another message.
   const pendingReminderInputs = useMemo(() => pendingComposerInputs.filter(input =>
-    !isHistoricalInput(input)
-    && !(conversationMode && input.kind === "durable" && input.interaction.kind === "ask_user_questions")),
-  [pendingComposerInputs, conversationMode, isHistoricalInput]);
+    !(conversationMode && input.kind === "durable" && input.interaction.kind === "ask_user_questions")),
+  [pendingComposerInputs, conversationMode]);
+  const latestUserComment = useMemo(() => comments
+    .filter(comment => !comment.deletedAt && comment.authorUserId && !comment.authorAgentId && !comment.createdByRunId)
+    .reduce<(typeof comments)[number] | null>((latest, comment) =>
+      !latest || toMs(comment.createdAt) >= toMs(latest.createdAt) ? comment : latest, null), [comments]);
+  const latestUserCommentId = latestUserComment?.id ?? null;
   // A later message leaves a question answerable in history, without reopening
   // its form on every render or reload. Explicit selection can still reopen it.
-  const currentPendingInputs = useMemo(() => pendingComposerInputs.filter(input => !isHistoricalInput(input)),
-  [pendingComposerInputs, isHistoricalInput]);
+  const currentPendingInputs = useMemo(() => pendingComposerInputs.filter(input =>
+    !(conversationMode && input.kind === "durable"
+      && input.interaction.kind === "ask_user_questions" && latestUserComment
+      && toMs(input.interaction.createdAt) < toMs(latestUserComment.createdAt))),
+  [pendingComposerInputs, conversationMode, latestUserComment]);
   const currentPendingKeys = useMemo(() => new Set(currentPendingInputs.map(input => input.key)), [currentPendingInputs]);
   const [takeoverMode, setTakeoverMode] = useState<"open" | "normal">("open");
   const [selectedPendingKey, setSelectedPendingKey] = useState<string | null>(
@@ -2544,8 +2540,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       if (assigneeUsesPaperclipRunner) setRunnerSubmissionPending(true);
       try {
         await onAdd(...args);
-        // The sent message makes the open ordinary question historical.
-        if (selectedPendingInput?.kind === "durable" && isOrdinaryTaskQuestion(selectedPendingInput.interaction)) {
+        if (conversationMode && selectedPendingInput?.kind === "durable" && selectedPendingInput.interaction.kind === "ask_user_questions") {
           setSelectedPendingKey(null);
           setTakeoverMode("normal");
         }
@@ -2554,7 +2549,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         throw error;
       }
     },
-    [assigneeUsesPaperclipRunner, onAdd, selectedPendingInput],
+    [assigneeUsesPaperclipRunner, onAdd, conversationMode, selectedPendingInput],
   );
   const optimisticRunnerStartup =
     assigneeUsesPaperclipRunner &&
@@ -2642,7 +2637,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         item={item}
         onReviewRequest={reopenToolReview}
         showUnansweredQuestion={conversationMode}
-        historicalQuestion={historicalQuestionIds.has(item.interaction.id)}
         planDocument={planDocument}
         showPlanPreview={
           !threadOwnsPlanPreview(
@@ -2684,7 +2678,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       tailRunId,
       reopenToolReview,
       conversationMode,
-      historicalQuestionIds,
     ],
   );
 

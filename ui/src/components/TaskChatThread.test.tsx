@@ -2895,91 +2895,12 @@ describe("Agent Chat unanswered question history", () => {
     expect(container.querySelector('[data-testid="task-chat-unanswered-question"]')).not.toBeNull();
   });
 
-  it("labels a moved-on question as historical, not unanswered", () => {
-    render(<TaskChatThread {...props} comments={movedOn} interactions={[old]} />);
-    const row = container.querySelector('[data-testid="task-chat-unanswered-question"]');
-    expect(row?.getAttribute("data-question-state")).toBe("historical");
-    expect(row?.textContent).toContain("Earlier question");
-    expect(row?.textContent).not.toContain("Unanswered question");
-  });
-});
-
-describe("Task chat historical questions (ordinary task mode)", () => {
-  const old = questionInteraction("old", "Which color?", "2026-08-15T12:00:01Z");
-  const movedOn = createLongThreadComments();
-  const agentReply = {
-    ...movedOn[3]!,
-    id: "agent-reply",
-    authorType: "agent" as const,
-    authorAgentId: "agent-1",
-    authorUserId: null,
-    body: "Still working on it.",
-    createdAt: new Date("2026-08-15T12:10:00.000Z"),
-    updatedAt: new Date("2026-08-15T12:10:00.000Z"),
-  };
-  const props = { conversationMode: false, issueId: "issue-1", onAdd: async () => {}, onSubmitInteractionAnswers: vi.fn() };
-  const takeover = () => container.querySelector('[data-testid="task-chat-composer-takeover"]');
-  const pendingIndicator = () => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-pending-input-indicator"]');
-  const historyRow = () => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-unanswered-question"]');
-  const dismiss = async () => {
-    await act(async () => takeover()!.querySelector<HTMLButtonElement>('[aria-label^="Dismiss "]')!.click());
-  };
-  const click = async (text: string) => {
-    const button = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent?.trim() === text);
-    expect(button).toBeTruthy();
-    await act(async () => button!.click());
-  };
-
-  it("renders a question older than the newest human message as historical", async () => {
-    render(<TaskChatThread {...props} comments={movedOn} interactions={[old]} />);
-    expect(takeover()).toBeNull();
-    expect(pendingIndicator()).toBeNull();
-    expect(historyRow()?.getAttribute("data-question-state")).toBe("historical");
-    expect(historyRow()?.textContent).toContain("Earlier question");
-    await act(async () => historyRow()!.click());
+  it("does not change ordinary task question behavior", async () => {
+    render(<TaskChatThread {...props} conversationMode={false} comments={movedOn} interactions={[old]} />);
     expect(takeover()?.textContent).toContain("Which color?");
+    expect(container.querySelector('[data-testid="task-chat-unanswered-question"]')).toBeNull();
     await dismiss();
-    expect(takeover()).toBeNull();
-    expect(pendingIndicator()).toBeNull();
-  });
-
-  it("does not make the question historical for a newer agent comment", () => {
-    const agentOnly = [agentReply];
-    render(<TaskChatThread {...props} comments={agentOnly} interactions={[old]} />);
-    expect(takeover()?.textContent).toContain("Which color?");
-    expect(historyRow()).toBeNull();
-  });
-
-  it("keeps X as answer later until a newer human message supersedes it", async () => {
-    render(<TaskChatThread {...props} comments={[]} interactions={[old]} />);
-    expect(takeover()?.textContent).toContain("Which color?");
-    await dismiss();
-    expect(takeover()).toBeNull();
     expect(pendingIndicator()?.textContent).toContain("1 pending input");
-    await act(async () => render(<TaskChatThread {...props} comments={movedOn} interactions={[old]} />));
-    expect(takeover()).toBeNull();
-    expect(pendingIndicator()).toBeNull();
-    expect(historyRow()?.getAttribute("data-question-state")).toBe("historical");
-  });
-
-  it("collapses an open question when a new human message arrives", async () => {
-    render(<TaskChatThread {...props} comments={[]} interactions={[old]} />);
-    expect(takeover()).not.toBeNull();
-    await act(async () => render(<TaskChatThread {...props} comments={movedOn} interactions={[old]} />));
-    expect(takeover()).toBeNull();
-    expect(pendingIndicator()).toBeNull();
-  });
-
-  it("cancels the question for good when Cancel can resolve it", async () => {
-    const onCancelInteraction = vi.fn().mockResolvedValue(undefined);
-    render(<TaskChatThread {...props} comments={[]} interactions={[old]} onCancelInteraction={onCancelInteraction} />);
-    await click("Cancel");
-    expect(onCancelInteraction).toHaveBeenCalledWith(old);
-    const cancelled = { ...old, status: "cancelled", result: { version: 1, cancellationReason: null } } as IssueThreadInteraction;
-    await act(async () => render(<TaskChatThread {...props} comments={[]} interactions={[cancelled]} onCancelInteraction={onCancelInteraction} />));
-    expect(takeover()).toBeNull();
-    expect(pendingIndicator()).toBeNull();
-    expect(historyRow()).toBeNull();
   });
 });
 
