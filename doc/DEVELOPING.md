@@ -501,7 +501,13 @@ Use the cheap local default unless you are specifically working on browser flows
 pnpm test
 ```
 
-`pnpm test` runs the Vitest suite only. For interactive Vitest watch mode use:
+`pnpm test` runs the Vitest suite only. Each Vitest invocation gets a fresh
+canonical `/tmp/pv-*` root for `PAPERCLIP_HOME` and `TMPDIR`. To place those
+roots elsewhere, set `PAPERCLIP_TEST_TEMP_PARENT` to an existing absolute
+directory whose canonical path is at most 38 bytes, so Unix socket fixtures stay
+within the macOS path limit. Invalid values fail before any test runs.
+
+For interactive Vitest watch mode use:
 
 ```sh
 pnpm test:watch

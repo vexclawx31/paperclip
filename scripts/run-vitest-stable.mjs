@@ -330,6 +330,39 @@ function parseCliOptions(argv) {
   };
 }
 
+// PAPERCLIP_TEST_TEMP_PARENT moves the per-invocation pv-XXXXXX roots out of
+// /tmp. The longest socket fixture is <root>/t/tsh-broker-<uuid>.sock: the
+// parent plus 65 bytes, within macOS's 103 usable sun_path bytes only when the
+// canonical parent is at most 38 bytes.
+const tempParentVariable = "PAPERCLIP_TEST_TEMP_PARENT";
+const maxTempParentBytes = 38;
+
+function resolveTempRootParent() {
+  const value = process.env[tempParentVariable];
+  if (value === undefined) {
+    return process.platform === "win32" ? os.tmpdir() : "/tmp";
+  }
+  if (value.trim() === "" || !path.isAbsolute(value)) {
+    fail(`${tempParentVariable} must be an absolute path. Received "${value}".`);
+  }
+  let canonical;
+  try {
+    canonical = realpathSync(value);
+  } catch {
+    fail(`${tempParentVariable} does not exist: "${value}".`);
+  }
+  if (!statSync(canonical).isDirectory()) {
+    fail(`${tempParentVariable} is not a directory: "${value}".`);
+  }
+  if (Buffer.byteLength(canonical) > maxTempParentBytes) {
+    fail(
+      `${tempParentVariable} canonical path "${canonical}" exceeds ${maxTempParentBytes} bytes; ` +
+        "Unix socket fixtures would exceed the macOS path limit.",
+    );
+  }
+  return canonical;
+}
+
 function selectSerializedSuites(routeTests, shardIndex, shardCount) {
   // Same duration-aware LPT partition as the general-server lane. Round-robin
   // over the alphabetical list clustered the heavy heartbeat/issues suites on
@@ -348,7 +381,6 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
 function runVitest(args, label, testShard = null) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
-  const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
   // Production workspace/security checks reject symlink aliases. In particular
   // /tmp is /private/tmp on macOS, so fixture roots must use the canonical path.
   const testRoot = realpathSync(mkdtempSync(path.join(tempRootParent, "pv-")));
@@ -564,6 +596,7 @@ const generalServerTestFiles = [
   .sort((a, b) => a.localeCompare(b));
 
 const options = parseCliOptions(process.argv.slice(2));
+const tempRootParent = resolveTempRootParent();
 if (options.dryRun) {
   const serializedSuites =
     options.mode === serializedModeName
@@ -576,6 +609,7 @@ if (options.dryRun) {
         shardIndex: options.shardIndex,
         shardCount: options.shardCount,
         group: options.group,
+        tempRootParent,
         availableGeneralGroups: allowedGeneralGroupNames,
         serializedSuiteCount: routeTests.length,
         selectedSerializedSuites: serializedSuites.map((routeTest) => routeTest.repoPath),

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -422,6 +423,71 @@ test("the PR vitest lane wrapper runs the native-runner group exactly on the fin
     env: workflowEnv({ GITHUB_WORKFLOW: "PR" }),
   });
   assert.notEqual(malformed.status, 0, "a malformed shard flag must fail rather than guess a lane");
+});
+
+// PAPERCLIP_TEST_TEMP_PARENT relocates the per-invocation pv-XXXXXX roots.
+// Dry runs validate and report the parent without creating any fixture, so
+// these cases never write under /tmp.
+const tempParentVariable = "PAPERCLIP_TEST_TEMP_PARENT";
+
+function tempParentDryRun(value) {
+  const env = workflowEnv();
+  delete env[tempParentVariable];
+  if (value !== undefined) env[tempParentVariable] = value;
+  return spawnSync(process.execPath, [script, "--mode", "serialized", "--dry-run"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env,
+  });
+}
+
+test("the temp parent defaults to /tmp (os.tmpdir() on Windows) when no override is set", () => {
+  const result = tempParentDryRun(undefined);
+  assert.equal(result.status, 0, result.stderr);
+  const expected = process.platform === "win32" ? os.tmpdir() : "/tmp";
+  assert.equal(JSON.parse(result.stdout).tempRootParent, expected);
+});
+
+test("a valid temp parent override is reported by its canonical path", () => {
+  const sandbox = mkdtempSync(path.join(os.tmpdir(), "pv-parent-"));
+  try {
+    // A symlink alias must resolve to its target, as the per-run roots do.
+    const alias = path.join(sandbox, "alias");
+    symlinkSync(path.parse(sandbox).root, alias);
+    for (const value of [path.parse(sandbox).root, alias]) {
+      const result = tempParentDryRun(value);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(JSON.parse(result.stdout).tempRootParent, realpathSync(value));
+    }
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test("an invalid temp parent override fails before any Vitest run", () => {
+  const sandbox = mkdtempSync(path.join(os.tmpdir(), "pv-parent-"));
+  try {
+    const file = path.join(sandbox, "file");
+    writeFileSync(file, "");
+    // Canonical length 39 leaves no room for pv-XXXXXX/t/<52-byte socket>.
+    const tooLong = path.join(sandbox, "x".repeat(40));
+    mkdirSync(tooLong);
+    for (const [value, message] of [
+      ["", /must be an absolute path/],
+      ["   ", /must be an absolute path/],
+      ["relative/dir", /must be an absolute path/],
+      [path.join(sandbox, "missing"), /does not exist/],
+      [file, /is not a directory/],
+      [tooLong, /exceeds 38 bytes/],
+    ]) {
+      const result = tempParentDryRun(value);
+      assert.notEqual(result.status, 0, `expected rejection for ${JSON.stringify(value)}`);
+      assert.equal(result.stdout, "", "no plan may be printed for an invalid override");
+      assert.match(result.stderr, message);
+    }
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
 });
 
 const lineShardFile = path.join(repoRoot, "server/src/__tests__/chat-channels.integration.test.ts");
