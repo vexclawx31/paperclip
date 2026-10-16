@@ -158,6 +158,52 @@ When `"scopedRunEnvironment": true`:
   redacted (for example `Hermes gateway HTTP 400: Run environment denied by
   policy`).
 
+#### Approval requests (`approval.request`)
+
+When Hermes escalates a flagged command to a human, it emits an
+`approval.request` event (also visible as `approval` on a
+`waiting_for_approval` run status) and blocks the agent until
+`POST /v1/runs/{run_id}/approval` answers it with `{ "choice", "request_id" }`.
+The adapter answers every such request:
+
+1. It classifies the request with a conservative, deterministic classifier
+   over the command, description and Hermes pattern keys. Red covers
+   credentials and secrets, service control and deploys, `sudo`, remote code
+   piped to a shell, money, external messages, force-pushing or deleting
+   `main`/`master`, destructive SQL, `rm -r`/`rm -f` outside the working
+   directory or `/tmp`, cross-tenant wording and disabling safety controls.
+   An empty command, a request Hermes' guardian denied, or a request carrying
+   an already-redacted secret is also red. Anything else is yellow.
+2. Red requests, and yellow requests when no supervisor is configured, become
+   a `request_board_approval` approval linked to the run's issue. It appears in
+   the board's attention inbox with Approve / Reject. The adapter waits for the
+   decision.
+3. Yellow requests go to `approvalSupervisorAgentId` when it names an active
+   agent in the same company that is not the running agent. Paperclip approves
+   them "under delegated supervisor policy" without a model call, and records
+   an activity entry.
+4. Approval answers Hermes with `once` (never `session` or `always`). A
+   rejection, a timeout, a disabled router or a host without approval support
+   answers `deny`. If the run ends first, the pending approval is cancelled.
+
+Every step writes `adapter.approval.*` run-log events and activity entries.
+Commands are redacted before they are logged or stored.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `approvalRouting` | `true` | `false` denies every request immediately. |
+| `approvalSupervisorAgentId` | unset | Agent whose delegated policy approves yellow requests. |
+| `approvalBoardTimeoutSec` | `900` | How long to wait for a board decision before denying (10 s to 24 h). |
+
+The board wait is also capped by the run's own `timeoutSec` (less a 15 second
+reserve), so set `timeoutSec` above `approvalBoardTimeoutSec`.
+
+Hermes has its own timeout, which must be raised separately in the Hermes
+profile: `approvals.timeout` (seconds) must be at least
+`approvalBoardTimeoutSec`. Otherwise Hermes denies the command first, and the
+late answer from Paperclip fails with `approval_not_pending`; the adapter logs
+this as `adapter.approval.answer_failed`.
+
 ### Compatibility with the old gateway package
 
 `@paperclipai/adapter-hermes-gateway` remains as a deprecated compatibility shim

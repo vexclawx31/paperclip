@@ -194,6 +194,40 @@ export interface AdapterRuntimeEvent {
   payload?: Record<string, unknown>;
 }
 
+/**
+ * A provider-side request for operator consent (for example a Hermes
+ * `approval.request`) that the adapter routes to the host. The adapter has
+ * already classified it; the host owns the durable decision record and its
+ * audit trail. Every text field is already redacted by the adapter.
+ */
+export interface AdapterApprovalRequest {
+  /** Provider request id; the host uses it as an idempotency key. */
+  requestId: string;
+  /** Provider run id the request belongs to. */
+  providerRunId: string;
+  /** "red" may only be decided by a human; "yellow" may be delegated. */
+  tier: "red" | "yellow";
+  /** "supervisor" asks the host to apply the delegated supervisor policy. */
+  route: "board" | "supervisor";
+  supervisorAgentId?: string | null;
+  command: string;
+  description: string;
+  /** Classifier rule ids that produced the tier. */
+  reasons: string[];
+  /** Upper bound the host may wait for a board decision. */
+  timeoutMs: number;
+  /** Aborted when the provider run ends or the Paperclip run is cancelled. */
+  signal: AbortSignal;
+}
+
+export interface AdapterApprovalDecision {
+  decision: "approved" | "denied" | "timeout" | "cancelled" | "unavailable";
+  decidedBy: "board" | "supervisor_policy" | "system";
+  approvalId?: string | null;
+  supervisorAgentId?: string | null;
+  note?: string | null;
+}
+
 export interface AdapterExecutionContext {
   /** Run-scoped operator cancellation; adapters must settle before returning. */
   signal?: AbortSignal;
@@ -226,6 +260,11 @@ export interface AdapterExecutionContext {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
+  /**
+   * Host-owned routing for provider approval requests. Absent on hosts that do
+   * not support it; adapters must then deny (fail closed).
+   */
+  onApprovalRequest?: (request: AdapterApprovalRequest) => Promise<AdapterApprovalDecision>;
   onRuntimeProgress?: RuntimeStatusSink;
   /**
    * Reports that execution has crossed the adapter's dispatch boundary.

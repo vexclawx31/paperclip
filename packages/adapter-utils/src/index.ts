@@ -7,6 +7,8 @@ export type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
   AdapterRuntimeEvent,
+  AdapterApprovalRequest,
+  AdapterApprovalDecision,
   AdapterRuntimeMcpServer,
   AdapterRuntimeMcpAccess,
   AdapterExecutionContext,

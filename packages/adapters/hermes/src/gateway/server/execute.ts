@@ -25,6 +25,7 @@ import {
   isRemotePlainHttp,
   remotePlainHttpDeniedMessage,
 } from "./transport-security.js";
+import { createApprovalRouter, readApprovalRoutingConfig, type ApprovalRouter } from "./approval-routing.js";
 
 type SessionKeyStrategy = "issue" | "agent" | "run" | "none";
 
@@ -57,6 +58,7 @@ type ExecutionState = {
   terminal: TerminalState | null;
   resolveTerminal: (state: TerminalState) => void;
   terminalPromise: Promise<TerminalState>;
+  approvals?: ApprovalRouter | null;
 };
 
 type TextRedactor = (value: string) => string;
@@ -570,6 +572,8 @@ async function handleEvent(
     await ctx.onLog("stdout", sanitizedDelta);
   }
 
+  if (eventName === "approval.request") state.approvals?.handle(parsed, state.runId);
+
   const status = extractStatus(parsed) ?? (eventName?.startsWith("run.") ? eventName.slice(4) : null);
   if (status && TERMINAL_STATUSES.has(status)) {
     markTerminal(state, {
@@ -616,6 +620,9 @@ async function pollStatus(input: {
         signal: input.signal,
       });
       const normalized = extractStatus(status);
+      // A pending approval is also visible on the status record, which covers
+      // an approval.request frame lost to an event-stream disconnect.
+      if (normalized === "waiting_for_approval") input.state.approvals?.handle(asRecord(status)?.approval, input.state.runId);
       if (normalized && TERMINAL_STATUSES.has(normalized)) {
         markTerminal(input.state, {
           runId: input.state.runId,
@@ -998,6 +1005,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const state = createExecutionState(runId);
   const controller = new AbortController();
+  const approvalController = new AbortController();
+  const abortApprovals = () => approvalController.abort();
+  ctx.signal?.addEventListener("abort", abortApprovals, { once: true });
+  const approvalHeaders = runHeaders;
+  state.approvals = createApprovalRouter({
+    ctx,
+    config: readApprovalRoutingConfig(ctx.config),
+    runDeadlineAt: timeoutMs > 0 ? Date.now() + timeoutMs : null,
+    signal: approvalController.signal,
+    redactText,
+    postDecision: async ({ runId: hermesRunId, requestId, choice }) => {
+      await fetchJson(apiUrl(baseUrl, `/v1/runs/${encodeURIComponent(hermesRunId)}/approval`), {
+        method: "POST",
+        headers: approvalHeaders,
+        body: JSON.stringify({ choice, request_id: requestId }),
+        signal: AbortSignal.timeout(15_000),
+      });
+    },
+  });
   void consumeEvents({
     ctx,
     baseUrl,
@@ -1026,6 +1052,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const outcome = await Promise.race([state.terminalPromise, timeoutPromise]);
   if (timeoutTimer) clearTimeout(timeoutTimer);
   controller.abort();
+  // Withdraw any pending board decision before returning; the provider run is over.
+  approvalController.abort();
+  ctx.signal?.removeEventListener("abort", abortApprovals);
+  await state.approvals.settle();
 
   if (outcome === "timeout") {
     await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
