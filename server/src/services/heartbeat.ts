@@ -389,6 +389,7 @@ import {
   publishPluginDomainEvent,
   type LogActivityInput,
 } from "./activity-log.js";
+import { createAdapterApprovalRequestHandler } from "./adapter-approval-requests.js";
 import {
   buildWorkspaceReadyComment,
   buildWorkspaceReadyMetadata,
@@ -24931,6 +24932,15 @@ export function heartbeatService(
                     onLog,
                     onMeta: onAdapterMeta,
                     onEvent: onAdapterEvent,
+                    onApprovalRequest: createAdapterApprovalRequestHandler({
+                      db,
+                      companyId: agent.companyId,
+                      agentId: agent.id,
+                      agentName: agent.name,
+                      heartbeatRunId: run.id,
+                      adapterType: agent.adapterType,
+                      issueId: issueId ?? null,
+                    }),
                     startupTraceContext: getStartupTraceContext(),
                     onRuntimeProgress: async (progress) => {
                       await recordCurrentHeartbeatRunRuntimeProgress(
