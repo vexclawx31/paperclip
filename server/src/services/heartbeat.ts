@@ -6596,7 +6596,13 @@ export function heartbeatService(
       // A comment alone is not an actionable escalation for a self-park: the
       // blocked issue has no other recovery path, so route one board action.
       if (issue?.status === "blocked") {
-        await recovery.escalateExhaustedNativeSelfPark({ id: issueId, companyId: run.companyId });
+        // Never let an escalation write failure abort this succeeded run's
+        // finalization; the recovery tick re-evaluates and escalates.
+        try {
+          await recovery.escalateExhaustedNativeSelfPark({ id: issueId, companyId: run.companyId });
+        } catch (err) {
+          logger.warn({ err, runId: run.id, issueId }, "inline native self-park escalation failed; deferring to recovery tick");
+        }
       }
       return;
     }
@@ -11649,6 +11655,9 @@ export function heartbeatService(
   ): Promise<string | null> {
     if (readNonEmptyString(context.livenessContinuationState) !== UNBLOCK_REQUESTED_CONTINUATION_STATE) return null;
     if (hasInteractionContinuationWakeContext(context)) return null;
+    // The unblock wake never carries a comment. A comment wake it coalesced
+    // into still owes that comment a run, so never cancel it here.
+    if (readNonEmptyString(context.wakeCommentId) || readNonEmptyString(context.commentId)) return null;
     const issue = await db
       .select()
       .from(issues)
@@ -22406,7 +22415,8 @@ export function heartbeatService(
                   )
                 : enrichedContextSnapshot,
               sessionIdBefore: explicitContinuation ? null : sessionBefore,
-              continuationAttempt,
+              // Re-read: a self-unblock follow-up may have continued an episode.
+              continuationAttempt: readContinuationAttempt(enrichedContextSnapshot.livenessContinuationAttempt),
               ...(reconciledSourceRunId
                 ? { retryOfRunId: reconciledSourceRunId }
                 : {}),
