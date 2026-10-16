@@ -144,7 +144,6 @@ import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
   collectDispositionRepairSourceState,
-  staleQuestionCutoffForWakingComment,
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
 } from "./disposition-repair.js";
@@ -3818,17 +3817,6 @@ export function recoveryService(
     return updated;
   }
 
-  /** See staleQuestionCutoffForWakingComment; null unless the run qualifies. */
-  async function staleQuestionCutoffForRun(issue: typeof issues.$inferSelect, runId: string) {
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runId)) return null;
-    const [run] = await db.select().from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, issue.companyId),
-    )).limit(1);
-    if (!run || run.agentId !== issue.assigneeAgentId ||
-        (readNonEmptyString(parseObject(run.contextSnapshot).issueId) ?? readNonEmptyString(parseObject(run.contextSnapshot).taskId)) !== issue.id) return null;
-    return staleQuestionCutoffForWakingComment(db, issue, run);
-  }
-
   async function decidePersistedLegacyContinuation(
     issue: typeof issues.$inferSelect,
     runId: string,
@@ -3961,8 +3949,7 @@ export function recoveryService(
     if (!source || source.agentId !== run.agentId || legacyDispositionEpisode(source).id !== episode.id) return "invalid_repair_source";
     const [issue] = await db.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).limit(1);
     if (!issue) return "missing_issue";
-    const state = await collectDispositionRepairSourceState(db, { issue, excludeRunId: run.id, excludeWakeupRequestId: run.wakeupRequestId ?? undefined,
-      ignorePendingQuestionsCreatedBefore: await staleQuestionCutoffForRun(issue, episode.id) });
+    const state = await collectDispositionRepairSourceState(db, { issue, excludeRunId: run.id, excludeWakeupRequestId: run.wakeupRequestId ?? undefined });
     // This slot has already been reserved. Check admission for that slot rather
     // than allocating or charging another repair attempt during dispatch.
     const decision = await decidePersistedLegacyContinuation(issue, source.id, state, { ...episode, attempt: episode.attempt - 1 }, run.id);
@@ -4010,11 +3997,8 @@ export function recoveryService(
       return "covered";
     }
 
-    // The episode's source run decides; its repair attempts are not comment wakes.
-    const cutoffRunId = episode?.id ?? latestRun?.id ?? null;
     const state = await collectDispositionRepairSourceState(db, {
       issue: current,
-      ignorePendingQuestionsCreatedBefore: cutoffRunId ? await staleQuestionCutoffForRun(current, cutoffRunId) : null,
     });
     if (episode) {
       if (!latestRun) return "skipped";

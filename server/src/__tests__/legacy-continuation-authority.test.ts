@@ -204,6 +204,19 @@ describe("legacy continuation persisted authority", () => {
     expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("queued");
     expect(await f.runs()).toHaveLength(2);
   });
+  it("promotes a delayed repair through dispatch admission while a stale question card stays pending", async () => {
+    const f = await staleQuestionFixture({ cardAt: "2026-10-16T10:00:00.000Z", commentAt: "2026-10-16T10:05:00.000Z" });
+    await f.createRecovery().reconcileLegacyContinuation(f.runId);
+    const first = (await f.runs()).find(r => r.id !== f.runId)!;
+    await f.finish(first);
+    await f.createRecovery().reconcileLegacyContinuation(first.id);
+    const second = (await f.runs()).find(r => r.status === "scheduled_retry")!;
+    // The dispatch gate reads the same wait rule as recovery scheduling.
+    const promoted = await heartbeatService(db).promoteDueScheduledRetries(new Date(second.scheduledRetryAt!.getTime() + 1));
+    expect(promoted.runIds).toContain(second.id);
+    expect((await f.runs()).find(r => r.id === second.id)).toMatchObject({ status: "queued", errorCode: null });
+    expect((await f.actions())[0].attemptCount).toBe(2);
+  });
   it("lets the periodic sweep repair an issue whose only wait is a stale question card", async () => {
     const f = await staleQuestionFixture({ cardAt: "2026-10-16T10:00:00.000Z", commentAt: "2026-10-16T10:05:00.000Z" });
     await f.createRecovery().reconcileStrandedAssignedIssues();
