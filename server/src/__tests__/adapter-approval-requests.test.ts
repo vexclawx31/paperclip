@@ -57,7 +57,6 @@ describeEmbeddedPostgres("adapter approval request handler", () => {
   async function seed() {
     const companyId = randomUUID();
     const agentId = randomUUID();
-    const supervisorId = randomUUID();
     const heartbeatRunId = randomUUID();
     const issueId = randomUUID();
     await db.insert(companies).values({
@@ -66,7 +65,7 @@ describeEmbeddedPostgres("adapter approval request handler", () => {
       issuePrefix: `A${companyId.slice(0, 7)}`.toUpperCase(),
       status: "active",
     });
-    for (const [id, name] of [[agentId, "Nox"], [supervisorId, "Vex"]] as const) {
+    for (const [id, name] of [[agentId, "Nox"]] as const) {
       await db.insert(agents).values({
         id,
         companyId,
@@ -92,7 +91,7 @@ describeEmbeddedPostgres("adapter approval request handler", () => {
       identifier: `APR-${issueId.slice(0, 8)}`,
       status: "in_progress",
     });
-    return { companyId, agentId, supervisorId, heartbeatRunId, issueId };
+    return { companyId, agentId, heartbeatRunId, issueId };
   }
   const sha = (command: string) => createHash("sha256").update(command, "utf8").digest("hex");
 
@@ -101,31 +100,14 @@ describeEmbeddedPostgres("adapter approval request handler", () => {
     return {
       requestId: "req-1",
       providerRunId: "run-hermes-1",
-      tier: "red",
-      route: "board",
-      supervisorAgentId: null,
-      categories: [],
       command,
       commandSha256: sha(command),
       commandComplete: true,
       description: "stop/restart hermes launchd service",
-      reasons: ["service_control"],
       timeoutMs: 60_000,
       signal: new AbortController().signal,
       ...overrides,
     };
-  }
-
-  function safeRequest(seeded: { supervisorId: string }, overrides: Partial<AdapterApprovalRequest> = {}) {
-    return request({
-      tier: "yellow",
-      route: "supervisor",
-      supervisorAgentId: seeded.supervisorId,
-      categories: ["test_build_lint"],
-      command: "pnpm test",
-      reasons: ["safe:test_build_lint"],
-      ...overrides,
-    });
   }
 
   function handlerFor(seeded: Awaited<ReturnType<typeof seed>>, overrides: { issueId?: string | null; fallbackPollMs?: number } = {}) {
@@ -169,7 +151,6 @@ describeEmbeddedPostgres("adapter approval request handler", () => {
       source: "adapter_approval_request",
       requestId: "req-1",
       heartbeatRunId: seeded.heartbeatRunId,
-      tier: "red",
       commandSha256: sha("launchctl kickstart -k gui/501/ai.paperclip"),
       commandComplete: true,
     });
@@ -244,56 +225,49 @@ describeEmbeddedPostgres("adapter approval request handler", () => {
     expect((await onlyApproval(seeded.companyId)).status).toBe("cancelled");
   });
 
-  it("marks redacted or truncated commands for the board and never delegates them", async () => {
+  it("marks redacted or truncated commands for the board", async () => {
     const seeded = await seed();
-    const decision = await handlerFor(seeded)(safeRequest(seeded, { commandComplete: false, timeoutMs: 30 }));
+    const decision = await handlerFor(seeded)(request({ commandComplete: false, timeoutMs: 30 }));
     expect(decision.decision).toBe("timeout");
     const approval = await onlyApproval(seeded.companyId);
     expect(JSON.stringify(approval.payload)).toContain("contains redacted/truncated content; full command not shown");
   });
 
-  it("approves known-safe requests under the delegated supervisor policy and names the category", async () => {
+  it("closes an approval that lands after the deadline as too late", async () => {
     const seeded = await seed();
-    const decision = await handlerFor(seeded)(safeRequest(seeded));
-    expect(decision).toMatchObject({
-      decision: "approved",
-      decidedBy: "supervisor_policy",
-      supervisorAgentId: seeded.supervisorId,
-      requestId: "req-1",
-      commandSha256: sha("pnpm test"),
-    });
-    expect(decision.note).toContain("safe category: test_build_lint");
-    expect(await db.select().from(approvals).where(eq(approvals.companyId, seeded.companyId))).toHaveLength(0);
-    const [entry] = await db.select().from(activityLog).where(eq(activityLog.action, "adapter_approval.supervisor_approved"));
-    expect(entry).toMatchObject({ companyId: seeded.companyId, agentId: seeded.agentId, runId: seeded.heartbeatRunId });
-    expect(entry?.details).toMatchObject({
-      supervisorAgentId: seeded.supervisorId,
-      safeCategory: "test_build_lint",
-      policy: "approved under delegated supervisor policy",
-    });
+    const pending = handlerFor(seeded)(request({ timeoutMs: 2_000 }));
+    const approval = await waitForPendingApproval(seeded.companyId);
+    await db.update(approvals).set({ status: "approved", decidedAt: new Date(Date.now() + 60_000) }).where(eq(approvals.id, approval.id));
+    await expect(pending).resolves.toMatchObject({ decision: "timeout", decidedBy: "system" });
+    const row = await onlyApproval(seeded.companyId);
+    expect(row.status).toBe("cancelled");
+    expect(row.decisionNote).toContain("Approved after the approval window closed");
+    expect(await actionsFor(seeded.companyId)).toContain("adapter_approval.approved_too_late");
   });
 
-  it.each(["paused", "error", "terminated", "pending_approval", "active"])("does not use a %s supervisor", async (status) => {
+  it("closes an approved record when Hermes did not accept the answer", async () => {
     const seeded = await seed();
-    await db.update(agents).set({ status }).where(eq(agents.id, seeded.supervisorId));
-    const decision = await handlerFor(seeded)(safeRequest(seeded, { timeoutMs: 30 }));
-    expect(decision.decision).toBe("timeout");
-    expect(await db.select().from(approvals).where(eq(approvals.companyId, seeded.companyId))).toHaveLength(1);
+    const pending = handlerFor(seeded)(request());
+    const approval = await waitForPendingApproval(seeded.companyId);
+    await approvalService(db).approve(approval.id, "board-user", null);
+    const decision = await pending;
+    expect(decision.decision).toBe("approved");
+    await decision.onDelivery?.({ delivered: false, choice: "once", reason: "approval_not_pending" });
+    const row = await onlyApproval(seeded.companyId);
+    expect(row.status).toBe("cancelled");
+    expect(row.decisionNote).toContain("approval_not_pending");
+    expect(await actionsFor(seeded.companyId)).toContain("adapter_approval.not_delivered");
   });
 
-  it("never delegates red or uncategorised requests, or to a supervisor from another company", async () => {
+  it("records a delivered answer and keeps the approval approved", async () => {
     const seeded = await seed();
-    const other = await seed();
-    const handler = handlerFor(seeded);
-
-    await expect(handler(request({ requestId: "red", route: "supervisor", supervisorAgentId: seeded.supervisorId, timeoutMs: 30 })))
-      .resolves.toMatchObject({ decision: "timeout" });
-    await expect(handler(safeRequest(seeded, { requestId: "nocat", categories: [], timeoutMs: 30 })))
-      .resolves.toMatchObject({ decision: "timeout" });
-    await expect(handler(safeRequest(seeded, { requestId: "foreign", supervisorAgentId: other.supervisorId, timeoutMs: 30 })))
-      .resolves.toMatchObject({ decision: "timeout" });
-    const rows = await db.select().from(approvals).where(eq(approvals.companyId, seeded.companyId));
-    expect(rows.map((row) => (row.payload as Record<string, unknown>).requestId).sort()).toEqual(["foreign", "nocat", "red"]);
+    const pending = handlerFor(seeded)(request());
+    const approval = await waitForPendingApproval(seeded.companyId);
+    await approvalService(db).approve(approval.id, "board-user", null);
+    const decision = await pending;
+    await decision.onDelivery?.({ delivered: true, choice: "once", reason: null });
+    expect((await onlyApproval(seeded.companyId)).status).toBe("approved");
+    expect(await actionsFor(seeded.companyId)).toContain("adapter_approval.delivered");
   });
 
   it("reuses the approval for a replayed request and denies a replay with a different command", async () => {
