@@ -203,6 +203,26 @@ function claudeResultIndicatesAuthFailure(parsed: Record<string, unknown>): bool
   return extractClaudeErrorMessages(parsed).length > 0;
 }
 
+const TRANSCRIPT_EVENT_TYPES = new Set(["assistant", "user", "stream_event", "tool_use", "tool_result"]);
+
+// Drop stream-json transcript events from raw stdout. Their content is model
+// and tool text, not Claude CLI status, so it must not drive auth classification.
+function nonTranscriptStdout(stdout: string): string {
+  return stdout
+    .split(/\r?\n/)
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("{")) return true;
+      try {
+        const event = JSON.parse(trimmed) as { type?: unknown };
+        return !(typeof event.type === "string" && TRANSCRIPT_EVENT_TYPES.has(event.type));
+      } catch {
+        return true;
+      }
+    })
+    .join("\n");
+}
+
 export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
@@ -211,10 +231,18 @@ export function detectClaudeLoginRequired(input: {
   const parsed = input.parsed ?? null;
   const resultText = asString(parsed?.result, "").trim();
 
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // Login-prompt markers match Claude's own error output only. A run whose
+  // parsed result clearly succeeded never reads its result text or transcript,
+  // and transcript events in stdout (assistant/user messages, tool results) are
+  // never scanned: agents working on auth code routinely print "unauthorized" or
+  // "authentication required" there.
+  const runFailed = parsed === null || claudeResultIndicatesAuthFailure(parsed);
+  const promptLines = [
+    runFailed ? resultText : "",
+    ...(runFailed ? extractClaudeErrorMessages(parsed ?? {}) : []),
+    nonTranscriptStdout(input.stdout),
+    input.stderr,
+  ]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())

@@ -14,6 +14,26 @@ import {
 } from "./parse.js";
 
 describe("detectClaudeLoginRequired", () => {
+  it("does not flag a successful run whose transcript mentions auth words", () => {
+    const parsed = { type: "result", subtype: "success", is_error: false, result: "I'll be notified when the broad run finishes." };
+    const stdout = [
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"The API returned 401 Unauthorized; authentication required for this route."}]}}',
+      '{"type":"user","message":{"content":[{"type":"tool_result","content":"HTTP 401: {\\"error\\":\\"Authentication required\\"} please log in"}]}}',
+      JSON.stringify(parsed),
+    ].join("\n");
+    expect(detectClaudeLoginRequired({ parsed, stdout, stderr: "" }).requiresLogin).toBe(false);
+  });
+
+  it("still flags a real login prompt on stderr even when the result parsed", () => {
+    const parsed = { type: "result", subtype: "success", is_error: false, result: "" };
+    expect(detectClaudeLoginRequired({ parsed, stdout: "", stderr: "Not logged in · Please run /login" }).requiresLogin).toBe(true);
+  });
+
+  it("ignores auth words in a successful result text", () => {
+    const parsed = { type: "result", subtype: "success", is_error: false, result: "Fixed the unauthorized handler; login required errors now return 401." };
+    expect(detectClaudeLoginRequired({ parsed, stdout: "", stderr: "" }).requiresLogin).toBe(false);
+  });
+
   it("classifies Claude's invalid API key login prompt as auth required", () => {
     expect(
       detectClaudeLoginRequired({
