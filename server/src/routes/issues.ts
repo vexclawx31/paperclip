@@ -7,7 +7,7 @@ import { retryNativeWorkspaceExport } from "../services/native-runtime/native-wo
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
-import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { getExecutionBlocker, reviewerReconciliationTarget } from "../services/execution-blocker.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -9114,9 +9114,11 @@ export function issueRoutes(
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
               assertBoard(req);
+              const continuesReview = sourceIssueStatus === "in_review" &&
+                reviewerReconciliationTarget(settled.evidence, lockedIssue) !== null;
               if (
                 activeRecoveryAction ||
-                sourceIssueStatus !== "todo" ||
+                (sourceIssueStatus !== "todo" && !continuesReview) ||
                 outcome !== "restored"
               ) {
                 throw conflict(
@@ -9218,8 +9220,10 @@ export function issueRoutes(
           }
         }
 
+        const continuesReview = outcome === "restored" && sourceIssueStatus === "in_review" &&
+          reviewerReconciliationTarget(activeRecoveryAction.evidence, lockedIssue) !== null;
         if (
-          sourceIssueStatus === "todo" &&
+          (sourceIssueStatus === "todo" || continuesReview) &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
           assertBoard(req);

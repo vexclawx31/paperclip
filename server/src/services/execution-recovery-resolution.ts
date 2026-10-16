@@ -23,6 +23,7 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { isOperatorDeliveryInterrupt } from "./legacy-execution-recovery.js";
+import { reviewerReconciliationTarget } from "./execution-blocker.js";
 import { issueService } from "./issues.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
@@ -247,6 +248,49 @@ export async function deliverReconciledExecutions(
             evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated"}'::jsonb`,
           })
           .where(pendingDecision);
+        continue;
+      }
+      const reviewerId = reviewerReconciliationTarget(action.evidence, task);
+      if (reviewerId) {
+        // Resume the review stage with its own participant. The assignee's
+        // hand-back path would discard the pending review.
+        const state = parseIssueExecutionState(task.executionState)!;
+        const reason = state.currentStageType === "approval" ? "execution_approval_requested" : "execution_review_requested";
+        const executionStage = {
+          wakeRole: state.currentStageType === "approval" ? "approver" : "reviewer",
+          stageId: state.currentStageId,
+          stageType: state.currentStageType,
+          currentParticipant: state.currentParticipant,
+          returnAssignee: state.returnAssignee,
+          reviewRequest: state.reviewRequest ?? null,
+          lastDecisionOutcome: state.lastDecisionOutcome,
+          allowedActions: ["approve", "request_changes"],
+        };
+        const reviewRun = await wake(reviewerId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason,
+          idempotencyKey: `execution-reconciliation:${action.id}`,
+          payload: { issueId: task.id, recoveryActionId: action.id, mutation: "update", executionStage },
+          requestedByActorType: "system",
+          requestedByActorId: "execution-recovery",
+          contextSnapshot: {
+            issueId: task.id,
+            taskId: task.id,
+            recoveryActionId: action.id,
+            previousRunId: decision.runId,
+            forceFreshSession: true,
+            wakeReason: reason,
+            source: "execution.reconciled",
+            executionStage,
+          },
+        });
+        if (reviewRun)
+          await db.update(issueRecoveryActions).set({
+            evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+              continuationDelivery: "delivered", continuationRunId: reviewRun.id,
+            })}::jsonb`,
+          }).where(pendingDecision);
         continue;
       }
       const run = await wake(action.returnOwnerAgentId, {

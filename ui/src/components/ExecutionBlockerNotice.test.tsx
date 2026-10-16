@@ -3,6 +3,7 @@ import { act, type AnchorHTMLAttributes } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ExecutionBlocker } from "@paperclipai/shared";
 import { ExecutionBlockerNotice } from "./ExecutionBlockerNotice";
 import { agentsApi } from "../api/agents";
 import { activityApi } from "../api/activity";
@@ -21,6 +22,8 @@ describe("stopped task recovery notice", () => {
   const onRetried = vi.fn();
   beforeEach(async () => {
     vi.clearAllMocks();
+    // The design-system checkbox measures itself.
+    vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
     container = document.createElement("div"); document.body.append(container);
     root = createRoot(container);
     client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
@@ -91,16 +94,27 @@ describe("stopped task recovery notice", () => {
     setter.call(element, value);
     element.dispatchEvent(new Event("input", { bubbles: true }));
   }
-  async function renderCancelledHold() {
-    vi.mocked(activityApi.runsForIssue).mockResolvedValue([{ runId: "cancelled-run", agentId: "agent", status: "cancelled" }] as never);
-    client.clear();
+  function radio(form: Element, title: string) {
+    return [...form.querySelectorAll<HTMLButtonElement>('[role="radio"]')].find(button => button.textContent?.includes(title))!;
+  }
+  async function renderCancelledHold(extra: Partial<ExecutionBlocker> = {}, runId = "cancelled-run") {
+    vi.mocked(activityApi.runsForIssue).mockResolvedValue([
+      { runId: "cancelled-run", agentId: "agent", status: "cancelled" },
+      { runId: "other-run", agentId: "agent", status: "cancelled" },
+    ] as never);
+    await act(async () => client.resetQueries());
     await act(async () => root.render(<QueryClientProvider client={client}>
       <ExecutionBlockerNotice companyId="company" issueId="task" onRetried={onRetried} blocker={{
-        recoveryActionId: "hold", runId: "cancelled-run", agentId: "agent", cause: "legacy_execution_requires_reconciliation",
-        nextAction: "Automatic recovery stopped.",
+        recoveryActionId: `hold-${runId}`, runId, agentId: "agent", cause: "legacy_execution_requires_reconciliation",
+        nextAction: "Automatic recovery stopped.", ...extra,
       }} />
     </QueryClientProvider>));
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+  }
+  async function fillValidForm(form: Element) {
+    await act(async () => radio(form, "No actions were performed").click());
+    await act(async () => typeInto(form.querySelector('textarea[aria-label="Outcome evidence"]')!, "Checked the run log; it stopped before any tool call."));
+    await act(async () => form.querySelector<HTMLButtonElement>('[role="checkbox"]')!.click());
   }
   it("offers Reconcile and continue, not Retry, for a hold left by a cancelled run", async () => {
     await renderCancelledHold();
@@ -117,9 +131,9 @@ describe("stopped task recovery notice", () => {
     // Cancel stays left of the primary action in the same footer row.
     expect([...footer.querySelectorAll("button")].map(button => button.textContent)).toEqual(["Cancel", "Reconcile and continue"]);
     expect(submit.disabled).toBe(true);
-    await act(async () => form.querySelector<HTMLInputElement>('input[value="not_performed"]')!.click());
+    await act(async () => radio(form, "No actions were performed").click());
     await act(async () => typeInto(form.querySelector("textarea")!, "too short"));
-    await act(async () => form.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click());
+    await act(async () => form.querySelector<HTMLButtonElement>('[role="checkbox"]')!.click());
     expect(submit.disabled).toBe(true);
     expect(form.textContent).toContain("Write at least 20 characters.");
     await act(async () => typeInto(form.querySelector("textarea")!, "  Checked the run log; it stopped before any tool call.  "));
@@ -127,7 +141,7 @@ describe("stopped task recovery notice", () => {
     await act(async () => submit.click());
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
     expect(issuesApi.resolveRecoveryAction).toHaveBeenCalledWith("task", {
-      actionId: "hold", outcome: "restored", sourceIssueStatus: "todo",
+      actionId: "hold-cancelled-run", outcome: "restored", sourceIssueStatus: "todo",
       executionReconciliation: {
         runId: "cancelled-run", providerStopped: true, actionOutcome: "not_performed",
         outcomeEvidence: "Checked the run log; it stopped before any tool call.",
@@ -142,10 +156,10 @@ describe("stopped task recovery notice", () => {
     await act(async () => buttonByText("Reconcile and continue").click());
     const form = container.querySelector("form")!;
     const submit = form.querySelector<HTMLButtonElement>('button[type="submit"]')!;
-    await act(async () => form.querySelector<HTMLInputElement>('input[value="mixed"]')!.click());
+    await act(async () => radio(form, "Some actions completed").click());
     await act(async () => typeInto(form.querySelector("textarea")!, "Two of three emails were sent; verified in the outbox."));
     expect(submit.disabled).toBe(true);
-    await act(async () => form.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click());
+    await act(async () => form.querySelector<HTMLButtonElement>('[role="checkbox"]')!.click());
     await act(async () => submit.click());
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
     expect(form.querySelector('[role="alert"]')?.textContent).toBe("The previous provider is still running. Stop it before continuing.");
@@ -154,5 +168,44 @@ describe("stopped task recovery notice", () => {
     await act(async () => buttonByText("Cancel").click());
     expect(container.querySelector("form")).toBeNull();
     expect(container.textContent).toContain("Reconcile and continue");
+  });
+  it("continues a stopped reviewer's hold in review", async () => {
+    vi.mocked(issuesApi.resolveRecoveryAction).mockResolvedValue({} as never);
+    await renderCancelledHold({ continueStatus: "in_review" });
+    await act(async () => buttonByText("Reconcile and continue").click());
+    const form = container.querySelector("form")!;
+    expect(form.textContent).toContain("The review continues with its current reviewer.");
+    await fillValidForm(form);
+    await act(async () => form.querySelector<HTMLButtonElement>('button[type="submit"]')!.click());
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    expect(issuesApi.resolveRecoveryAction).toHaveBeenCalledWith("task", expect.objectContaining({ sourceIssueStatus: "in_review" }));
+  });
+  it("requires workspace repair evidence for an unsafe workspace restore hold", async () => {
+    vi.mocked(issuesApi.resolveRecoveryAction).mockResolvedValue({} as never);
+    await renderCancelledHold({ workspaceRepairRequired: true });
+    await act(async () => buttonByText("Reconcile and continue").click());
+    const form = container.querySelector("form")!;
+    const submit = form.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+    await fillValidForm(form);
+    expect(submit.disabled).toBe(true);
+    await act(async () => typeInto(form.querySelector('textarea[aria-label="Workspace repair evidence"]')!, "  Verified fresh confined staging after repair.  "));
+    expect(submit.disabled).toBe(false);
+    await act(async () => submit.click());
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    expect(issuesApi.resolveRecoveryAction).toHaveBeenCalledWith("task", expect.objectContaining({
+      executionReconciliation: expect.objectContaining({ workspaceRepairEvidence: "Verified fresh confined staging after repair." }),
+    }));
+  });
+  it("starts with an empty form when the hold changes", async () => {
+    await renderCancelledHold();
+    await act(async () => buttonByText("Reconcile and continue").click());
+    await fillValidForm(container.querySelector("form")!);
+    await renderCancelledHold({}, "other-run");
+    expect(container.querySelector("form")).toBeNull();
+    await act(async () => buttonByText("Reconcile and continue").click());
+    const form = container.querySelector("form")!;
+    expect(form.querySelector("textarea")!.value).toBe("");
+    expect(form.querySelector('[role="checkbox"]')!.getAttribute("aria-checked")).toBe("false");
+    expect(form.querySelector('[role="radio"][aria-checked="true"]')).toBeNull();
   });
 });

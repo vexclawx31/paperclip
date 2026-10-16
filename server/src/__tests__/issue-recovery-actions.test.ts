@@ -33,6 +33,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -1826,6 +1827,40 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
     expect(recorded!.evidence).not.toHaveProperty("automaticRecovery");
     expect(recorded!.evidence).toMatchObject({ executionReconciliation: { runId, actionOutcome: "mixed" }, continuationDelivery: "pending" });
+  });
+
+  it("keeps a stopped reviewer's task in review when the board reconciles its run", async () => {
+    const { companyId, managerId: reviewerId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: reviewerId, runId, issueId: sourceIssueId, status: "cancelled" });
+    const executionState = {
+      status: "pending", currentStageId: randomUUID(), currentStageIndex: 0, currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: reviewerId, userId: null },
+      returnAssignee: { type: "agent", agentId: coderId, userId: null },
+      completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    };
+    await db.update(issues).set({ status: "in_review", executionState }).where(eq(issues.id, sourceIssueId));
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "active",
+      ownerType: "board", returnOwnerAgentId: coderId, cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+      nextAction: "Reconcile the stopped reviewer run.",
+      evidence: { runId, reviewParticipantAgentId: reviewerId },
+    }).returning();
+    expect(await getExecutionBlocker(db, companyId, sourceIssueId)).toMatchObject({ continueStatus: "in_review", workspaceRepairRequired: false });
+    const resolved = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({
+      actionId: action!.id, outcome: "restored", sourceIssueStatus: "in_review",
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "Checked the reviewer run log: it stopped before posting a verdict." },
+    }).expect(200);
+    expect(resolved.body.issue).toMatchObject({ status: "in_review", assigneeAgentId: coderId });
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    expect(recorded!.evidence).toMatchObject({ executionReconciliation: { runId }, continuationDelivery: "pending" });
+    const wake = vi.fn(async () => ({ id: randomUUID() }));
+    await deliverReconciledExecutions(db, wake as never);
+    expect(wake).toHaveBeenCalledWith(reviewerId, expect.objectContaining({
+      reason: "execution_review_requested",
+      contextSnapshot: expect.objectContaining({ issueId: sourceIssueId, wakeReason: "execution_review_requested", previousRunId: runId }),
+    }));
   });
 
   async function seedReconciledDelivery() {
