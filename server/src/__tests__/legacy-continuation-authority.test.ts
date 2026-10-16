@@ -187,6 +187,54 @@ describe("legacy continuation persisted authority", () => {
     expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("skipped");
     expect(await f.runs()).toHaveLength(1);
   });
+  async function staleQuestionFixture(input: { cardAt: string; commentAt: string; kind?: "ask_user_questions" | "request_confirmation"; author?: "user" | "agent"; wakeReason?: string }) {
+    const commentId = randomUUID();
+    const f = await fixture({ wakeReason: input.wakeReason ?? "issue_commented", wakeCommentId: commentId });
+    await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: input.kind ?? "ask_user_questions", status: "pending",
+      continuationPolicy: "none", requestedResolverPolicy: "anyone", effectiveResolverPolicy: "anyone", createdAt: new Date(input.cardAt),
+      payload: input.kind === "request_confirmation" ? { version: 1, prompt: "Approve?" }
+        : { version: 1, questions: [{ id: "scope", prompt: "Which scope?", selectionMode: "single", options: [{ id: "a", label: "A" }] }] } });
+    await db.insert(issueComments).values({ id: commentId, companyId: f.companyId, issueId: f.issueId, createdAt: new Date(input.commentAt),
+      body: "Use scope A and finish the export.",
+      ...(input.author === "agent" ? { authorType: "agent", authorAgentId: f.agentId } : { authorType: "user", authorUserId: "fixture-owner" }) });
+    return f;
+  }
+  it("does not let a question card older than the waking operator comment strand the issue", async () => {
+    const f = await staleQuestionFixture({ cardAt: "2026-10-16T10:00:00.000Z", commentAt: "2026-10-16T10:05:00.000Z" });
+    expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("queued");
+    expect(await f.runs()).toHaveLength(2);
+  });
+  it("lets the periodic sweep repair an issue whose only wait is a stale question card", async () => {
+    const f = await staleQuestionFixture({ cardAt: "2026-10-16T10:00:00.000Z", commentAt: "2026-10-16T10:05:00.000Z" });
+    await f.createRecovery().reconcileStrandedAssignedIssues();
+    const repairs = (await f.runs()).filter(r => r.id !== f.runId);
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0]!.contextSnapshot).toMatchObject({ legacyDispositionEpisode: { id: f.runId, attempt: 1 } });
+  });
+  it("keeps the bounded episode for a stale question card: two attempts, then board escalation", async () => {
+    const f = await staleQuestionFixture({ cardAt: "2026-10-16T10:00:00.000Z", commentAt: "2026-10-16T10:05:00.000Z" });
+    await f.createRecovery().reconcileLegacyContinuation(f.runId);
+    const first = (await f.runs()).find(r => r.id !== f.runId)!;
+    expect(await f.createRecovery().legacyRepairDispatchBlock(first.id)).toBeNull();
+    await f.finish(first);
+    await f.createRecovery().reconcileLegacyContinuation(first.id);
+    const second = (await f.runs()).find(r => r.status === "scheduled_retry")!;
+    expect(second.contextSnapshot).toMatchObject({ legacyDispositionEpisode: { id: f.runId, attempt: 2, maxAttempts: 2 } });
+    await f.finish(second);
+    expect(await f.createRecovery().reconcileLegacyContinuation(second.id)).toBe("escalated");
+    expect(await f.runs()).toHaveLength(3);
+    expect((await f.actions()).find(a => a.status === "active")).toMatchObject({ ownerType: "board", attemptCount: 2 });
+  });
+  it.each([
+    ["a card newer than the waking comment", { cardAt: "2026-10-16T10:05:00.000Z", commentAt: "2026-10-16T10:00:00.000Z" }],
+    ["a pending confirmation older than the comment", { cardAt: "2026-10-16T10:00:00.000Z", commentAt: "2026-10-16T10:05:00.000Z", kind: "request_confirmation" as const }],
+    ["an agent-authored waking comment", { cardAt: "2026-10-16T10:00:00.000Z", commentAt: "2026-10-16T10:05:00.000Z", author: "agent" as const }],
+    ["a run not woken by a comment", { cardAt: "2026-10-16T10:00:00.000Z", commentAt: "2026-10-16T10:05:00.000Z", wakeReason: "issue_assigned" }],
+  ])("still waits on %s", async (_label, input) => {
+    const f = await staleQuestionFixture(input);
+    expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("skipped");
+    expect(await f.runs()).toHaveLength(1);
+  });
   it("rechecks a newly pending approval at dispatch without spending another attempt", async () => {
     const f = await fixture();
     await f.createRecovery().reconcileLegacyContinuation(f.runId);

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -7,12 +7,14 @@ import {
   approvals,
   heartbeatRuns,
   issueApprovals,
+  issueComments,
   issueRelations,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
 } from "@paperclipai/db";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
+import { deriveCommentId } from "../../modules/run-dispatch/domain/wake-context.js";
 import {
   dispositionRepairQuietEligible,
   isBoundLegacyDispositionRepairRun,
@@ -147,12 +149,47 @@ export async function readIssueDurableWaitingPath(
   return (await collectDispositionRepairSourceState(db, { issue: current })).durablePathReason;
 }
 
+/**
+ * When a successful legacy run was woken by a user comment newer than a
+ * pending question card, the agent has already acted on the operator's newer
+ * reply. That card is no longer the task's wait. Returns the waking comment's
+ * creation time, or null when the run does not qualify.
+ */
+export async function staleQuestionCutoffForWakingComment(
+  db: Db,
+  issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "status">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "companyId" | "runtimeMode" | "status" | "contextSnapshot"> | null | undefined,
+): Promise<Date | null> {
+  if (!run || run.companyId !== issue.companyId || run.runtimeMode !== "legacy" || run.status !== "succeeded") return null;
+  if (!["todo", "in_progress"].includes(issue.status)) return null;
+  const context = run.contextSnapshot ?? {};
+  if (context.wakeReason !== "issue_commented") return null;
+  const commentId = deriveCommentId(context);
+  if (!commentId || !UUID_RE.test(commentId)) return null;
+  const [comment] = await db.select({ createdAt: issueComments.createdAt }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId),
+    eq(issueComments.issueId, issue.id),
+    eq(issueComments.id, commentId),
+    eq(issueComments.authorType, "user"),
+    isNotNull(issueComments.authorUserId),
+    isNull(issueComments.createdByRunId),
+    isNull(issueComments.deletedAt),
+  )).limit(1);
+  return comment?.createdAt ?? null;
+}
+
 export async function collectDispositionRepairSourceState(
   db: Db,
   input: {
     issue: DispositionRepairIssue;
     excludeRunId?: string | null;
     excludeWakeupRequestId?: string | null;
+    /**
+     * Pending ask_user_questions cards created before this time are not a
+     * wait. Set only from staleQuestionCutoffForWakingComment. Approvals and
+     * confirmations always remain waits.
+     */
+    ignorePendingQuestionsCreatedBefore?: Date | null;
   },
 ): Promise<DispositionRepairSourceState> {
   const issue = input.issue;
@@ -192,6 +229,7 @@ export async function collectDispositionRepairSourceState(
           kind: issueThreadInteractions.kind,
           continuationPolicy: issueThreadInteractions.continuationPolicy,
           updatedAt: issueThreadInteractions.updatedAt,
+          createdAt: issueThreadInteractions.createdAt,
         })
         .from(issueThreadInteractions)
         .where(
@@ -261,7 +299,10 @@ export async function collectDispositionRepairSourceState(
     ]);
 
   const pendingExecutionState = parseIssueExecutionState(issue.executionState);
-  const pendingInteraction = interactions.some((row) => row.status === "pending");
+  const staleQuestionCutoff = input.ignorePendingQuestionsCreatedBefore ?? null;
+  const pendingInteraction = interactions.some((row) => row.status === "pending" &&
+    !(staleQuestionCutoff && row.kind === "ask_user_questions" &&
+      row.createdAt.getTime() < staleQuestionCutoff.getTime()));
   const pendingApproval = linkedApprovals.some((row) =>
     row.status === "pending" || row.status === "revision_requested",
   );
@@ -291,7 +332,8 @@ export async function collectDispositionRepairSourceState(
     blockers: blockers.sort((a, b) => a.id.localeCompare(b.id)),
     children: children.sort((a, b) => a.id.localeCompare(b.id)),
     interactions: interactions
-      .map((row) => ({ ...row, updatedAt: row.updatedAt.toISOString() }))
+      // createdAt only filters stale questions; keep the persisted digest stable.
+      .map(({ createdAt: _createdAt, ...row }) => ({ ...row, updatedAt: row.updatedAt.toISOString() }))
       .sort((a, b) => a.id.localeCompare(b.id)),
     approvals: linkedApprovals
       .map((row) => ({ ...row, decidedAt: row.decidedAt?.toISOString() ?? null }))
