@@ -1,25 +1,34 @@
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, approvals, issueApprovals } from "@paperclipai/db";
+import { agents, approvals } from "@paperclipai/db";
 import type { AdapterApprovalDecision, AdapterApprovalRequest } from "@paperclipai/adapter-utils";
 import { logActivity } from "./activity-log.js";
 import { approvalService } from "./approvals.js";
+import { issueApprovalService } from "./issue-approvals.js";
+import { subscribeCompanyLiveEvents } from "./live-events.js";
 
 // Host side of AdapterExecutionContext.onApprovalRequest. An adapter (today
 // hermes_gateway) hands over a classified provider approval request; this
 // module owns the durable decision record and its audit trail:
 //
-// - route "supervisor" (yellow tier only): approve under the delegated
-//   supervisor policy, after checking the supervisor is a live agent in the
-//   same company and is not the requesting agent. No LLM call: the policy is
-//   the supervisor's authority. Logged as an activity entry.
-// - route "board" (red tier, or a supervisor that cannot be used): create a
-//   `request_board_approval` approval, which surfaces in the attention inbox
-//   with Approve / Reject, link it to the run's issue, and wait for the board.
-//   A timeout or an ended run cancels the approval and fails closed.
+// - route "supervisor": approve under the delegated supervisor policy, only
+//   for a yellow request whose whole command matched known-safe categories
+//   and is shown in full, and only when the supervisor (a board-only
+//   adapterConfig key) is an idle or running agent in the same company and is
+//   not the requesting agent. No LLM call: the policy is the authority.
+// - route "board" (everything else): create a `request_board_approval`
+//   approval, which surfaces in the attention inbox with Approve / Reject,
+//   link it to the run's issue, and wait for the board. Any exit without an
+//   approve/reject decision (timeout, abort, error, revision requested)
+//   cancels the approval so it never lingers in the inbox.
 
 export const ADAPTER_APPROVAL_SOURCE = "adapter_approval_request";
-const DEFAULT_POLL_INTERVAL_MS = 2_000;
+export const SUPERVISOR_SAFE_CATEGORIES = new Set(["git", "package_install", "test_build_lint", "workspace_files"]);
+const USABLE_SUPERVISOR_STATUSES = new Set(["idle", "running"]);
+// Live events wake the waiter immediately; this poll only covers decisions
+// made by another server process.
+const DEFAULT_FALLBACK_POLL_MS = 15_000;
+const INCOMPLETE_NOTE = "This command contains redacted/truncated content; full command not shown.";
 
 export type AdapterApprovalRequestHandlerDeps = {
   db: Db;
@@ -29,30 +38,16 @@ export type AdapterApprovalRequestHandlerDeps = {
   heartbeatRunId: string;
   adapterType: string;
   issueId: string | null;
-  pollIntervalMs?: number;
-  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  fallbackPollMs?: number;
   now?: () => number;
 };
 
-function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
-    const timer = setTimeout(done, ms);
-    function done() {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", done);
-      resolve();
-    }
-    signal.addEventListener("abort", done, { once: true });
-  });
-}
-
 export function createAdapterApprovalRequestHandler(deps: AdapterApprovalRequestHandlerDeps) {
   const { db, companyId, agentId, heartbeatRunId, issueId } = deps;
-  const pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  const sleep = deps.sleep ?? defaultSleep;
+  const fallbackPollMs = deps.fallbackPollMs ?? DEFAULT_FALLBACK_POLL_MS;
   const now = deps.now ?? Date.now;
   const approvalsSvc = approvalService(db);
+  const issueApprovalsSvc = issueApprovalService(db);
 
   const auditBase = (request: AdapterApprovalRequest) => ({
     adapterType: deps.adapterType,
@@ -60,9 +55,14 @@ export function createAdapterApprovalRequestHandler(deps: AdapterApprovalRequest
     requestId: request.requestId,
     tier: request.tier,
     reasons: request.reasons,
+    categories: request.categories,
+    commandSha256: request.commandSha256,
+    commandComplete: request.commandComplete,
     command: request.command,
     description: request.description,
   });
+
+  const echo = (request: AdapterApprovalRequest) => ({ requestId: request.requestId, commandSha256: request.commandSha256 });
 
   async function log(action: string, entityType: string, entityId: string, details: Record<string, unknown>) {
     await logActivity(db, {
@@ -79,26 +79,36 @@ export function createAdapterApprovalRequestHandler(deps: AdapterApprovalRequest
     });
   }
 
+  function delegable(request: AdapterApprovalRequest): string | null {
+    if (request.tier !== "yellow") return "Red-tier requests are never delegated to a supervisor.";
+    if (!request.commandComplete) return INCOMPLETE_NOTE;
+    if (request.categories.length === 0 || !request.categories.every((category) => SUPERVISOR_SAFE_CATEGORIES.has(category))) {
+      return "The command did not match a known-safe category.";
+    }
+    return null;
+  }
+
   async function usableSupervisor(supervisorAgentId: string | null | undefined): Promise<string | null> {
     if (!supervisorAgentId || supervisorAgentId === agentId) return null;
     const row = await db
       .select({ id: agents.id, status: agents.status })
       .from(agents)
       .where(and(eq(agents.id, supervisorAgentId), eq(agents.companyId, companyId)))
-      .then((rows) => rows[0] ?? null)
-      .catch(() => null);
-    if (!row || row.status === "terminated" || row.status === "pending_approval") return null;
+      .then((rows) => rows[0] ?? null);
+    if (!row || !USABLE_SUPERVISOR_STATUSES.has(row.status)) return null;
     return row.id;
   }
 
   async function approveUnderSupervisorPolicy(request: AdapterApprovalRequest, supervisorAgentId: string): Promise<AdapterApprovalDecision> {
-    const note = "approved under delegated supervisor policy";
+    const category = request.categories.join("+");
+    const note = `approved under delegated supervisor policy (safe category: ${category})`;
     await log("adapter_approval.supervisor_approved", "heartbeat_run", heartbeatRunId, {
       ...auditBase(request),
       supervisorAgentId,
-      policy: note,
+      safeCategory: category,
+      policy: "approved under delegated supervisor policy",
     });
-    return { decision: "approved", decidedBy: "supervisor_policy", supervisorAgentId, note };
+    return { decision: "approved", decidedBy: "supervisor_policy", supervisorAgentId, note, ...echo(request) };
   }
 
   async function findExisting(requestId: string) {
@@ -116,51 +126,50 @@ export function createAdapterApprovalRequestHandler(deps: AdapterApprovalRequest
   }
 
   async function createBoardApproval(request: AdapterApprovalRequest, routingNote: string | null) {
-    const existing = await findExisting(request.requestId);
-    if (existing) return existing;
     const timeoutMinutes = Math.max(1, Math.round(request.timeoutMs / 60_000));
     const agentLabel = deps.agentName?.trim() || "An agent";
-    const [created] = await db
-      .insert(approvals)
-      .values({
-        companyId,
-        type: "request_board_approval",
-        // Deliberately no requestedByAgentId: approving must not queue an
-        // extra wake for an agent whose run is still waiting on this answer.
-        requestedByAgentId: null,
-        requestedByUserId: null,
-        status: "pending",
-        payload: {
-          title: `Approve agent command (${request.tier} tier)`,
-          summary: `${agentLabel} asked to run a command that its runtime flagged for human approval: ${request.description || "no description"}.`,
-          recommendedAction: `Approve only if this exact command is intended. The run waits up to ${timeoutMinutes} minute(s); after that the command is denied.`,
-          risks: [
-            `Classifier reasons: ${request.reasons.join(", ") || "none"}.`,
-            "Approval applies to this single command only (choice \"once\").",
-            ...(routingNote ? [routingNote] : []),
-          ],
-          proposedComment: `\`\`\`\n${request.command}\n\`\`\``,
-          source: ADAPTER_APPROVAL_SOURCE,
-          adapterType: deps.adapterType,
-          agentId,
-          heartbeatRunId,
-          issueId,
-          providerRunId: request.providerRunId,
-          requestId: request.requestId,
-          tier: request.tier,
-          reasons: request.reasons,
-          command: request.command,
-          description: request.description,
-          expiresAt: new Date(now() + request.timeoutMs).toISOString(),
-        },
-      })
-      .returning();
-    if (issueId) {
-      await db
-        .insert(issueApprovals)
-        .values({ companyId, issueId, approvalId: created.id, linkedByAgentId: agentId })
-        .onConflictDoNothing();
-    }
+    const notes = [
+      ...(request.commandComplete ? [] : [INCOMPLETE_NOTE]),
+      ...(routingNote && routingNote !== INCOMPLETE_NOTE ? [routingNote] : []),
+    ];
+    const created = await approvalsSvc.create(companyId, {
+      type: "request_board_approval",
+      // Deliberately no requestedByAgentId: approving must not queue an extra
+      // wake for an agent whose run is still waiting on this answer.
+      requestedByAgentId: null,
+      requestedByUserId: null,
+      status: "pending",
+      payload: {
+        title: `Approve agent command (${request.tier} tier)`,
+        summary: `${agentLabel} asked to run a command that its runtime flagged for human approval: ${request.description || "no description"}.`,
+        recommendedAction: `Approve only if this exact command is intended. The run waits up to ${timeoutMinutes} minute(s); after that the command is denied.`,
+        risks: [
+          ...notes,
+          `Classifier reasons: ${request.reasons.join(", ") || "none"}.`,
+          "Approval applies to this single command only (choice \"once\").",
+        ],
+        proposedComment: `\`\`\`\n${request.command}\n\`\`\`${request.commandComplete ? "" : `\n\n${INCOMPLETE_NOTE}`}`,
+        source: ADAPTER_APPROVAL_SOURCE,
+        adapterType: deps.adapterType,
+        agentId,
+        heartbeatRunId,
+        issueId,
+        providerRunId: request.providerRunId,
+        requestId: request.requestId,
+        tier: request.tier,
+        reasons: request.reasons,
+        categories: request.categories,
+        command: request.command,
+        commandSha256: request.commandSha256,
+        commandComplete: request.commandComplete,
+        description: request.description,
+        expiresAt: new Date(now() + request.timeoutMs).toISOString(),
+      },
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      updatedAt: new Date(),
+    });
     await log("approval.created", "approval", created.id, {
       type: created.type,
       issueIds: issueId ? [issueId] : [],
@@ -169,63 +178,100 @@ export function createAdapterApprovalRequestHandler(deps: AdapterApprovalRequest
     return created;
   }
 
+  /** Resolves when the approval may have changed, the deadline passes, or the run aborts. */
+  function waitForChange(approvalId: string, ms: number, signal: AbortSignal): Promise<void> {
+    if (signal.aborted || ms <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      let unsubscribe = () => {};
+      const timer = setTimeout(done, ms);
+      function done() {
+        clearTimeout(timer);
+        unsubscribe();
+        signal.removeEventListener("abort", done);
+        resolve();
+      }
+      unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+        const payload = event.payload as Record<string, unknown> | undefined;
+        if (event.type === "activity.logged" && payload?.entityType === "approval" && payload?.entityId === approvalId) done();
+      });
+      signal.addEventListener("abort", done, { once: true });
+    });
+  }
+
   async function awaitBoard(request: AdapterApprovalRequest, routingNote: string | null): Promise<AdapterApprovalDecision> {
-    const approval = await createBoardApproval(request, routingNote);
-    const deadline = now() + request.timeoutMs;
+    const existing = await findExisting(request.requestId);
+    if (existing && (existing.payload as Record<string, unknown>).commandSha256 !== request.commandSha256) {
+      // A replayed request id with a different command must never inherit a decision.
+      await log("adapter_approval.hash_mismatch", "approval", existing.id, auditBase(request));
+      return { decision: "denied", decidedBy: "system", approvalId: existing.id, note: "The request id was reused for a different command." };
+    }
+    const approval = existing ?? await createBoardApproval(request, routingNote);
     let status = approval.status;
     let decisionNote = approval.decisionNote;
-    while (status === "pending") {
-      if (request.signal.aborted || now() >= deadline) break;
-      await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - now())), request.signal);
-      const latest = await approvalsSvc.getById(approval.id);
-      if (!latest) break;
-      status = latest.status;
-      decisionNote = latest.decisionNote;
-    }
-
-    if (status === "approved" || status === "rejected" || status === "revision_requested" || status === "cancelled") {
-      const decision: AdapterApprovalDecision["decision"] =
-        status === "approved" ? "approved" : status === "cancelled" ? "cancelled" : "denied";
-      await log("adapter_approval.board_resolved", "approval", approval.id, {
+    let settled = false;
+    try {
+      if (!existing && issueId) {
+        await issueApprovalsSvc.linkManyForApproval(approval.id, [issueId], { agentId });
+      }
+      const deadline = now() + request.timeoutMs;
+      while (status === "pending" && !request.signal.aborted && now() < deadline) {
+        await waitForChange(approval.id, Math.min(fallbackPollMs, deadline - now()), request.signal);
+        const latest = await approvalsSvc.getById(approval.id);
+        if (!latest) break;
+        status = latest.status;
+        decisionNote = latest.decisionNote;
+      }
+      if (status === "approved" || status === "rejected") {
+        settled = true;
+        const decision = status === "approved" ? "approved" : "denied";
+        await log("adapter_approval.board_resolved", "approval", approval.id, { ...auditBase(request), approvalStatus: status, decision });
+        return {
+          decision,
+          decidedBy: "board",
+          approvalId: approval.id,
+          note: decisionNote ?? null,
+          ...(decision === "approved" ? echo(request) : {}),
+        };
+      }
+      if (status === "cancelled") {
+        settled = true;
+        return { decision: "cancelled", decidedBy: "system", approvalId: approval.id, note: decisionNote ?? null };
+      }
+      if (status === "revision_requested") {
+        return { decision: "denied", decidedBy: "board", approvalId: approval.id, note: decisionNote ?? "The board requested a revision; the command was denied." };
+      }
+      const aborted = request.signal.aborted;
+      await log(aborted ? "adapter_approval.abandoned" : "adapter_approval.timed_out", "approval", approval.id, {
         ...auditBase(request),
-        approvalStatus: status,
-        decision,
+        timeoutMs: request.timeoutMs,
       });
-      return { decision, decidedBy: "board", approvalId: approval.id, note: decisionNote ?? null };
+      return aborted
+        ? { decision: "cancelled", decidedBy: "system", approvalId: approval.id, note: "The agent run ended before a board decision; the command was not run." }
+        : { decision: "timeout", decidedBy: "system", approvalId: approval.id, note: "No board decision before the approval timeout; the command was denied." };
+    } finally {
+      if (!settled) {
+        // Close the record on every other exit path, including thrown errors.
+        const reason = status === "revision_requested"
+          ? "Closed: the board requested a revision; agents cannot revise a runtime command."
+          : "Closed without a board decision; the command was denied.";
+        try {
+          await approvalsSvc.cancel(approval.id, reason);
+        } catch {
+          // Best effort: the original outcome (or error) still propagates.
+        }
+      }
     }
-
-    const aborted = request.signal.aborted;
-    const reason = aborted
-      ? "The agent run ended before a board decision; the command was not run."
-      : "No board decision before the approval timeout; the command was denied.";
-    await approvalsSvc.cancel(approval.id, reason);
-    // The board may have decided in the same instant; honour that decision.
-    const final = await approvalsSvc.getById(approval.id);
-    if (final && (final.status === "approved" || final.status === "rejected")) {
-      return {
-        decision: final.status === "approved" ? "approved" : "denied",
-        decidedBy: "board",
-        approvalId: approval.id,
-        note: final.decisionNote ?? null,
-      };
-    }
-    await log(aborted ? "adapter_approval.abandoned" : "adapter_approval.timed_out", "approval", approval.id, {
-      ...auditBase(request),
-      timeoutMs: request.timeoutMs,
-    });
-    return { decision: aborted ? "cancelled" : "timeout", decidedBy: "system", approvalId: approval.id, note: reason };
   }
 
   return async function handleAdapterApprovalRequest(request: AdapterApprovalRequest): Promise<AdapterApprovalDecision> {
     let routingNote: string | null = null;
     if (request.route === "supervisor") {
-      // Defense in depth: the host never delegates a red request.
-      if (request.tier !== "yellow") {
-        routingNote = "Red-tier requests are never delegated to a supervisor.";
-      } else {
+      // Defense in depth: re-check everything the adapter claimed.
+      routingNote = delegable(request);
+      if (!routingNote) {
         const supervisorAgentId = await usableSupervisor(request.supervisorAgentId);
         if (supervisorAgentId) return approveUnderSupervisorPolicy(request, supervisorAgentId);
-        routingNote = "The configured approval supervisor is not an active agent in this company, so the board decides.";
+        routingNote = "The configured approval supervisor is not an idle or running agent in this company, so the board decides.";
       }
     }
     if (request.timeoutMs <= 0) {

@@ -2898,6 +2898,30 @@ export function agentRoutes(
     return KNOWN_INSTRUCTIONS_BUNDLE_KEYS.some((key) => adapterConfig[key] !== undefined);
   }
 
+  // Board-only adapterConfig keys. The approval supervisor can auto-approve
+  // runtime commands for the agent, so an agent must never set or change it
+  // (removing it only sends more requests to the board, which is allowed).
+  const BOARD_ONLY_ADAPTER_CONFIG_KEYS = ["approvalSupervisorAgentId"] as const;
+
+  function assertNoAgentBoardOnlyAdapterConfigMutation(
+    req: Request,
+    nextAdapterConfig: Record<string, unknown> | null | undefined,
+    existingAdapterConfig: Record<string, unknown> | null,
+    path = "adapterConfig",
+  ) {
+    if (req.actor.type !== "agent" || !nextAdapterConfig) return;
+    const changed = BOARD_ONLY_ADAPTER_CONFIG_KEYS.filter((key) => {
+      if (!hasOwn(nextAdapterConfig, key)) return false;
+      const next = nextAdapterConfig[key];
+      if (next === undefined || next === null || next === "") return false;
+      return next !== existingAdapterConfig?.[key];
+    });
+    if (changed.length === 0) return;
+    throw forbidden(
+      `Agent-authenticated callers cannot set or change board-only adapter configuration (${changed.map((key) => `${path}.${key}`).join(", ")})`,
+    );
+  }
+
   function assertNoAgentAdapterConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown>,
@@ -4368,6 +4392,7 @@ export function agentRoutes(
       await assertSelectableAdapterType(rollbackAdapterType);
     }
     const rollbackAdapterConfig = asRecord(rollbackConfig.adapterConfig) ?? {};
+    assertNoAgentBoardOnlyAdapterConfigMutation(req, rollbackAdapterConfig, asRecord(existing.adapterConfig));
     assertExternalInstructionsAdmin(req, existing);
     assertExternalInstructionsAdmin(req, {
       ...existing,
@@ -4530,6 +4555,7 @@ export function agentRoutes(
       rawHireAdapterConfig,
     );
     assertNoAgentAdapterConfigMutation(req, rawHireAdapterConfig);
+    assertNoAgentBoardOnlyAdapterConfigMutation(req, rawHireAdapterConfig, null);
     const hiredAgentId = randomUUID();
     const authInheritance = await applyHiringAgentAuthInheritance(
       req,
@@ -4838,6 +4864,7 @@ export function agentRoutes(
       rawCreateAdapterConfig,
     );
     assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
+    assertNoAgentBoardOnlyAdapterConfigMutation(req, rawCreateAdapterConfig, null);
     const agentId = randomUUID();
     const requestedAdapterConfig = applyCodexLocalKeyIsolation(
       companyId,
@@ -5441,6 +5468,7 @@ export function agentRoutes(
         return;
       }
       assertNoAgentAdapterConfigMutation(req, adapterConfig);
+      assertNoAgentBoardOnlyAdapterConfigMutation(req, adapterConfig, asRecord(existing.adapterConfig));
       const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
       if (changingInstructionsConfig) {
         await assertCanManageInstructionsPath(req, existing);
