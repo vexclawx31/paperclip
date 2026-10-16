@@ -22,8 +22,9 @@ Status values: **open** (not started), **in progress**, **fixed (master)**,
 | C1 | Self-parked tasks (blocked on their own unblock action) went silent after one run; approvals that were granted were never picked up again. | Live baseline proof; LIT-105, LIT-97, LIT-85 | Paperclip recovery | fixed (live) — bounded episode, then board escalation |
 | C2 | A native self-park was re-escalated on every tick after the board resolved it. | PR #7 review | Paperclip recovery | fixed (live) |
 | C3 | A board comment wake that absorbed a self-unblock notification was cancelled when a wait appeared before claim. | PR #7 review | Paperclip wake queue | fixed (live) |
-| C4 | A run that declares a blocker but leaves its task `in_progress` with no durable waiting path got no prompt repair; only the 30-minute stranded sweep remained. An agent said "paused for independent review" without creating a review path. | LIT-133 (20:11Z) | Paperclip recovery | in progress — root cause under investigation |
-| C5 | A failure with unknown effect is settled to `blocked` plus an agent-error alert, but the task-level inbox item does not say why it is stuck. | Isolated proofs (fail case) | Paperclip attention | open |
+| C4 | A stale pending question card counted as a durable wait. The operator answered by comment instead of using the card. The card (`supersedeOnUserComment=false`) stayed pending, so disposition repair and the periodic sweep both skipped the issue with `durable_wait`, and nothing would ever run again. | LIT-133 (20:11Z) | Paperclip recovery plus interactions | in progress — PR #16 (question cards supersede on the operator's newer comment by default) closes the common case |
+| C5 | Edge case of C4: a card the creator explicitly keeps open (`false`) still counts as a wait after the agent has acted on a newer operator reply. | LIT-133 analysis | Paperclip recovery | open — ignore pending cards older than the operator comment that woke the run, when the run succeeded and the issue is still `todo` or `in_progress`; bounded repair episode unchanged |
+| C6 | A failure with unknown effect is settled to `blocked` plus an agent-error alert, but the task-level inbox item does not say why it is stuck. | Isolated proofs (fail case) | Paperclip attention | open |
 
 ## Agent access and channel parity
 
