@@ -26766,6 +26766,24 @@ export function heartbeatService(
     }
   }
 
+  /**
+   * Promote saved user input for a stopped legacy run once a recovery hold
+   * no longer blocks it. Ordinary admission still applies every gate.
+   */
+  async function promoteDeferredLegacyWakes(run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">) {
+    const latestRun = await getRun(run.id);
+    if (!latestRun || latestRun.companyId !== run.companyId || latestRun.runtimeMode !== "legacy" ||
+        !isHeartbeatRunTerminalStatus(latestRun.status)) return;
+    const pendingWakes = await db.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, latestRun.companyId), eq(agentWakeupRequests.agentId, latestRun.agentId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${String(latestRun.contextSnapshot?.issueId)}`,
+    )).orderBy(asc(agentWakeupRequests.requestedAt)).limit(50);
+    const interrupt = pendingWakes.find(wake => wake.payload?.queuedCommentInterrupt);
+    if (interrupt) await resumeQueuedCommentInterrupt(latestRun.companyId, interrupt.id);
+    else if (pendingWakes.length) await releaseIssueExecutionAndPromote(latestRun, { suppressImmediateRecovery: true });
+  }
+
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
     options: { suppressImmediateRecovery?: boolean } = {},
@@ -30235,6 +30253,7 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    promoteDeferredLegacyWakes,
 
     scheduleBoundedRetry: async (
       runId: string,

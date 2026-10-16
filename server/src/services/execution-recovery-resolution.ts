@@ -23,6 +23,7 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { isOperatorDeliveryInterrupt } from "./legacy-execution-recovery.js";
+import { issueService } from "./issues.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -311,8 +312,14 @@ export async function deliverReconciledExecutions(
 export async function settleUnrecoverableExecutions(
   db: Db,
   now = new Date(),
-  options: { failpoint?: (phase: "persisted") => void } = {},
+  options: {
+    failpoint?: (phase: "persisted") => void;
+    /** Promotes saved user input after an operator-delivery hold is retired. */
+    promoteDeferredWakes?: (run: { id: string; companyId: string }) => Promise<void>;
+  } = {},
 ) {
+  const retiredRuns: { id: string; companyId: string }[] = [];
+  await retireSettledOperatorDeliveryHolds(db, now, retiredRuns);
   // Fold obsolete conversation holds without waking historical work on upgrade.
   // Keep their evidence and record the policy change in the task's activity log.
   const obsoleteConversationHold = and(
@@ -474,7 +481,7 @@ export async function settleUnrecoverableExecutions(
         // Retire it so the operator's queued message can be promoted.
         if (run.runtimeMode === "legacy" && isOperatorDeliveryInterrupt(run) &&
             !hasWorkspaceRestoreFailure(run.resultJson)) {
-          const note = "The operator interrupted this run to deliver a queued message. No recovery hold is needed.";
+          const note = OPERATOR_HANDOFF_NOTE;
           await tx.update(issueRecoveryActions).set({
             status: "resolved",
             outcome: "cancelled",
@@ -504,6 +511,8 @@ export async function settleUnrecoverableExecutions(
             runId: run.id,
             details: { recoveryActionId: action.id, outcome: "cancelled", replay: "operator_handoff" },
           });
+          await recordOperatorHandoffOnRun(tx as unknown as Db, run, action.id, action.cause, note);
+          retiredRuns.push({ id: run.id, companyId: run.companyId });
           options.failpoint?.("persisted");
           return;
         }
@@ -521,6 +530,7 @@ export async function settleUnrecoverableExecutions(
           : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
         let nativeBootstrapFailureBlock = action.evidence.nativeBootstrapFailureBlock;
+        let legacyFailureBlock = action.evidence.legacyFailureBlock;
         if (current) {
           const [projected] = await tx
             .update(issues)
@@ -535,6 +545,11 @@ export async function settleUnrecoverableExecutions(
           // An already-blocked task may have a separate human/dependency hold.
           if (task.status !== "blocked" && run.runtimeMode === "native") {
             nativeFailureBlock = { runId: run.id, statusVersion: projected!.statusVersion };
+          }
+          // Receipt for this exact projection. A later retirement may restore
+          // the task only while it is unchanged since this settle blocked it.
+          if (task.status !== "blocked" && run.runtimeMode === "legacy") {
+            legacyFailureBlock = { runId: run.id, statusVersion: projected!.statusVersion, previousStatus: task.status };
           }
           if (task.status !== "blocked" && run.runtimeMode === "legacy" && !run.runtimeModeResolvedAt &&
               run.errorCode === "server_shutdown_interrupted" && claimedAdapterType(run) === "paperclip_runner") {
@@ -556,6 +571,7 @@ export async function settleUnrecoverableExecutions(
               ...action.evidence,
               ...(nativeFailureBlock ? { nativeFailureBlock } : {}),
               ...(nativeBootstrapFailureBlock ? { nativeBootstrapFailureBlock } : {}),
+              ...(legacyFailureBlock ? { legacyFailureBlock } : {}),
               automaticRecovery: {
                 policy: "preserve_without_replay_v1",
                 runId: run.id,
@@ -607,6 +623,131 @@ export async function settleUnrecoverableExecutions(
         { err, recoveryActionId: candidate.id },
         "Automatic recovery disposition remains pending",
       );
+    }
+  }
+  for (const run of retiredRuns) {
+    await options.promoteDeferredWakes?.(run).catch((err) => {
+      logger.warn({ err, runId: run.id }, "Saved user input after an operator handoff remains deferred");
+    });
+  }
+}
+
+const OPERATOR_HANDOFF_NOTE =
+  "The operator interrupted this run to deliver a queued message. No recovery hold is needed.";
+
+async function recordOperatorHandoffOnRun(
+  tx: Db,
+  run: typeof heartbeatRuns.$inferSelect,
+  recoveryActionId: string,
+  cause: string,
+  message: string,
+) {
+  await tx
+    .update(heartbeatRuns)
+    .set({ executionStatusDeliveryId: randomUUID() })
+    .where(eq(heartbeatRuns.id, run.id));
+  await appendHeartbeatRunEvent(tx, {
+    companyId: run.companyId,
+    agentId: run.agentId,
+    runId: run.id,
+    eventType: "lifecycle",
+    stream: "system",
+    level: "info",
+    message,
+    payload: { recoveryActionId, cause, automaticRecovery: "operator_delivery_handoff_v1", replay: "operator_handoff" },
+  });
+}
+
+/**
+ * Before operator-delivery interrupts stopped creating holds, the automatic
+ * disposition settled them as no-replay blocks. Retire those blocks, and
+ * restore the task only when this settle's own receipt proves the block is
+ * unchanged. The caller promotes the saved user input afterwards.
+ */
+async function retireSettledOperatorDeliveryHolds(
+  db: Db,
+  now: Date,
+  retiredRuns: { id: string; companyId: string }[],
+) {
+  const candidates = await db
+    .select({ id: issueRecoveryActions.id })
+    .from(issueRecoveryActions)
+    .innerJoin(
+      heartbeatRuns,
+      and(
+        eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
+        sql`${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'`,
+      ),
+    )
+    .where(and(
+      eq(issueRecoveryActions.status, "resolved"),
+      eq(issueRecoveryActions.outcome, "blocked"),
+      eq(issueRecoveryActions.cause, "legacy_execution_requires_reconciliation"),
+      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      sql`not (${issueRecoveryActions.evidence} ? 'executionReconciliation')`,
+      eq(heartbeatRuns.runtimeMode, "legacy"),
+      eq(heartbeatRuns.status, "cancelled"),
+      eq(heartbeatRuns.errorCode, "operator_interrupted"),
+      sql`${heartbeatRuns.resultJson}->>'operatorInterrupted' = 'true'`,
+      sql`coalesce(${heartbeatRuns.resultJson}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'`,
+    ))
+    .limit(25);
+  for (const candidate of candidates) {
+    try {
+      await db.transaction(async (tx) => {
+        const [action] = await tx.select().from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.id, candidate.id)).for("update");
+        if (!action || action.status !== "resolved" || action.outcome !== "blocked" ||
+            (action.evidence.automaticRecovery as { replay?: string } | undefined)?.replay !== "blocked" ||
+            action.evidence.executionReconciliation) return;
+        const runId = action.evidence.runId;
+        if (typeof runId !== "string") return;
+        const [task] = await tx.select().from(issues).where(and(
+          eq(issues.companyId, action.companyId), eq(issues.id, action.sourceIssueId),
+        )).for("update");
+        const [run] = await tx.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, action.companyId), eq(heartbeatRuns.id, runId),
+        ));
+        if (!task || !run || run.runtimeMode !== "legacy" || !isOperatorDeliveryInterrupt(run) ||
+            hasWorkspaceRestoreFailure(run.resultJson) ||
+            (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== task.id) return;
+        const receipt = action.evidence.legacyFailureBlock as
+          { runId?: unknown; statusVersion?: unknown } | undefined;
+        const restore = task.status === "blocked" && receipt?.runId === run.id &&
+          receipt.statusVersion === task.statusVersion &&
+          task.assigneeAgentId === run.agentId && !isSupersededConversationRun(task, run) &&
+          !task.executionRunId && !task.checkoutRunId;
+        if (restore) await issueService(tx as unknown as Db).update(task.id, { status: "todo" }, tx);
+        await tx.update(issueRecoveryActions).set({
+          updatedAt: now,
+          resolutionNote: OPERATOR_HANDOFF_NOTE,
+          evidence: {
+            ...action.evidence,
+            operatorHandoffNote: `${OPERATOR_HANDOFF_NOTE} An earlier automatic disposition blocked replay; that block is retired.`,
+            automaticRecovery: {
+              ...(action.evidence.automaticRecovery as Record<string, unknown>),
+              policy: "operator_delivery_handoff_v1",
+              replay: "operator_handoff",
+              previousReplay: "blocked",
+              recordedAt: now.toISOString(),
+            },
+          },
+        }).where(eq(issueRecoveryActions.id, action.id));
+        await persistActivity(tx as unknown as Db, {
+          companyId: action.companyId,
+          actorType: "system",
+          actorId: "execution-recovery",
+          action: "issue.execution_recovery_settled",
+          entityType: "issue",
+          entityId: task.id,
+          runId: run.id,
+          details: { recoveryActionId: action.id, replay: "operator_handoff", restoredStatus: restore ? "todo" : null },
+        });
+        await recordOperatorHandoffOnRun(tx as unknown as Db, run, action.id, action.cause, OPERATOR_HANDOFF_NOTE);
+        retiredRuns.push({ id: run.id, companyId: run.companyId });
+      });
+    } catch (err) {
+      logger.warn({ err, recoveryActionId: candidate.id }, "Operator handoff retirement remains pending");
     }
   }
 }
