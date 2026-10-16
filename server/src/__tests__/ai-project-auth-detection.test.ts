@@ -12,6 +12,13 @@ describe("project auth settings detection", () => {
     expect(projectFileConfiguresAuth(".claude/settings.json", JSON.stringify({ apiKeyHelper: "/bin/key-helper" }))).toBe(true);
     expect(projectFileConfiguresAuth(".claude/settings.json", JSON.stringify({ env: { ANTHROPIC_API_KEY: "x" } }))).toBe(true);
     expect(projectFileConfiguresAuth(".claude/settings.local.json", JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: "x" } }))).toBe(true);
+    for (const env of [{ CLAUDE_CODE_USE_BEDROCK: "1" }, { ANTHROPIC_BASE_URL: "https://proxy" }, { CLAUDE_CONFIG_DIR: "/tmp/c" }]) {
+      expect(projectFileConfiguresAuth(".claude/settings.json", JSON.stringify({ env }))).toBe(true);
+    }
+    for (const key of ["awsCredentialExport", "awsAuthRefresh", "forceLoginMethod"]) {
+      expect(projectFileConfiguresAuth(".claude/settings.json", JSON.stringify({ [key]: "value" }))).toBe(true);
+    }
+    expect(projectFileConfiguresAuth(".claude/settings.json", JSON.stringify({ env: ["ANTHROPIC_API_KEY=x"] }))).toBe(true);
   });
 
   it("does not flag Claude settings that only mention auth variable names in unrelated text", () => {
