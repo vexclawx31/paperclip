@@ -455,6 +455,16 @@ npx paperclipai issue recovery-actions <issue-id>
 npx paperclipai issue recovery:resolve <issue-id> --outcome restored --source-issue-status todo
 ```
 
+To clear an execution-recovery hold left by a stopped run, reconcile that run. Pass the hold's action ID and the stopped run's ID, then record what its actions did. These flags assert that the provider has stopped, and the server checks this before it restores the task:
+
+```sh
+npx paperclipai issue recovery:resolve <issue-id> --outcome restored --source-issue-status todo \
+  --action-id <recovery-action-id> --reconcile-run-id <run-id> \
+  --action-outcome not_performed --outcome-evidence "Checked the run log: it stopped before any tool call."
+```
+
+`--action-outcome` is `completed`, `not_performed`, or `mixed`. `--outcome-evidence` must be at least 20 characters. When the run's workspace restore was unsafe, also pass `--workspace-repair-evidence`.
+
 ```sh
 npx paperclipai issue documents <issue-id> [--include-system]
 npx paperclipai issue document:get <issue-id> <key>

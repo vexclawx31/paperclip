@@ -120,6 +120,54 @@ describe("issue subresource commands", () => {
     ]);
   });
 
+  it("sends an execution reconciliation decision with recovery:resolve", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run([
+      "issue", "recovery:resolve", ISSUE_ID,
+      "--outcome", "restored",
+      "--source-issue-status", "todo",
+      "--action-id", HOLD_ID,
+      "--reconcile-run-id", COMMENT_ID,
+      "--action-outcome", "not_performed",
+      "--outcome-evidence", "Checked the run log; it stopped before any tool call.",
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`http://localhost:3100/api/issues/${ISSUE_ID}/recovery-actions/resolve`);
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      executionReconciliation: {
+        runId: COMMENT_ID,
+        providerStopped: true,
+        actionOutcome: "not_performed",
+        outcomeEvidence: "Checked the run log; it stopped before any tool call.",
+      },
+      actionId: HOLD_ID,
+      outcome: "restored",
+      sourceIssueStatus: "todo",
+    });
+  });
+
+  it("rejects a partial or invalid execution reconciliation before calling the API", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+    const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`exit ${code}`);
+    }) as typeof process.exit);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const base = ["issue", "recovery:resolve", ISSUE_ID, "--outcome", "restored", "--source-issue-status", "todo"];
+
+    await expect(run([...base, "--reconcile-run-id", COMMENT_ID])).rejects.toThrow("exit 1");
+    expect(String(error.mock.calls.at(-1)?.[0])).toContain("must be given together");
+    await expect(run([...base, "--reconcile-run-id", COMMENT_ID, "--action-outcome", "maybe",
+      "--outcome-evidence", "Checked the run log; it stopped before any tool call."])).rejects.toThrow("exit 1");
+    await expect(run([...base, "--reconcile-run-id", COMMENT_ID, "--action-outcome", "completed",
+      "--outcome-evidence", "too short"])).rejects.toThrow("exit 1");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(exit).toHaveBeenCalledTimes(3);
+  });
+
   it("wraps document and work product endpoints", async () => {
     const fetchMock = vi
       .fn()

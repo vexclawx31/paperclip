@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, ne, notInArray, sql } from "drizzle-orm";
+import { isUuidLike } from "@paperclipai/shared";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -7,15 +8,18 @@ import {
   approvals,
   heartbeatRuns,
   issueApprovals,
+  issueComments,
   issueRelations,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
 } from "@paperclipai/db";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
+import { deriveCommentId } from "../../modules/run-dispatch/domain/wake-context.js";
 import {
   dispositionRepairQuietEligible,
   isBoundLegacyDispositionRepairRun,
+  legacyDispositionEpisode,
   legacyDispositionRepairSourceRunId,
   repairRunOwnsCurrentStatus,
 } from "./legacy-continuation.js";
@@ -147,6 +151,86 @@ export async function readIssueDurableWaitingPath(
   return (await collectDispositionRepairSourceState(db, { issue: current })).durablePathReason;
 }
 
+function readRunString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * The run a disposition repair was scheduled from, or the run itself when it
+ * is not a repair. An episode repair names its source run in the persisted
+ * episode. A fingerprint repair names it in retryOfRunId. Returns null when
+ * the source cannot be named without walking further.
+ */
+function dispositionRepairSourceRunId(run: { id: string; contextSnapshot?: unknown }): string | null {
+  const context = (run.contextSnapshot ?? {}) as Record<string, unknown>;
+  if (legacyDispositionRepairSourceRunId(run)) {
+    const episodeId = legacyDispositionEpisode(run).id;
+    return isUuidLike(episodeId) ? episodeId : null;
+  }
+  if (readRunString(context.dispositionRepairFingerprint)) {
+    const sourceId = readRunString(context.retryOfRunId);
+    return sourceId && isUuidLike(sourceId) ? sourceId : null;
+  }
+  return run.id;
+}
+
+/**
+ * A pending question card is no longer the task's wait when the agent already
+ * acted on a newer operator comment. The rule reads the issue's latest
+ * assignee run, the disposition-repair source it names, and the waking
+ * comment: at most three indexed lookups. The source run must be legacy and
+ * succeeded, and it must have been woken (issue_commented) by a live user
+ * comment. Returns that comment's creation time, or null.
+ *
+ * Disposition repair applies it while the issue is todo or in_progress. The
+ * board's retry of an escalated repair also allows blocked, the status that
+ * escalation set. Every caller uses this one helper, so recovery scheduling,
+ * dispatch admission, quiet presentation and the board retry agree.
+ */
+export async function staleQuestionCutoffForIssue(
+  db: Db,
+  issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "assigneeAgentId">,
+  options: { allowBlocked?: boolean } = {},
+): Promise<Date | null> {
+  const statuses = options.allowBlocked ? ["todo", "in_progress", "blocked"] : ["todo", "in_progress"];
+  if (!statuses.includes(issue.status) || !issue.assigneeAgentId) return null;
+  const [latest] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId),
+    eq(heartbeatRuns.agentId, issue.assigneeAgentId),
+    sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  if (!latest) return null;
+  const sourceId = dispositionRepairSourceRunId(latest);
+  if (!sourceId) return null;
+  const [source] = sourceId === latest.id ? [latest] : await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sourceId),
+  )).limit(1);
+  if (!source || source.agentId !== issue.assigneeAgentId || source.runtimeMode !== "legacy" ||
+      source.status !== "succeeded") return null;
+  const context = source.contextSnapshot ?? {};
+  if (context.issueId !== issue.id || context.wakeReason !== "issue_commented") return null;
+  const commentId = deriveCommentId(context);
+  if (!commentId || !isUuidLike(commentId)) return null;
+  const [comment] = await db.select({ createdAt: issueComments.createdAt }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId),
+    eq(issueComments.issueId, issue.id),
+    eq(issueComments.id, commentId),
+    eq(issueComments.authorType, "user"),
+    isNotNull(issueComments.authorUserId),
+    isNull(issueComments.createdByRunId),
+    isNull(issueComments.deletedAt),
+  )).limit(1);
+  return comment?.createdAt ?? null;
+}
+
+/** Pending ask_user_questions cards older than the cutoff are not a wait. */
+export function isStaleQuestion(
+  row: { kind: string; createdAt: Date },
+  cutoff: Date | null,
+): boolean {
+  return Boolean(cutoff && row.kind === "ask_user_questions" && row.createdAt.getTime() < cutoff.getTime());
+}
+
 export async function collectDispositionRepairSourceState(
   db: Db,
   input: {
@@ -192,6 +276,7 @@ export async function collectDispositionRepairSourceState(
           kind: issueThreadInteractions.kind,
           continuationPolicy: issueThreadInteractions.continuationPolicy,
           updatedAt: issueThreadInteractions.updatedAt,
+          createdAt: issueThreadInteractions.createdAt,
         })
         .from(issueThreadInteractions)
         .where(
@@ -261,7 +346,13 @@ export async function collectDispositionRepairSourceState(
     ]);
 
   const pendingExecutionState = parseIssueExecutionState(issue.executionState);
-  const pendingInteraction = interactions.some((row) => row.status === "pending");
+  // Only an ask_user_questions card can be superseded by a newer operator
+  // comment. Confirmations and approvals always remain waits.
+  const staleQuestionCutoff = interactions.some((row) => row.status === "pending" && row.kind === "ask_user_questions")
+    ? await staleQuestionCutoffForIssue(db, issue)
+    : null;
+  const pendingInteraction = interactions.some((row) => row.status === "pending" &&
+    !isStaleQuestion(row, staleQuestionCutoff));
   const pendingApproval = linkedApprovals.some((row) =>
     row.status === "pending" || row.status === "revision_requested",
   );
@@ -291,7 +382,8 @@ export async function collectDispositionRepairSourceState(
     blockers: blockers.sort((a, b) => a.id.localeCompare(b.id)),
     children: children.sort((a, b) => a.id.localeCompare(b.id)),
     interactions: interactions
-      .map((row) => ({ ...row, updatedAt: row.updatedAt.toISOString() }))
+      // createdAt only filters stale questions; keep the persisted digest stable.
+      .map(({ createdAt: _createdAt, ...row }) => ({ ...row, updatedAt: row.updatedAt.toISOString() }))
       .sort((a, b) => a.id.localeCompare(b.id)),
     approvals: linkedApprovals
       .map((row) => ({ ...row, decidedAt: row.decidedAt?.toISOString() ?? null }))

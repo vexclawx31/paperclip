@@ -466,6 +466,36 @@ const support = externalDatabaseUrl
       expect(savedDocument).toMatchObject({ latestBody: "Only the two approved changes.", latestRevisionId: revisionId });
     });
 
+    it("retires an operator-delivery interrupt hold instead of blocking the task without replay", async () => {
+      const source = await seed();
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.runId));
+      const interrupted = { operatorInterrupted: true, interruptionSource: "issue_comment_interrupt", queuedCommentInterruptQueueId: randomUUID() };
+      const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled",
+        errorCode: "operator_interrupted", error: "Interrupted to send queued messages", resultJson: interrupted,
+      }).where(eq(heartbeatRuns.id, source.runId)).returning();
+      expect(legacyExecutionNeedsReconciliation(run!)).toBe(false);
+      // A hold recorded before the handoff stopped creating holds.
+      await terminalizeLegacyExecution({ db, run: run!, status: "cancelled" });
+      expect(await getExecutionBlocker(db, source.companyId, source.issueId)).toMatchObject({ runId: source.runId });
+      await settleUnrecoverableExecutions(db);
+      const [task] = await db.select().from(issues).where(eq(issues.id, source.issueId));
+      expect(task!.status).toBe("in_progress");
+      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+      expect(action).toMatchObject({ status: "resolved", outcome: "cancelled",
+        evidence: { automaticRecovery: { replay: "operator_handoff" } } });
+      expect(await getExecutionBlocker(db, source.companyId, source.issueId)).toBeNull();
+      // A genuine unknown-effect cancellation on the same path still blocks without replay.
+      const other = await seed();
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, other.runId));
+      const [crashed] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "failed", errorCode: "adapter_failed", resultJson: {} })
+        .where(eq(heartbeatRuns.id, other.runId)).returning();
+      expect(legacyExecutionNeedsReconciliation(crashed!)).toBe(true);
+      await terminalizeLegacyExecution({ db, run: crashed!, status: "failed" });
+      await settleUnrecoverableExecutions(db);
+      expect((await db.select().from(issues).where(eq(issues.id, other.issueId)))[0]!.status).toBe("blocked");
+      expect(await getExecutionBlocker(db, other.companyId, other.issueId)).toMatchObject({ runId: other.runId });
+    });
+
     it("does not reopen a reconciled legacy run while continuation is pending", async () => {
       const source = await seed();
       const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled" }).where(eq(heartbeatRuns.id, source.runId)).returning();

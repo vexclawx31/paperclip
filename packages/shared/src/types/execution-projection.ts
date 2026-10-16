@@ -5,6 +5,8 @@ export interface ExecutionBlocker {
   agentId: string | null;
   cause: string;
   nextAction: string;
+  /** The stopped run's workspace restore was unsafe; reconciliation needs workspace repair evidence. */
+  workspaceRepairRequired?: boolean;
 }
 
 /** Presentation of existing execution records, not a second task status machine. */

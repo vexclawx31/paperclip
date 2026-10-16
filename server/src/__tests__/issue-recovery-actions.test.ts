@@ -33,6 +33,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -1806,6 +1807,28 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(recorded);
   });
 
+  it("clears a legacy reconciliation hold left by a cancelled run with the board's Reconcile and continue payload", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "cancelled" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: coderId, cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+      nextAction: "Automatic recovery stopped.",
+      evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const resolved = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({
+      actionId: action!.id, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "mixed",
+        outcomeEvidence: "Checked the run log: the first file write landed, the second did not." },
+    }).expect(200);
+    expect(resolved.body.issue.status).toBe("todo");
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    expect(recorded!.evidence).not.toHaveProperty("automaticRecovery");
+    expect(recorded!.evidence).toMatchObject({ executionReconciliation: { runId, actionOutcome: "mixed" }, continuationDelivery: "pending" });
+  });
+
   async function seedReconciledDelivery() {
     const fixture = await seedCompany();
     const { companyId, coderId, sourceIssueId } = fixture;
@@ -2141,6 +2164,67 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect.arrayContaining(["issue.updated", "issue.recovery_action_resolved"]),
     );
   });
+
+  it.each([
+    ["retries past a question card older than the operator comment the agent acted on", "ask_user_questions", true],
+    ["still refuses a confirmation older than that comment", "request_confirmation", false],
+  ] as const)("%s", async (_label, kind, allowed) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: coderId }).where(eq(issues.id, sourceIssueId));
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId, sourceIssueId, kind: "deliberate_wait_without_target", ownerType: "board",
+      returnOwnerAgentId: coderId, cause: "deliberate_wait_without_target", fingerprint: "disposition:stale-card",
+      nextAction: "Review the outcome.", wakePolicy: { type: "board_escalation" },
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId, issueId: sourceIssueId, kind, status: "pending", createdByAgentId: coderId,
+      createdAt: new Date("2026-10-16T10:00:00.000Z"),
+      payload: kind === "request_confirmation"
+        ? { version: 1, prompt: "Confirm the next step." }
+        : { version: 1, questions: [{ id: "next", prompt: "Which step?", selectionMode: "single", options: [{ id: "a", label: "A" }] }] },
+    });
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({ id: commentId, companyId, issueId: sourceIssueId, authorType: "user",
+      authorUserId: "board-user", body: "Use A.", createdAt: new Date("2026-10-16T10:05:00.000Z") });
+    const sourceRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId: coderId, invocationSource: "on_demand",
+      status: "succeeded", runtimeMode: "legacy", createdAt: new Date("2026-10-16T10:06:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId, wakeReason: "issue_commented", wakeCommentId: commentId } });
+    // The exhausted episode's last repair run is the issue's latest run.
+    await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, invocationSource: "automation",
+      status: "succeeded", runtimeMode: "legacy", createdAt: new Date("2026-10-16T10:10:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId, wakeReason: "issue_disposition_repair", retryOfRunId: randomUUID(),
+        dispositionRepairSourceRunId: randomUUID(), legacyDispositionEpisode: { id: sourceRunId, attempt: 2, maxAttempts: 2 } } });
+    const wake = vi.fn(async () => null);
+    const app = createApp(undefined, { recoveryActionEnqueueWakeup: wake });
+    const response = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({ actionId: action.id, outcome: "restored", sourceIssueStatus: "todo" });
+    if (allowed) {
+      expect(response.status).toBe(200);
+      expect(wake).toHaveBeenCalledTimes(1);
+    } else {
+      expect(response.status).toBe(409);
+      expect(response.body.details?.code).toBe("disposition_recovery_interaction_pending");
+    }
+  });
+
+  it.each(["restore_permission_denied", "restore_lock_timeout", "restore_unsafe_archive", "restore_failed"])(
+    "reports that reconciliation needs workspace repair evidence after %s",
+    async (workspaceRestoreFailure) => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
+      await db.update(heartbeatRuns).set({ resultJson: { workspaceRestoreFailure } }).where(eq(heartbeatRuns.id, runId));
+      await db.insert(issueRecoveryActions).values({
+        companyId, sourceIssueId, kind: "active_run_watchdog", status: "active", ownerType: "board", returnOwnerAgentId: coderId,
+        cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+        nextAction: "Reconcile.", evidence: { runId },
+      });
+      expect(await getExecutionBlocker(db, companyId, sourceIssueId)).toMatchObject({ runId, workspaceRepairRequired: true });
+      await db.update(heartbeatRuns).set({ resultJson: {} }).where(eq(heartbeatRuns.id, runId));
+      expect(await getExecutionBlocker(db, companyId, sourceIssueId)).toMatchObject({ workspaceRepairRequired: false });
+    },
+  );
 
   it.each(["ask_user_questions", "request_confirmation"] as const)("does not retry past a new pending %s", async (kind) => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();

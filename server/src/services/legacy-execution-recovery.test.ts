@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
+import { isOperatorDeliveryInterrupt, legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
 
 const stopped = {
   runtimeMode: "legacy", status: "cancelled", errorCode: "cancelled",
@@ -85,4 +85,25 @@ it("retains conversation retry eligibility for a transient restore lock timeout"
   expect(legacyExecutionNeedsReconciliation({ runtimeMode: "legacy", status: "failed", errorCode: "workspace_restore_failed", resultJson: {
     workspaceRestoreFailure: "restore_lock_timeout", conversationContinuation: "continue_conversation_v1",
   } })).toBe(false);
+});
+
+it("treats an operator-delivery interrupt as a handoff, not an unknown-effect failure", () => {
+  const interrupted = {
+    runtimeMode: "legacy", status: "cancelled", errorCode: "operator_interrupted",
+    resultJson: { operatorInterrupted: true, interruptionSource: "issue_comment_interrupt", queuedCommentInterruptQueueId: "queue-1" },
+  };
+  expect(isOperatorDeliveryInterrupt(interrupted)).toBe(true);
+  expect(legacyExecutionNeedsReconciliation(interrupted)).toBe(false);
+  // An exhausted retry budget does not turn the operator's handoff into a crash.
+  expect(legacyExecutionNeedsReconciliation({ ...interrupted, scheduledRetryAttempt: 3 })).toBe(false);
+  // Both the code and the marker are required; failures and timeouts keep their hold.
+  expect(legacyExecutionNeedsReconciliation({ ...interrupted, resultJson: {} })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...interrupted, errorCode: "cancelled" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...interrupted, status: "failed" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...interrupted, status: "timed_out" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...interrupted, errorCode: "adapter_failed", status: "failed", resultJson: {} })).toBe(true);
+  // An unsafe workspace still needs repair, whoever stopped the run.
+  expect(legacyExecutionNeedsReconciliation({ ...interrupted, resultJson: {
+    ...interrupted.resultJson, workspaceRestoreFailure: "restore_unsafe_archive",
+  } })).toBe(true);
 });

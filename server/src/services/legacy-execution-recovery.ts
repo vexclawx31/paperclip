@@ -14,6 +14,20 @@ import { issueService } from "./issues.js";
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
+/**
+ * A run the board cancelled to deliver its own queued message (the
+ * queued-comment Interrupt or interrupt-by-comment). Both stamp the
+ * `operator_interrupted` error code together with the `operatorInterrupted`
+ * result marker; neither alone is enough.
+ */
+export function isOperatorDeliveryInterrupt(
+  run: Pick<Run, "status" | "errorCode" | "resultJson">,
+): boolean {
+  return run.status === "cancelled" &&
+    run.errorCode === "operator_interrupted" &&
+    run.resultJson?.operatorInterrupted === true;
+}
+
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
@@ -28,6 +42,10 @@ export function legacyExecutionNeedsReconciliation(
   // A fresh conversation turn lets the agent decide what remains. The retry
   // scheduler, not an action-outcome hold, owns the automatic attempt limit.
   if (hasConversationContinuationPolicy(run.resultJson)) return false;
+  // The operator stopped this run to hand it their own queued message. That
+  // is a deliberate handoff, not an unknown-effect crash: the successor is a
+  // new turn carrying the operator's input, which the operator authorized.
+  if (isOperatorDeliveryInterrupt(run)) return false;
   // Productive turn-budget continuation is not a failed provider session.
   if (normalizeMaxTurnStopReason(run.resultJson?.stopReason) ?? normalizeMaxTurnStopReason(run.errorCode)) return false;
   const evidence = run.resultJson?.executionRecovery as

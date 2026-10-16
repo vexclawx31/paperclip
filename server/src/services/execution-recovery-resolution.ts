@@ -22,6 +22,7 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import { isOperatorDeliveryInterrupt } from "./legacy-execution-recovery.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -468,6 +469,44 @@ export async function settleUnrecoverableExecutions(
             !coordinator.failureDetail?.replacementDenied)
         )
           return;
+        // A hold recorded for an operator-delivery interrupt (before that
+        // handoff stopped creating holds) must not become a no-replay block.
+        // Retire it so the operator's queued message can be promoted.
+        if (run.runtimeMode === "legacy" && isOperatorDeliveryInterrupt(run) &&
+            !hasWorkspaceRestoreFailure(run.resultJson)) {
+          const note = "The operator interrupted this run to deliver a queued message. No recovery hold is needed.";
+          await tx.update(issueRecoveryActions).set({
+            status: "resolved",
+            outcome: "cancelled",
+            resolvedAt: now,
+            updatedAt: now,
+            nextAction: note,
+            resolutionNote: note,
+            wakePolicy: null,
+            monitorPolicy: null,
+            evidence: {
+              ...action.evidence,
+              automaticRecovery: {
+                policy: "operator_delivery_handoff_v1",
+                runId: run.id,
+                replay: "operator_handoff",
+                recordedAt: now.toISOString(),
+              },
+            },
+          }).where(eq(issueRecoveryActions.id, action.id));
+          await persistActivity(tx as unknown as Db, {
+            companyId: run.companyId,
+            actorType: "system",
+            actorId: "execution-recovery",
+            action: "issue.execution_recovery_settled",
+            entityType: "issue",
+            entityId: task.id,
+            runId: run.id,
+            details: { recoveryActionId: action.id, outcome: "cancelled", replay: "operator_handoff" },
+          });
+          options.failpoint?.("persisted");
+          return;
+        }
         const current =
           !isSupersededConversationRun(task, run) &&
           action.returnOwnerAgentId !== null &&

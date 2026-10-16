@@ -146,6 +146,31 @@ interface IssueRecoveryResolveOptions extends BaseClientOptions {
   outcome: string;
   sourceIssueStatus: string;
   resolutionNote?: string;
+  reconcileRunId?: string;
+  actionOutcome?: string;
+  outcomeEvidence?: string;
+  workspaceRepairEvidence?: string;
+}
+
+/**
+ * Builds the executionReconciliation decision for a stopped run. Recording one
+ * asserts that the provider has stopped; the server verifies it before restore.
+ */
+function buildExecutionReconciliationOption(opts: Pick<IssueRecoveryResolveOptions,
+  "reconcileRunId" | "actionOutcome" | "outcomeEvidence" | "workspaceRepairEvidence">) {
+  const given = [opts.reconcileRunId, opts.actionOutcome, opts.outcomeEvidence, opts.workspaceRepairEvidence]
+    .some((value) => value !== undefined);
+  if (!given) return undefined;
+  if (!opts.reconcileRunId || !opts.actionOutcome || !opts.outcomeEvidence) {
+    throw new Error("--reconcile-run-id, --action-outcome, and --outcome-evidence must be given together");
+  }
+  return {
+    runId: opts.reconcileRunId,
+    providerStopped: true as const,
+    actionOutcome: opts.actionOutcome,
+    outcomeEvidence: opts.outcomeEvidence,
+    ...(opts.workspaceRepairEvidence !== undefined ? { workspaceRepairEvidence: opts.workspaceRepairEvidence } : {}),
+  };
 }
 
 interface InteractionAcceptOptions extends BaseClientOptions {
@@ -526,10 +551,16 @@ export function registerIssueCommands(program: Command): void {
       .requiredOption("--source-issue-status <status>", "todo, done, or in_review for restored outcomes; blocked is only valid for blocked outcomes")
       .option("--action-id <id>", "Specific recovery action ID")
       .option("--resolution-note <text>", "Resolution note")
+      .option("--reconcile-run-id <runId>", "Reconcile this stopped run before continuing (records that its provider has stopped)")
+      .option("--action-outcome <outcome>", "Observed outcome of the stopped run's actions: completed, not_performed, or mixed")
+      .option("--outcome-evidence <text>", "What you checked to establish the action outcome (at least 20 characters)")
+      .option("--workspace-repair-evidence <text>", "Required when the run's workspace restore was unsafe: how staging was verified or repaired")
       .action(async (issueId: string, opts: IssueRecoveryResolveOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
+          const executionReconciliation = buildExecutionReconciliationOption(opts);
           const payload = resolveIssueRecoveryActionSchema.parse({
+            ...(executionReconciliation ? { executionReconciliation } : {}),
             actionId: opts.actionId,
             outcome: opts.outcome,
             sourceIssueStatus: opts.sourceIssueStatus,

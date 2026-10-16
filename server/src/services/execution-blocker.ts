@@ -2,7 +2,7 @@ import { and, desc, eq, gt, inArray, not, or, sql } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
 import { heartbeatRuns, issueComments, issues, issueRecoveryActions, type Db } from "@paperclipai/db";
-import { EXECUTION_RECONCILIATION_CAUSES, type ExecutionBlocker } from "@paperclipai/shared";
+import { EXECUTION_RECONCILIATION_CAUSES, hasWorkspaceRestoreFailure, type ExecutionBlocker } from "@paperclipai/shared";
 
 /** Resolved recovery bookkeeping can still carry an effective no-replay hold. */
 export function executionBlockerPredicate() {
@@ -53,7 +53,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   if (!action) return null;
   const parsedRunId = z.string().guid().safeParse(action.evidence.runId ?? action.evidence.sourceRunId);
   const runId = parsedRunId.success ? parsedRunId.data : null;
-  const [run] = runId ? await db.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(and(
+  const [run] = runId ? await db.select({ agentId: heartbeatRuns.agentId, resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId),
   )).limit(1) : [];
 
@@ -64,5 +64,8 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     agentId: run?.agentId ?? null,
     cause: action.cause,
     nextAction: action.nextAction,
+    // The server requires workspace repair evidence for any restore failure
+    // on the stopped run (validateExecutionReconciliation).
+    workspaceRepairRequired: hasWorkspaceRestoreFailure(run?.resultJson) || hasWorkspaceRestoreFailure(action.evidence),
   };
 }

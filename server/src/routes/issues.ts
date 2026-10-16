@@ -8,6 +8,7 @@ import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractio
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { isStaleQuestion, staleQuestionCutoffForIssue } from "../services/recovery/disposition-repair.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -9201,16 +9202,20 @@ export function issueRoutes(
           // Interaction creation also locks the source issue. Check the durable
           // wait inside this transaction so retry cannot bypass a newer question
           // or confirmation after the notice was rendered.
-          const [pendingInteraction] = await tx
-            .select({ id: issueThreadInteractions.id })
+          // A question card older than the operator comment the agent already
+          // acted on is not a wait. Use disposition repair's rule so the two agree.
+          const pendingInteractions = await tx
+            .select({ id: issueThreadInteractions.id, kind: issueThreadInteractions.kind, createdAt: issueThreadInteractions.createdAt })
             .from(issueThreadInteractions)
             .where(and(
               eq(issueThreadInteractions.companyId, lockedIssue.companyId),
               eq(issueThreadInteractions.issueId, lockedIssue.id),
               eq(issueThreadInteractions.status, "pending"),
-            ))
-            .limit(1);
-          if (pendingInteraction) {
+            ));
+          const staleQuestionCutoff = pendingInteractions.some((row) => row.kind === "ask_user_questions")
+            ? await staleQuestionCutoffForIssue(tx as unknown as Db, lockedIssue, { allowBlocked: true })
+            : null;
+          if (pendingInteractions.some((row) => !isStaleQuestion(row, staleQuestionCutoff))) {
             throw conflict(
               "Respond to the pending question or confirmation before retrying.",
               { code: "disposition_recovery_interaction_pending" },

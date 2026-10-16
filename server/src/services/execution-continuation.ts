@@ -13,9 +13,15 @@ import {
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
+import { isOperatorDeliveryInterrupt } from "./legacy-execution-recovery.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
 import { isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
+
+
+/** Shown to the turn that follows an operator-delivery interrupt. */
+export const OPERATOR_INTERRUPT_NOTICE =
+  "Your previous turn was interrupted to deliver this message. Before repeating any action from it, check what already completed (files, commits, external calls) and do not redo completed side effects.";
 
 export class StaleExecutionContinuationError extends Error {
   constructor(readonly code: "continuation_task_ownership_changed") {
@@ -407,12 +413,18 @@ export async function buildExecutionContinuation(input: {
     if (!predecessor || !authorization || explicitUserSource !== sourceRunId)
       throw new Error("continuation_user_authorization_missing");
   }
+  // An operator-delivery interrupt carries no reconciliation hold. The next
+  // turn must check what the stopped turn already did instead of replaying it.
+  const operatorInterrupted = lastTerminal && isOperatorDeliveryInterrupt({
+    status: lastTerminal.status, errorCode: lastTerminal.errorCode, resultJson: object(lastTerminal.result),
+  }) ? lastTerminal : null;
   const interruptedRunId = explicitUserSource ?? string(input.context.interruptedRunId) ?? (lastTerminal && lastTerminal.status !== "succeeded" &&
-    (hasConversationContinuationPolicy(lastTerminal.result) ||
+    (hasConversationContinuationPolicy(lastTerminal.result) || operatorInterrupted ||
       lastTerminal.status === "interrupted" || lastTerminal.errorCode === "process_lost")
     ? lastTerminal.id : undefined);
   return {
     ...(interruptedRunId ? { interruptedRunId } : {}),
+    ...(operatorInterrupted ? { operatorInterruptNotice: OPERATOR_INTERRUPT_NOTICE } : {}),
     ...(resumeDelta ? { resumeDelta } : {}),
     recoveryOutcomes: reconciliations
       .filter((row) => row.evidence.executionReconciliation)
