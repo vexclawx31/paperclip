@@ -66,6 +66,37 @@ export function stripAiAuthBindings(env: unknown): Record<string, unknown> {
       delete result[key];
   return result;
 }
+const PROJECT_AUTH_PATTERN =
+  /apiKeyHelper|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENAI_API_KEY|model_provider\s*=|env_key\s*=|experimental_bearer_token|cli_auth_credentials_store/;
+const CLAUDE_AUTH_ENV_KEYS = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY"];
+
+// A settings file conflicts only when it actually configures authentication.
+// Claude settings are JSON: only `apiKeyHelper` or an auth variable under `env`
+// counts, not a mention of a variable name in unrelated text (for example an
+// auto-mode environment description). TOML comments are ignored. Anything that
+// cannot be parsed keeps the strict textual check.
+export function projectFileConfiguresAuth(relative: string, content: string): boolean {
+  if (relative.endsWith(".json")) {
+    let settings: unknown;
+    try {
+      settings = JSON.parse(content);
+    } catch {
+      return PROJECT_AUTH_PATTERN.test(content);
+    }
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) return PROJECT_AUTH_PATTERN.test(content);
+    const record = settings as Record<string, unknown>;
+    if (record.apiKeyHelper !== undefined && record.apiKeyHelper !== null && record.apiKeyHelper !== "") return true;
+    const env = record.env;
+    return Boolean(env && typeof env === "object" && !Array.isArray(env) &&
+      CLAUDE_AUTH_ENV_KEYS.some((key) => Object.prototype.hasOwnProperty.call(env, key)));
+  }
+  const withoutComments = content
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n");
+  return PROJECT_AUTH_PATTERN.test(withoutComments);
+}
+
 export async function assertManagedAiProjectAuth(
   config: Record<string, unknown>,
   provider: AiConnectionBinding["provider"],
@@ -147,11 +178,7 @@ done`,
     for (const relative of files) {
       try {
         const content = await readFile(path.join(directory, relative), "utf8");
-        if (
-          /apiKeyHelper|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENAI_API_KEY|model_provider\s*=|env_key\s*=|experimental_bearer_token|cli_auth_credentials_store/.test(
-            content,
-          )
-        ) {
+        if (projectFileConfiguresAuth(relative, content)) {
           throw unprocessable(
             "Project authentication settings conflict with the selected AI connection",
             { code: "ai_connection_incompatible" },
