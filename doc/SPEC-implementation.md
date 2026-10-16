@@ -720,10 +720,15 @@ Issue-thread interactions are coordination records, not grants of authority. Eve
 interaction kind defaults to resolver policy `anyone` when the create request omits
 `resolverPolicy`. Restrictions are opt-in.
 
-Question, confirmation, checkbox confirmation, and item verdict cards stay pending
-when a user sends an ordinary task comment. Their `supersedeOnUserComment` flag
-defaults to `false`. A creator may set it to `true` when a comment should replace
-the pending request, as the opening onboarding question does.
+Question (`ask_user_questions`) cards are superseded when a user sends a newer
+ordinary task comment: their `supersedeOnUserComment` flag defaults to `true`, so
+the server expires the pending question with `superseded_by_comment`; the comment
+itself wakes the issue's assignee as usual. Questions with an addressee or a
+restricted resolver policy keep the `false` default. A creator may set it to `false` to keep
+a question open while discussion continues. Confirmation, checkbox confirmation,
+and item verdict cards stay pending when a user comments; their flag defaults to
+`false`, and a creator may set it to `true` when a comment should replace the
+pending request.
 
 Canonical resolver policies are:
 

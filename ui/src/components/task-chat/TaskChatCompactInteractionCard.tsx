@@ -1971,9 +1971,9 @@ export function TaskChatCompactInteractionCard({
         <AskUserQuestionsCard
           interaction={interaction}
           onSubmitInteractionAnswers={onSubmitInteractionAnswers}
-          onCancelInteraction={
-            presentation === "timeline" ? onCancelInteraction : undefined
-          }
+          // A runtime-projected question belongs to a live provider turn;
+          // cancelling it would cancel that run, so Cancel only closes the form.
+          onCancelInteraction={interaction.payload.runtimeRequestId ? undefined : onCancelInteraction}
           errorMessage={errorMessage}
           draftKey={draftKey}
           onUploadImage={onUploadImage}

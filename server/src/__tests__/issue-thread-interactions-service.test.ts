@@ -1662,7 +1662,60 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
-  it("keeps ask_user_questions pending by default when the user sends a message", async () => {
+  it("supersedes ask_user_questions by default when the user sends a newer message", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Question supersede default");
+
+    await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "ask_user_questions",
+      payload: {
+        version: 1,
+        questions: [{
+          id: "scope",
+          prompt: "Choose the scope",
+          selectionMode: "single",
+          options: [{ id: "phase-1", label: "Phase 1" }],
+        }],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const [created] = await db.select().from(issueThreadInteractions);
+    expect(created?.payload).toMatchObject({ supersedeOnUserComment: true });
+
+    const expired = await interactionsSvc.expireRequestConfirmationsSupersededByComment({
+      id: issueId,
+      companyId,
+    }, {
+      id: randomUUID(),
+      createdAt: new Date(Date.now() + 1_000),
+      authorUserId: "local-board",
+    }, {
+      userId: "local-board",
+    });
+
+    expect(expired).toHaveLength(1);
+    const rows = await db.select().from(issueThreadInteractions);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("expired");
+    expect(rows[0]?.result).toMatchObject({ version: 1, expirationReason: "superseded_by_comment" });
+  });
+
+  it("does not default a restricted-resolver question to supersede on a board comment", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Restricted question");
+    await interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "ask_user_questions",
+      resolverPolicy: "not_creator",
+      payload: { version: 1, questions: [{ id: "scope", prompt: "Choose", selectionMode: "single", options: [{ id: "a", label: "A" }] }] },
+    }, { userId: "local-board" });
+    const [created] = await db.select().from(issueThreadInteractions);
+    expect(created?.payload).toMatchObject({ supersedeOnUserComment: false });
+  });
+
+  it("keeps ask_user_questions pending when its creator opts out of supersede", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Question supersede opt-out");
 
     await interactionsSvc.create({
@@ -1672,6 +1725,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       kind: "ask_user_questions",
       payload: {
         version: 1,
+        supersedeOnUserComment: false,
         questions: [{
           id: "scope",
           prompt: "Choose the scope",

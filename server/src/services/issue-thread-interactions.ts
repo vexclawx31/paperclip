@@ -855,11 +855,16 @@ function normalizeCreateInteractionInput(
 ): CreateIssueThreadInteraction {
   switch (input.kind) {
     case "ask_user_questions":
+      // An ordinary question (no addressee, open resolver policy) is superseded
+      // by the operator's newer comment unless its creator explicitly keeps it
+      // open for discussion (false). Addressed or restricted questions keep the
+      // conservative default so an unrelated board comment cannot expire them.
       return {
         ...input,
         payload: {
           ...input.payload,
-          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? false,
+          supersedeOnUserComment: input.payload.supersedeOnUserComment ??
+            (!input.addresseeAgentId && (!input.resolverPolicy || input.resolverPolicy === "anyone")),
         },
       };
     case "request_confirmation":
