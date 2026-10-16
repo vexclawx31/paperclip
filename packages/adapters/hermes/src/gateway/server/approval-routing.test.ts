@@ -279,23 +279,85 @@ describe("createApprovalRouter", () => {
     expect(postDecision).not.toHaveBeenCalled();
   });
 
-  it("withdraws a request when a later status poll shows Hermes stopped waiting", async () => {
+  it("withdraws a request only after two later polls show Hermes stopped waiting", async () => {
     let clock = 1_000;
     const onApprovalRequest = waitingHost();
     const { ctx, onEvent } = routerCtx(onApprovalRequest);
     const { router, postDecision } = makeRouter(ctx, { now: () => clock });
     router.handle(hermesEvent(), "run_abc");
     await vi.waitFor(() => expect(onApprovalRequest).toHaveBeenCalled());
-    // A poll that started before the request was seen may predate it.
-    router.observeStatus("running", 900);
-    router.observeStatus("waiting_for_approval", 1_500);
-    expect(onApprovalRequest.mock.calls[0]![0].signal.aborted).toBe(false);
+    const signal = () => onApprovalRequest.mock.calls[0]![0].signal;
+    // Polls that started before the request was seen never count.
+    router.observeStatus("running", null, 900);
+    router.observeStatus("running", null, 950);
+    expect(signal().aborted).toBe(false);
+    // One lagging "running" poll does not cancel a live board approval.
+    router.observeStatus("running", null, 1_500);
+    expect(signal().aborted).toBe(false);
+    // A waiting poll resets the count.
+    router.observeStatus("waiting_for_approval", "0f1e2d3c4b5a", 1_600);
+    router.observeStatus("queued", null, 1_700);
+    expect(signal().aborted).toBe(false);
     clock = 2_000;
-    router.observeStatus("running", 1_500);
+    router.observeStatus("running", null, 1_800);
+    await router.settle();
+    expect(signal().reason).toBe(PROVIDER_NOT_PENDING);
+    expect(postDecision).not.toHaveBeenCalled();
+    expect(onEvent.mock.calls.some(([event]) => event.eventType === "adapter.approval.abandoned")).toBe(true);
+  });
+
+  it("withdraws a request when Hermes is waiting on a different request id", async () => {
+    const onApprovalRequest = waitingHost();
+    const { ctx } = routerCtx(onApprovalRequest);
+    const { router, postDecision } = makeRouter(ctx, { now: () => 1_000 });
+    router.handle(hermesEvent(), "run_abc");
+    await vi.waitFor(() => expect(onApprovalRequest).toHaveBeenCalled());
+    router.observeStatus("waiting_for_approval", "0f1e2d3c4b5a", 1_500);
+    expect(onApprovalRequest.mock.calls[0]![0].signal.aborted).toBe(false);
+    router.observeStatus("waiting_for_approval", "another-request", 1_500);
     await router.settle();
     expect(onApprovalRequest.mock.calls[0]![0].signal.reason).toBe(PROVIDER_NOT_PENDING);
     expect(postDecision).not.toHaveBeenCalled();
-    expect(onEvent.mock.calls.some(([event]) => event.eventType === "adapter.approval.abandoned")).toBe(true);
+  });
+
+  it("denies, closes the record and logs route_failed when routing throws", async () => {
+    const onDelivery = vi.fn(async (_delivery: AdapterApprovalDelivery) => undefined);
+    const onApprovalRequest = vi.fn(async (request: AdapterApprovalRequest): Promise<AdapterApprovalDecision> => {
+      const decision: AdapterApprovalDecision = {
+        decision: "approved",
+        decidedBy: "board",
+        requestId: request.requestId,
+        commandSha256: request.commandSha256,
+        onDelivery,
+      };
+      // Fail after the host decided but before the answer is sent.
+      Object.defineProperty(decision, "approvalId", { get: () => { throw new Error("boom"); } });
+      return decision;
+    });
+    const { ctx, onEvent } = routerCtx(onApprovalRequest);
+    const { router, postDecision } = makeRouter(ctx);
+    router.handle(hermesEvent(), "run_abc");
+    await router.settle();
+    expect(postDecision).toHaveBeenCalledTimes(1);
+    expect(postDecision).toHaveBeenCalledWith({ runId: "run_abc", requestId: "0f1e2d3c4b5a", choice: "deny" });
+    expect(onDelivery).toHaveBeenCalledWith({ delivered: false, choice: "deny", reason: "route_failed" });
+    const failed = onEvent.mock.calls.find(([event]) => event.eventType === "adapter.approval.route_failed");
+    expect(failed?.[0].message).toContain("boom");
+    // The pending entry is gone: later polls do nothing.
+    expect(() => router.observeStatus("running", null, Number.MAX_SAFE_INTEGER)).not.toThrow();
+  });
+
+  it("denies when routing throws before the host is asked", async () => {
+    const onApprovalRequest = boardDecision("approved");
+    const { ctx } = routerCtx(onApprovalRequest);
+    ctx.onEvent = vi.fn(async (event) => {
+      if (event.eventType === "adapter.approval.requested") throw new Error("event sink down");
+    });
+    const { router, postDecision } = makeRouter(ctx);
+    router.handle(hermesEvent(), "run_abc");
+    await router.settle();
+    expect(onApprovalRequest).not.toHaveBeenCalled();
+    expect(postDecision).toHaveBeenCalledWith({ runId: "run_abc", requestId: "0f1e2d3c4b5a", choice: "deny" });
   });
 
   it("reports an answer Hermes rejected as not pending so the host can close the record", async () => {

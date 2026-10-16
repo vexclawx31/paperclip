@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { redactCredentialPatterns } from "./credential-redaction.js";
 import type {
   AdapterApprovalDecision,
   AdapterExecutionContext,
@@ -79,21 +80,13 @@ export function parseHermesApprovalRequest(value: unknown, fallbackRunId: string
 // Redaction and integrity
 // ---------------------------------------------------------------------------
 
-const TOKEN_REDACTIONS: Array<[RegExp, string]> = [
-  [/\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]"],
-  [/\b(authorization|x-api-key|api-key|cookie)\s*:\s*[^\s"']+/gi, "$1: [redacted]"],
-  [/\b([A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key|private[_-]?key|credential|auth)[A-Za-z0-9_]*)\s*=\s*("[^"]*"|'[^']*'|[^\s"']+)/gi, "$1=[redacted]"],
-  [/(--?(?:token|secret|password|passwd|api[-_]?key|auth|key|pat|credentials?))(\s+|=)("[^"]*"|'[^']*'|[^\s"']+)/gi, "$1$2[redacted]"],
-  [/\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|xox[abposr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|pcp_[A-Za-z0-9_-]{16,})\b/g, "[redacted-token]"],
-  [/:\/\/([^/\s:@]+):([^/\s@]+)@/g, "://$1:[redacted]@"],
-  [/\b[A-Fa-f0-9]{32,}\b/g, "[redacted-hex]"],
-  [/\b[A-Za-z0-9+_-]{40,}={0,2}/g, "[redacted-blob]"],
-];
-
-/** Redact token-like material from approval text before it is logged or stored. */
+/**
+ * Redact an approval text for logging or storage: the run's text redactor
+ * (exact configured secrets) and the shared credential patterns, the same
+ * list execute.ts applies to every logged or returned string.
+ */
 export function redactApprovalText(value: string, redactText?: (value: string) => string): string {
-  let out = redactText ? redactText(value) : value;
-  for (const [pattern, replacement] of TOKEN_REDACTIONS) out = out.replace(pattern, replacement);
+  const out = redactCredentialPatterns(redactText ? redactText(value) : value);
   return out.length <= MAX_APPROVAL_TEXT_CHARS ? out : `${out.slice(0, MAX_APPROVAL_TEXT_CHARS)}... [truncated]`;
 }
 
@@ -150,15 +143,22 @@ export type ApprovalRouterInput = {
 export type ApprovalRouter = {
   handle: (raw: unknown, fallbackRunId: string) => void;
   /**
-   * Report a Hermes run status fetched by a poll that started at `pollStartedAt`.
-   * A request first seen before the poll started is withdrawn when the status
-   * is no longer `waiting_for_approval`: Hermes stopped waiting for it.
+   * Report a Hermes run status fetched by a poll that started at
+   * `pollStartedAt`. Only polls that started after a request was seen count.
+   * A request is withdrawn (Hermes stopped waiting for it) when two such polls
+   * in a row are not `waiting_for_approval`, or when one shows
+   * `waiting_for_approval` for a different request id. Status can lag the
+   * event stream, so a single `running` poll never withdraws a request.
    */
-  observeStatus: (status: string | null, pollStartedAt: number) => void;
+  observeStatus: (status: string | null, pendingRequestId: string | null, pollStartedAt: number) => void;
   settle: () => Promise<void>;
 };
 
-type PendingRequest = { seenAt: number; controller: AbortController };
+type PendingRequest = { seenAt: number; controller: AbortController; notWaitingPolls: number; onRunAbort: () => void };
+
+/** Polls in a row that must show "not waiting" before a request is withdrawn. */
+export const NOT_WAITING_POLLS_TO_WITHDRAW = 2;
+export const ROUTE_FAILED = "route_failed";
 
 /**
  * Create a per-run router. `handle` is fire-and-forget so the event stream
@@ -176,7 +176,9 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
     await input.ctx.onEvent?.({ eventType, stream: "system", level, message, payload });
   };
 
-  async function route(request: HermesApprovalRequest, entry: PendingRequest): Promise<void> {
+  type RouteState = { decision: AdapterApprovalDecision | null; answered: boolean; reported: boolean };
+
+  async function route(request: HermesApprovalRequest, entry: PendingRequest, st: RouteState): Promise<void> {
     const command = redactApprovalText(request.command, input.redactText);
     const description = redactApprovalText(request.description, input.redactText);
     const commandComplete = !isCommandIncomplete(request.command, command);
@@ -184,9 +186,8 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
     // One signal for "stop waiting": the run ended or stopped, or Hermes
     // withdrew this request.
     const requestSignal = entry.controller.signal;
-    const onRunAbort = () => entry.controller.abort(input.signal.reason);
-    if (input.signal.aborted) onRunAbort();
-    else input.signal.addEventListener("abort", onRunAbort, { once: true });
+    if (input.signal.aborted) entry.onRunAbort();
+    else input.signal.addEventListener("abort", entry.onRunAbort, { once: true });
 
     const base = {
       hermesRunId: request.runId,
@@ -210,6 +211,7 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
     }
 
     let decision: AdapterApprovalDecision;
+    // The host call may have created a record; any failure from here on must close it.
     if (!input.config.enabled) {
       decision = { decision: "unavailable", decidedBy: "system", note: "Approval routing is disabled in adapterConfig.approvalRouting." };
     } else if (!input.ctx.onApprovalRequest) {
@@ -234,12 +236,14 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
         };
       }
     }
-    input.signal.removeEventListener("abort", onRunAbort);
+    st.decision = decision;
+    input.signal.removeEventListener("abort", entry.onRunAbort);
     pending.delete(request.requestId);
 
     // An approval must be for this exact request and command.
     if (decision.decision === "approved" && (decision.requestId !== request.requestId || decision.commandSha256 !== sha)) {
       decision = { ...decision, decision: "denied", decidedBy: "system", note: "The approval did not match this request id and command hash." };
+      st.decision = decision;
     }
 
     const outcomeBase = {
@@ -248,6 +252,7 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
       ...(decision.approvalId ? { approvalId: decision.approvalId } : {}),
     };
     const report = async (delivered: boolean, choice: "once" | "deny", reason: string | null) => {
+      st.reported = true;
       try {
         await decision.onDelivery?.({ delivered, choice, reason });
       } catch {
@@ -289,6 +294,7 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
     };
 
     let result: ApprovalAnswerResult;
+    st.answered = true;
     try {
       result = await input.postDecision({ runId: request.runId, requestId: request.requestId, choice });
     } catch (err) {
@@ -307,23 +313,91 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
     }
   }
 
+  /** Best-effort cleanup when route() throws: deny, close the record, log. */
+  async function routeFailed(request: HermesApprovalRequest, entry: PendingRequest, st: RouteState, err: unknown): Promise<void> {
+    const reason = input.redactText(err instanceof Error ? err.message : String(err));
+    const providerGone = entry.controller.signal.aborted &&
+      [PROVIDER_RUN_ENDED, PROVIDER_NOT_PENDING].includes(String(entry.controller.signal.reason ?? ""));
+    // Stop any host wait that is still in progress; the host cancels its record.
+    if (!entry.controller.signal.aborted) entry.controller.abort(ROUTE_FAILED);
+    let denied = false;
+    if (!st.answered && !providerGone) {
+      st.answered = true;
+      try {
+        denied = (await input.postDecision({ runId: request.runId, requestId: request.requestId, choice: "deny" })).delivered;
+      } catch {
+        denied = false;
+      }
+    }
+    if (st.decision && !st.reported) {
+      st.reported = true;
+      try {
+        // Not delivered as decided: the host closes an approved record.
+        await st.decision.onDelivery?.({ delivered: false, choice: "deny", reason: ROUTE_FAILED });
+      } catch {
+        // Best effort.
+      }
+    }
+    let approvalId: string | null = null;
+    try {
+      approvalId = st.decision?.approvalId ?? null;
+    } catch {
+      approvalId = null;
+    }
+    const message = `request ${request.requestId} routing failed (${reason}); ${denied ? "answered Hermes with \"deny\"" : "no answer was delivered"}`;
+    try {
+      await emit("adapter.approval.route_failed", "warn", message, {
+        hermesRunId: request.runId,
+        requestId: request.requestId,
+        reason,
+        denied,
+        ...(approvalId ? { approvalId } : {}),
+      });
+    } catch {
+      try {
+        await input.ctx.onLog("stderr", `[hermes-gateway:approval] ${message}\n`);
+      } catch {
+        // Nothing left to report to.
+      }
+    }
+  }
+
   return {
     handle(raw, fallbackRunId) {
       const request = parseHermesApprovalRequest(raw, fallbackRunId);
       if (!request || seen.has(request.requestId)) return;
       seen.add(request.requestId);
-      const entry: PendingRequest = { seenAt: now(), controller: new AbortController() };
+      const controller = new AbortController();
+      const entry: PendingRequest = {
+        seenAt: now(),
+        controller,
+        notWaitingPolls: 0,
+        onRunAbort: () => controller.abort(input.signal.reason),
+      };
       pending.set(request.requestId, entry);
-      const task = route(request, entry)
+      const st: RouteState = { decision: null, answered: false, reported: false };
+      const task = route(request, entry, st)
+        .catch((err) => routeFailed(request, entry, st, err))
         .catch(() => undefined)
-        .finally(() => inFlight.delete(task));
+        .finally(() => {
+          input.signal.removeEventListener("abort", entry.onRunAbort);
+          pending.delete(request.requestId);
+          inFlight.delete(task);
+        });
       inFlight.add(task);
     },
-    observeStatus(status, pollStartedAt) {
-      if (!status || status === "waiting_for_approval") return;
-      for (const entry of pending.values()) {
+    observeStatus(status, pendingRequestId, pollStartedAt) {
+      if (!status) return;
+      for (const [requestId, entry] of pending) {
         // A poll that started before we saw the request may predate it.
-        if (entry.seenAt < pollStartedAt) entry.controller.abort(PROVIDER_NOT_PENDING);
+        if (entry.seenAt >= pollStartedAt || entry.controller.signal.aborted) continue;
+        if (status === "waiting_for_approval") {
+          entry.notWaitingPolls = 0;
+          if (pendingRequestId && pendingRequestId !== requestId) entry.controller.abort(PROVIDER_NOT_PENDING);
+          continue;
+        }
+        entry.notWaitingPolls += 1;
+        if (entry.notWaitingPolls >= NOT_WAITING_POLLS_TO_WITHDRAW) entry.controller.abort(PROVIDER_NOT_PENDING);
       }
     },
     async settle() {

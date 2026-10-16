@@ -1148,6 +1148,34 @@ describe("approval routing", () => {
     expect(urls.findIndex((url) => url.endsWith("/approval"))).toBeLessThan(urls.findIndex((url) => url.endsWith("/stop")));
   });
 
+  it("redacts approval commands in the status record that reaches final_status", async () => {
+    const token = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+    const approval = { event: "approval.request", request_id: "req-7", command: `deploy --token ${token}`, nested: [{ command: `x --token ${token}` }] };
+    let stopped = false;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) return new Response(JSON.stringify({ run_id: "run-hermes-1" }), { status: 200 });
+      if (url.endsWith("/events")) {
+        return new Response(sseStream(`event: approval.request\ndata: ${JSON.stringify(approval)}\n\n`), { status: 200 });
+      }
+      if (url.endsWith("/approval")) return new Response(JSON.stringify({ resolved: 1 }), { status: 200 });
+      if (url.endsWith("/stop")) {
+        stopped = true;
+        return new Response(JSON.stringify({ status: "stopping" }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: stopped ? "cancelled" : "waiting_for_approval", approval }), { status: 200 });
+    }));
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 1, pollIntervalMs: 250 });
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("hermes_gateway_timeout");
+    expect(JSON.stringify(result.resultJson?.final_status)).toContain("[redacted]");
+    expect(JSON.stringify(result)).not.toContain(token);
+    const logged = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls.map((call) => String(call[1])).join("");
+    expect(logged).not.toContain(token);
+  });
+
   it("reports approval_not_pending from Hermes as an undelivered answer", async () => {
     approvalHarness({ notPending: true });
     const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30 });

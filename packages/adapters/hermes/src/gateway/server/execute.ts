@@ -29,9 +29,9 @@ import {
   createApprovalRouter,
   PROVIDER_RUN_ENDED,
   readApprovalRoutingConfig,
-  redactApprovalText,
   type ApprovalRouter,
 } from "./approval-routing.js";
+import { redactCredentialPatterns } from "./credential-redaction.js";
 
 type SessionKeyStrategy = "issue" | "agent" | "run" | "none";
 
@@ -232,10 +232,12 @@ function stringifyForLog(value: unknown, maxChars = 4_000): string {
 }
 
 function sanitizeSensitiveText(value: string): string {
-  return value
+  // One path: the session/header patterns below plus the shared credential
+  // patterns that approval commands also use.
+  return redactCredentialPatterns(value
     .replace(BEARER_TOKEN_PATTERN, "Bearer [redacted]")
     .replace(HERMES_SESSION_KEY_HEADER_PATTERN, "$1[redacted]")
-    .replace(PAPERCLIP_SESSION_KEY_PATTERN, "[redacted-session-key]");
+    .replace(PAPERCLIP_SESSION_KEY_PATTERN, "[redacted-session-key]"));
 }
 
 function escapeRegExp(value: string): string {
@@ -566,14 +568,9 @@ async function handleEvent(
   const eventName = eventNameFromData(parsed, frame.event);
   if (ctx.config.scopedRunEnvironment === true && eventName === "message.delta") return;
   state.lastEventName = eventName;
-  // Approval frames carry the flagged command; apply the approval redaction
-  // too so no token-like argument reaches the run log.
-  const loggable = eventName === "approval.request" && record
-    ? Object.fromEntries(Object.entries(record).map(([key, value]) => [key, typeof value === "string" ? redactApprovalText(value, redactText) : value]))
-    : parsed;
   await ctx.onLog(
     "stdout",
-    `[hermes-gateway:event] run=${state.runId} event=${eventName ?? "message"} data=${stringifyForLog(redactForLog(loggable, [], 0, redactText), 8_000)}\n`,
+    `[hermes-gateway:event] run=${state.runId} event=${eventName ?? "message"} data=${stringifyForLog(redactForLog(parsed, [], 0, redactText), 8_000)}\n`,
   );
 
   const delta = nonEmpty(record?.delta) ?? nonEmpty(record?.text_delta);
@@ -637,7 +634,7 @@ async function pollStatus(input: {
       if (normalized === "waiting_for_approval") input.state.approvals?.handle(asRecord(status)?.approval, input.state.runId);
       // Hermes stopped waiting (its own approvals.timeout, a stop, or another
       // answer): withdraw the request so the board record is closed.
-      input.state.approvals?.observeStatus(normalized, pollStartedAt);
+      input.state.approvals?.observeStatus(normalized, nonEmpty(asRecord(asRecord(status)?.approval)?.request_id), pollStartedAt);
       if (normalized && TERMINAL_STATUSES.has(normalized)) {
         markTerminal(input.state, {
           runId: input.state.runId,
