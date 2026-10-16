@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import type {
   AdapterApprovalDecision,
   AdapterApprovalRequest,
   AdapterExecutionContext,
 } from "@paperclipai/adapter-utils";
+import { analyzeCommand, DEFAULT_SAFE_ROOTS, readSafeRoots, type SafeCategory } from "./approval-classifier.js";
 
 // Hermes emits `approval.request` when its approval gate (smart or manual)
 // escalates a flagged command to a human, then blocks the agent until
@@ -10,11 +12,13 @@ import type {
 // This module parses those events, classifies them conservatively, routes them
 // through the host, and answers Hermes with the narrowest possible scope.
 
-export const DEFAULT_APPROVAL_BOARD_TIMEOUT_SEC = 900;
+// Below the default run timeoutSec (600) minus the 15 s answer reserve, so the
+// default pairing never caps the board wait.
+export const DEFAULT_APPROVAL_BOARD_TIMEOUT_SEC = 540;
 const MIN_APPROVAL_BOARD_TIMEOUT_SEC = 10;
 const MAX_APPROVAL_BOARD_TIMEOUT_SEC = 24 * 60 * 60;
 // Leave the adapter time to answer Hermes before its own run deadline.
-const RUN_DEADLINE_RESERVE_MS = 15_000;
+export const RUN_DEADLINE_RESERVE_MS = 15_000;
 const MAX_APPROVAL_TEXT_CHARS = 2_000;
 
 export type HermesApprovalRequest = {
@@ -32,13 +36,19 @@ export type ApprovalTier = "red" | "yellow";
 export type ApprovalClassification = {
   tier: ApprovalTier;
   reasons: string[];
+  /** Known-safe categories the whole command matched (yellow only). */
+  categories: SafeCategory[];
 };
 
 export type ApprovalRoutingConfig = {
   enabled: boolean;
   supervisorAgentId: string | null;
   boardTimeoutMs: number;
+  safeRoots: string[];
 };
+
+/** Abort reason that means Hermes already finished the run; nothing to answer. */
+export const PROVIDER_RUN_ENDED = "provider_run_ended";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -96,94 +106,58 @@ export function redactApprovalText(value: string, redactText?: (value: string) =
   return out.length <= MAX_APPROVAL_TEXT_CHARS ? out : `${out.slice(0, MAX_APPROVAL_TEXT_CHARS)}... [truncated]`;
 }
 
+export function commandSha256(command: string): string {
+  return createHash("sha256").update(command, "utf8").digest("hex");
+}
+
 // ---------------------------------------------------------------------------
 // Classification
 // ---------------------------------------------------------------------------
 
-type Rule = { id: string; test: (command: string, text: string) => boolean };
+type Rule = { id: string; test: (text: string) => boolean };
 
-const SCRATCH_PREFIXES = ["/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"];
-
-function shellWords(segment: string): string[] {
-  return segment.match(/"[^"]*"|'[^']*'|\S+/g)?.map((word) => word.replace(/^["']|["']$/g, "")) ?? [];
-}
-
-// `rm -r`/`rm -f` is only delegable when every target stays inside the run's
-// working directory or a disposable scratch path. Anything the classifier
-// cannot place (absolute, home, `..`, variables, globs at a root) is red.
-function rmOutsideWorkspace(command: string): boolean {
-  for (const segment of command.split(/&&|\|\||[;|\n]|\$\(|`/)) {
-    const words = shellWords(segment.trim());
-    const index = words.findIndex((word) => word === "rm" || word.endsWith("/rm"));
-    if (index < 0) continue;
-    const args = words.slice(index + 1);
-    const flags = args.filter((arg) => arg.startsWith("-"));
-    const recursiveOrForce = flags.some((flag) => /^-[a-zA-Z]*[rRf]/.test(flag) || flag === "--recursive" || flag === "--force");
-    if (!recursiveOrForce) continue;
-    const targets = args.filter((arg) => !arg.startsWith("-"));
-    if (targets.length === 0) return true;
-    for (const target of targets) {
-      if (SCRATCH_PREFIXES.some((prefix) => target.startsWith(prefix) && target.length > prefix.length && !target.includes(".."))) continue;
-      if (/^[\/~$]/.test(target) || target.includes("..") || target.includes("$") || target === "*" || target === "." || target === "./") return true;
-    }
-  }
-  return false;
-}
-
-function forcePushToProtected(command: string): boolean {
-  for (const segment of command.split(/&&|\|\||[;|\n]/)) {
-    const words = shellWords(segment.trim());
-    const gitIndex = words.indexOf("git");
-    if (gitIndex < 0 || !words.slice(gitIndex + 1).includes("push")) continue;
-    const args = words.slice(words.indexOf("push", gitIndex) + 1);
-    const force = args.some((arg) => arg === "-f" || arg.startsWith("--force") || /^-[a-zA-Z]*f/.test(arg) || arg.startsWith("+"));
-    const deletes = args.some((arg) => arg === "--delete" || arg === "-d" || arg.startsWith(":"));
-    if (!force && !deletes) continue;
-    const refs = args.filter((arg) => !arg.startsWith("-"));
-    // `git push --force` with no explicit branch pushes an unknown target.
-    if (refs.length <= 1) return true;
-    if (refs.slice(1).some((ref) => /(^|[:+/])(main|master)$/.test(ref) || ref === "--all" || ref === "--mirror")) return true;
-    if (args.includes("--all") || args.includes("--mirror")) return true;
-  }
-  return false;
-}
-
-const RED_RULES: Rule[] = [
-  { id: "credentials", test: (_c, t) => /\b(credentials?|secrets?|tokens?|oauth|keychain|api[_-]?keys?|passwords?|passwd|private[_ -]?keys?|ssh[_-]?keys?|ssh-keygen|gpg|auth\.json)\b|\bsecurity\s+(find|add|delete|dump)-|\.ssh\/|\.netrc|\.npmrc|\.pypirc|\.env\b|\.hermes\/(config|\.env|auth)/i.test(t) },
-  { id: "redacted_secret", test: (c) => /\*\*\*|«redacted|\[redacted/i.test(c) },
-  { id: "service_control", test: (_c, t) => /\b(launchctl|systemctl|service\s+\S+\s+(start|stop|restart|reload)|brew\s+services|pm2\s+(start|stop|restart|reload|delete)|supervisorctl|hermes\s+(gateway|update)|init\s+[06]|shutdown|reboot|poweroff|halt)\b|system service|launchd service|hermes gateway|self-termination|container lifecycle|kill all processes/i.test(t) },
-  { id: "deploy", test: (_c, t) => /\b(deploy(ment)?s?|kubectl|helm|terraform\s+(apply|destroy|import)|pulumi\s+up|docker\s+(push|login)|podman\s+push|fly(ctl)?\s+deploy|vercel\b.*--prod|railway\s+up|heroku\b|eb\s+deploy|gcloud\b|aws\b|az\s)|remote daemon|daemon redirect/i.test(t) },
-  { id: "privilege", test: (_c, t) => /(^|[\s;&|(`])(sudo|doas|su)(\s|$)|\bchown\b.*\broot\b|chmod\s+(-R\s+)?[0-7]*7[0-7]{0,2}\s+\/|world\/other-writable|chown to root|sudo with/i.test(t) },
-  { id: "remote_code", test: (_c, t) => /\b(curl|wget|fetch)\b[^|;&]*\|\s*(sudo\s+)?(ba|z|k|da|fi)?sh\b|\b(ba|z)?sh\s+<\(\s*(curl|wget)|\b(python3?|node|ruby|perl)\s+(-c\s+)?<\(\s*(curl|wget)|remote content|remote script|possible command obfuscation/i.test(t) },
-  { id: "money", test: (_c, t) => /\b(stripe|payments?|paypal|braintree|invoice|purchase|billing|charge[sd]?|refund|subscription|spend[_ -]?limit|budget)\b/i.test(t) },
-  { id: "external_comms", test: (_c, t) => /\b(e-?mail|sendmail|smtp|mailgun|sendgrid|postmark|ses\s+send|slack|discord|telegram|twilio|whatsapp|imessage|osascript.*messages|tweet|twitter|linkedin|webhooks?|chat\.postMessage|gh\s+(issue|pr)\s+comment|gh\s+release\s+create|npm\s+publish|pnpm\s+publish|twine\s+upload)\b/i.test(t) },
-  { id: "force_push_protected", test: (c) => forcePushToProtected(c) },
-  { id: "destructive_sql", test: (_c, t) => /\b(drop\s+(table|database|schema|index|view|owner|role|user)|truncate(\s+table)?\s+\w+|dropdb|pg_dropcluster|flushall|flushdb)\b|\bdelete\s+from\s+[\w."]+\s*(;|$|"|')|sql drop|sql truncate|sql delete without where/i.test(t) },
-  { id: "delete_outside_workspace", test: (c) => rmOutsideWorkspace(c) },
-  { id: "disk_destruction", test: (_c, t) => /\b(mkfs|dd\s+.*of=\/dev|diskutil\s+(erase|partition|unmount)|shred|wipefs|fdisk)\b|block device|root filesystem|system directory|home directory|root path|fork bomb|system config|system file|find\s+\/\S*\s.*-delete/i.test(t) },
-  { id: "cross_tenant", test: (_c, t) => /\b(other|another|different)\s+(company|tenant|customer)\b/i.test(t) },
-  { id: "disable_safety", test: (_c, t) => /--dangerously|--yolo|\byolo\b|approvals?\.(mode|timeout)|approval[_ -]?(policy|mode)|csrutil|spctl\s+--master-disable|ufw\s+disable|setenforce\s+0|auditctl|disable[-_ ]?(safety|approvals?|audit|guard(ian)?|backups?)|--no-verify|hermes\s+config\s+set|ngrok|cloudflared|tailscale\s+(funnel|serve)/i.test(t) },
+// Vetoes over the command, description and pattern keys. They only add red
+// reasons; a command is yellow only through analyzeCommand's safe categories.
+const RED_VETOES: Rule[] = [
+  { id: "credentials", test: (t) => /\b(credentials?|secrets?|tokens?|oauth|keychain|api[_-]?keys?|passwords?|passwd|private[_ -]?keys?|ssh[_-]?keys?|ssh-keygen|gpg|auth\.json)\b|\bsecurity\s+(find|add|delete|dump)-|\.ssh\/|\.netrc|\.npmrc|\.pypirc|\.env\b|\.hermes\/(config|\.env|auth)/i.test(t) },
+  { id: "service_control", test: (t) => /\b(launchctl|systemctl|service\s+\S+\s+(start|stop|restart|reload)|brew\s+services|pm2|supervisorctl|hermes\s+(gateway|update)|shutdown|reboot|poweroff)\b|system service|launchd service|hermes gateway|self-termination|container lifecycle|kill all processes/i.test(t) },
+  { id: "deploy", test: (t) => /\b(deploy(ment)?s?|kubectl|helm|terraform|pulumi|docker|podman|flyctl|vercel|railway|heroku|gcloud|aws)\b|remote daemon|daemon redirect/i.test(t) },
+  { id: "remote_code", test: (t) => /remote content|remote script|possible command obfuscation/i.test(t) },
+  { id: "money", test: (t) => /\b(stripe|payments?|paypal|braintree|invoice|purchase|billing|refund|subscription|spend[_ -]?limit|budget)\b/i.test(t) },
+  { id: "external_comms", test: (t) => /\b(e-?mail|sendmail|smtp|mailgun|sendgrid|postmark|slack|discord|telegram|twilio|whatsapp|imessage|tweet|twitter|linkedin|webhooks?|publish)\b/i.test(t) },
+  { id: "destructive_sql", test: (t) => /\b(drop\s+(table|database|schema|index|view|owner|role|user)|truncate(\s+table)?\s+\w+|dropdb|flushall|flushdb)\b|\bdelete\s+from\s+[\w."]+\s*(;|$|"|')|sql drop|sql truncate|sql delete without where/i.test(t) },
+  { id: "disk_destruction", test: (t) => /block device|root filesystem|system directory|home directory|root path|fork bomb|system config|system file/i.test(t) },
+  { id: "cross_tenant", test: (t) => /\b(other|another|different)\s+(company|tenant|customer)\b/i.test(t) },
+  { id: "disable_safety", test: (t) => /--dangerously|--yolo|\byolo\b|approvals?\.(mode|timeout)|approval[_ -]?(policy|mode)|disable[-_ ]?(safety|approvals?|audit|guard(ian)?|backups?)|--no-verify|ngrok|cloudflared/i.test(t) },
 ];
 
+const INCOMPLETE_MARKERS = /\*\*\*|«redacted|\[redacted|\[truncated|…\s*$/i;
+
 /**
- * Conservative deterministic classifier. A request is "yellow" (delegable to
- * a supervisor) only when it carries a command, Hermes' guardian did not deny
- * it, and no red rule matches. Anything else is "red" (human only).
+ * Fail-safe classifier. A request is "yellow" (delegable) only when the whole
+ * command matches known-safe categories, nothing in it is redacted or
+ * truncated, Hermes' guardian did not deny it, and no veto matches. Anything
+ * else is "red" (human only).
  */
-export function classifyApprovalRequest(request: Pick<HermesApprovalRequest, "command" | "description" | "patternKeys" | "smartDenied">): ApprovalClassification {
+export function classifyApprovalRequest(
+  request: Pick<HermesApprovalRequest, "command" | "description" | "patternKeys" | "smartDenied">,
+  safeRoots: string[] = DEFAULT_SAFE_ROOTS,
+): ApprovalClassification {
   const command = request.command.trim();
   const text = [command, request.description, ...request.patternKeys].join("\n");
   const reasons: string[] = [];
   if (!command) reasons.push("unclassifiable");
   if (request.smartDenied) reasons.push("guardian_denied");
-  for (const rule of RED_RULES) {
-    try {
-      if (rule.test(command, text)) reasons.push(rule.id);
-    } catch {
-      reasons.push("classifier_error");
-    }
+  if (INCOMPLETE_MARKERS.test(command)) reasons.push("redacted_or_truncated");
+  for (const rule of RED_VETOES) {
+    if (rule.test(text)) reasons.push(rule.id);
   }
-  return reasons.length > 0 ? { tier: "red", reasons } : { tier: "yellow", reasons: ["no_red_rule_matched"] };
+  const analysis = command ? analyzeCommand(command, safeRoots) : null;
+  if (analysis && !analysis.safe) reasons.push(...analysis.reasons);
+  if (reasons.length > 0 || !analysis?.safe) {
+    return { tier: "red", reasons: [...new Set(reasons.length > 0 ? reasons : ["unclassifiable"])], categories: [] };
+  }
+  return { tier: "yellow", reasons: analysis.categories.map((category) => `safe:${category}`), categories: analysis.categories };
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +175,14 @@ export function readApprovalRoutingConfig(config: Record<string, unknown>): Appr
     enabled: config.approvalRouting !== false,
     supervisorAgentId: nonEmpty(config.approvalSupervisorAgentId),
     boardTimeoutMs: Math.round(Math.min(MAX_APPROVAL_BOARD_TIMEOUT_SEC, Math.max(MIN_APPROVAL_BOARD_TIMEOUT_SEC, timeoutSec)) * 1000),
+    safeRoots: readSafeRoots(config.approvalScratchRoots),
   };
+}
+
+/** min(approvalBoardTimeoutSec, remaining run time − reserve), never negative. */
+export function effectiveBoardTimeoutMs(boardTimeoutMs: number, runDeadlineAt: number | null, now = Date.now()): number {
+  if (runDeadlineAt === null) return boardTimeoutMs;
+  return Math.max(0, Math.min(boardTimeoutMs, runDeadlineAt - now - RUN_DEADLINE_RESERVE_MS));
 }
 
 export type ApprovalRouterInput = {
@@ -209,6 +190,7 @@ export type ApprovalRouterInput = {
   config: ApprovalRoutingConfig;
   /** Absolute epoch ms of the adapter run deadline, or null when unbounded. */
   runDeadlineAt: number | null;
+  /** Aborted when the run ends. Reason PROVIDER_RUN_ENDED skips the answer. */
   signal: AbortSignal;
   redactText: (value: string) => string;
   postDecision: (input: { runId: string; requestId: string; choice: "once" | "deny" }) => Promise<void>;
@@ -236,12 +218,24 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
   async function route(request: HermesApprovalRequest): Promise<void> {
     const command = redactApprovalText(request.command, input.redactText);
     const description = redactApprovalText(request.description, input.redactText);
-    const classification = classifyApprovalRequest(request);
+    const classification = classifyApprovalRequest(request, input.config.safeRoots);
+    // The board must see exactly what it approves. If display redaction or
+    // truncation changed the command, it can never be delegated.
+    const commandComplete = command === request.command && !classification.reasons.includes("redacted_or_truncated");
+    if (!commandComplete && classification.tier === "yellow") {
+      classification.tier = "red";
+      classification.reasons = ["redacted_or_truncated"];
+      classification.categories = [];
+    }
+    const sha = commandSha256(request.command);
     const base = {
       hermesRunId: request.runId,
       requestId: request.requestId,
       tier: classification.tier,
       reasons: classification.reasons,
+      categories: classification.categories,
+      commandSha256: sha,
+      commandComplete,
       command,
       description,
     };
@@ -257,14 +251,22 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
       { ...base, route, ...(route === "supervisor" ? { supervisorAgentId } : {}) },
     );
 
+    const timeoutMs = effectiveBoardTimeoutMs(input.config.boardTimeoutMs, input.runDeadlineAt);
+    if (route === "board" && timeoutMs < input.config.boardTimeoutMs) {
+      await emit(
+        "adapter.approval.timeout_capped",
+        "warn",
+        `request ${request.requestId}: board wait capped to ${Math.floor(timeoutMs / 1000)}s by the run timeout (approvalBoardTimeoutSec is ${Math.floor(input.config.boardTimeoutMs / 1000)}s); raise timeoutSec to wait longer`,
+        { ...base, effectiveTimeoutMs: timeoutMs, configuredTimeoutMs: input.config.boardTimeoutMs },
+      );
+    }
+
     let decision: AdapterApprovalDecision;
     if (!input.config.enabled) {
       decision = { decision: "unavailable", decidedBy: "system", note: "Approval routing is disabled in adapterConfig.approvalRouting." };
     } else if (!input.ctx.onApprovalRequest) {
       decision = { decision: "unavailable", decidedBy: "system", note: "This Paperclip host cannot route approval requests." };
     } else {
-      const remaining = input.runDeadlineAt === null ? Number.POSITIVE_INFINITY : input.runDeadlineAt - Date.now() - RUN_DEADLINE_RESERVE_MS;
-      const timeoutMs = Math.max(0, Math.min(input.config.boardTimeoutMs, remaining));
       try {
         decision = await input.ctx.onApprovalRequest({
           requestId: request.requestId,
@@ -272,7 +274,10 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
           tier: classification.tier,
           route,
           supervisorAgentId: route === "supervisor" ? supervisorAgentId : null,
+          categories: classification.categories,
           command,
+          commandSha256: sha,
+          commandComplete,
           description,
           reasons: classification.reasons,
           timeoutMs,
@@ -287,9 +292,17 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
       }
     }
 
-    if (input.signal.aborted && decision.decision !== "approved" && decision.decision !== "denied") {
-      await emit("adapter.approval.abandoned", "warn", `request ${request.requestId} abandoned: run ended before a decision`, { ...base, decision: decision.decision });
-      return;
+    // An approval must be for this exact request and command.
+    if (decision.decision === "approved" && (decision.requestId !== request.requestId || decision.commandSha256 !== sha)) {
+      decision = { decision: "denied", decidedBy: "system", note: "The approval did not match this request id and command hash." };
+    }
+
+    if (input.signal.aborted && decision.decision !== "approved") {
+      if (input.signal.reason === PROVIDER_RUN_ENDED) {
+        await emit("adapter.approval.abandoned", "warn", `request ${request.requestId} abandoned: the Hermes run ended before a decision`, { ...base, decision: decision.decision });
+        return;
+      }
+      decision = { decision: "cancelled", decidedBy: "system", note: "The Paperclip run was cancelled or timed out before a decision." };
     }
 
     const choice = decision.decision === "approved" ? "once" : "deny";
@@ -304,11 +317,11 @@ export function createApprovalRouter(input: ApprovalRouterInput): ApprovalRouter
     };
     const summary =
       decision.decision === "approved" && decision.decidedBy === "supervisor_policy"
-        ? "approved under delegated supervisor policy"
+        ? `approved under delegated supervisor policy (${classification.categories.join("+")})`
         : decision.decision === "approved"
           ? "approved by the board"
           : decision.decision === "denied"
-            ? "denied by the board"
+            ? `denied${decision.decidedBy === "board" ? " by the board" : `: ${decision.note ?? "denied"}`}`
             : decision.decision === "timeout"
               ? "denied: no board decision before the approval timeout"
               : `denied: ${decision.note ?? decision.decision}`;

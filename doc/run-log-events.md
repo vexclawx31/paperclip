@@ -236,18 +236,22 @@ The `hermes_gateway` adapter writes these events while it answers Hermes
 `approval.request` events (see `packages/adapters/hermes/README.md`):
 
 - `adapter.approval.requested`: the request id, Hermes run id, tier (`red` or
-  `yellow`), classifier reasons, route (`board` or `supervisor`) and the
+  `yellow`), classifier reasons, matched safe categories, route (`board` or
+  `supervisor`), the command's SHA-256 and whether it is shown in full, and the
   redacted command and description.
 - `adapter.approval.resolved`: the decision, who decided it (`board`,
   `supervisor_policy` or `system`), the approval id when one was created, and
   the choice sent to Hermes (`once` or `deny`).
 - `adapter.approval.answer_failed`: Hermes did not accept the answer, for
   example because its own `approvals.timeout` elapsed first.
-- `adapter.approval.abandoned`: the run ended before any decision.
+- `adapter.approval.timeout_capped`: the board wait was shortened to fit the
+  run's `timeoutSec`.
+- `adapter.approval.abandoned`: the Hermes run ended before any decision.
 
 The matching activity entries are `approval.created`,
-`adapter_approval.board_resolved`, `adapter_approval.supervisor_approved`,
-`adapter_approval.timed_out` and `adapter_approval.abandoned`.
+`adapter_approval.board_resolved`, `adapter_approval.supervisor_approved`
+(with the safe category), `adapter_approval.timed_out`,
+`adapter_approval.abandoned` and `adapter_approval.hash_mismatch`.
 
 ## Related instrumentation
 

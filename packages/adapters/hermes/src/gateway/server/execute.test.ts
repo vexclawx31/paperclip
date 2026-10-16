@@ -1096,7 +1096,13 @@ describe("approval routing", () => {
     const { approvalPosts } = approvalHarness();
     const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30, pollIntervalMs: 250 });
     const onEvent = vi.fn(async () => undefined);
-    const onApprovalRequest = vi.fn(async () => ({ decision: "approved" as const, decidedBy: "board" as const, approvalId: "appr-1" }));
+    const onApprovalRequest = vi.fn(async (request: AdapterApprovalRequest) => ({
+      decision: "approved" as const,
+      decidedBy: "board" as const,
+      approvalId: "appr-1",
+      requestId: request.requestId,
+      commandSha256: request.commandSha256,
+    }));
     ctx.onEvent = onEvent;
     ctx.onApprovalRequest = onApprovalRequest;
 
@@ -1111,6 +1117,33 @@ describe("approval routing", () => {
     expect(approvalPosts).toEqual([{ choice: "once", request_id: "req-1" }]);
     const eventTypes = (onEvent.mock.calls as unknown as Array<[{ eventType: string }]>).map(([event]) => event.eventType);
     expect(eventTypes).toEqual(expect.arrayContaining(["adapter.approval.requested", "adapter.approval.resolved"]));
+    // The per-event stream log line carries the frame, but never the raw token.
+    const logged = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls.map((call) => String(call[1])).join("");
+    expect(logged).toContain("event=approval.request");
+    expect(logged).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123");
+  });
+
+  it("denies a pending approval and stops the run when the Paperclip run is cancelled", async () => {
+    const { approvalPosts } = approvalHarness();
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30 });
+    const runAbort = new AbortController();
+    ctx.signal = runAbort.signal;
+    const onCancellationReady = vi.fn(async () => undefined);
+    ctx.onCancellationReady = onCancellationReady;
+    ctx.onApprovalRequest = vi.fn((request: AdapterApprovalRequest) => {
+      setTimeout(() => runAbort.abort(), 5);
+      return new Promise<AdapterApprovalDecision>((resolve) => {
+        request.signal.addEventListener("abort", () => resolve({ decision: "cancelled", decidedBy: "system" }));
+      });
+    });
+
+    const result = await execute(ctx);
+
+    expect(onCancellationReady).toHaveBeenCalledTimes(1);
+    expect(result.errorCode).toBe("hermes_gateway_cancelled");
+    expect(approvalPosts).toEqual([{ choice: "deny", request_id: "req-1" }]);
+    const urls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((call) => String(call[0]));
+    expect(urls.findIndex((url) => url.endsWith("/approval"))).toBeLessThan(urls.findIndex((url) => url.endsWith("/stop")));
   });
 
   it("denies a board timeout with the deny choice", async () => {
@@ -1130,7 +1163,7 @@ describe("approval routing", () => {
   it("picks up a pending approval from the status poll when the stream misses it", async () => {
     const { approvalPosts } = approvalHarness({ statusApproval: true });
     const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30, pollIntervalMs: 250 });
-    const onApprovalRequest = vi.fn(async () => ({ decision: "denied" as const, decidedBy: "board" as const }));
+    const onApprovalRequest = vi.fn(async (_request: AdapterApprovalRequest) => ({ decision: "denied" as const, decidedBy: "board" as const }));
     ctx.onApprovalRequest = onApprovalRequest;
 
     await execute(ctx);

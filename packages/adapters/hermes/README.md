@@ -164,45 +164,78 @@ When Hermes escalates a flagged command to a human, it emits an
 `approval.request` event (also visible as `approval` on a
 `waiting_for_approval` run status) and blocks the agent until
 `POST /v1/runs/{run_id}/approval` answers it with `{ "choice", "request_id" }`.
-The adapter answers every such request:
+The adapter answers every such request.
 
-1. It classifies the request with a conservative, deterministic classifier
-   over the command, description and Hermes pattern keys. Red covers
-   credentials and secrets, service control and deploys, `sudo`, remote code
-   piped to a shell, money, external messages, force-pushing or deleting
-   `main`/`master`, destructive SQL, `rm -r`/`rm -f` outside the working
-   directory or `/tmp`, cross-tenant wording and disabling safety controls.
-   An empty command, a request Hermes' guardian denied, or a request carrying
-   an already-redacted secret is also red. Anything else is yellow.
-2. Red requests, and yellow requests when no supervisor is configured, become
-   a `request_board_approval` approval linked to the run's issue. It appears in
-   the board's attention inbox with Approve / Reject. The adapter waits for the
-   decision.
-3. Yellow requests go to `approvalSupervisorAgentId` when it names an active
-   agent in the same company that is not the running agent. Paperclip approves
-   them "under delegated supervisor policy" without a model call, and records
-   an activity entry.
-4. Approval answers Hermes with `once` (never `session` or `always`). A
-   rejection, a timeout, a disabled router or a host without approval support
-   answers `deny`. If the run ends first, the pending approval is cancelled.
+**Classification fails safe.** A request is yellow (delegable) only when the
+whole command parses and every part of it matches a known-safe category:
+
+- `git`: local git operations and pushes. Force-pushes to `main`, `master` or
+  an unnamed branch, remote branch deletion, `git -c` and unknown subcommands
+  are red.
+- `package_install`: `pnpm`/`npm`/`yarn`/`bun` installs into the workspace
+  (no `-g`, no `file:`/URL sources, no custom registry), `uv`, `poetry`,
+  `cargo fetch`/`add`, `go mod`, `pip install -r`/`-e`.
+- `test_build_lint`: test, build, lint, typecheck and format scripts, and
+  known tools (`vitest`, `jest`, `tsc`, `eslint`, `prettier`, `pytest`,
+  `cargo test`, `go test`, `make test`, ...).
+- `workspace_files`: reads, writes and deletes whose paths resolve inside a
+  safe root (`/tmp`, `/private/tmp` and `approvalScratchRoots`).
+
+The parser strips leading backslashes and `command`/`builtin`/`env`, and
+tracks every `cd`. Hermes does not report the shell's working directory and
+keeps it between tool calls, so a relative path is inside a safe root only
+after the same command `cd`s into one. Everything else is red: `$`/backtick
+expansion, subshells, heredocs, background jobs, `sh -c`, `eval`, `xargs`,
+`base64 -d`, inline interpreter code (`python -c`, `node -e`), `find -delete`
+or `-exec`, unknown programs, and anything that does not parse. Vetoes for
+credentials, service control and deploys, money, external messages,
+destructive SQL and disabling safety controls, a Hermes guardian denial, or a
+redacted or truncated command also make a request red.
+
+**Routing.**
+
+1. Yellow requests go to `approvalSupervisorAgentId` when it names an idle or
+   running agent in the same company that is not the running agent, and the
+   command is shown in full. Paperclip approves them "under delegated
+   supervisor policy" without a model call. The activity entry names the safe
+   category.
+2. Everything else becomes a `request_board_approval` approval, linked to the
+   run's issue, in the board's attention inbox with Approve / Reject. The
+   approval stores the command's SHA-256. If the displayed command is
+   redacted or truncated, the approval says so ("full command not shown").
+   An approval is used only when it echoes the same `request_id` and hash.
+3. Approval answers Hermes with `once` (never `session` or `always`). A
+   rejection, a revision request, a timeout, a disabled router, a host without
+   approval support or a cancelled Paperclip run answers `deny`. Every exit
+   without an approve or reject decision cancels the approval record.
+
+`approvalSupervisorAgentId` is board-only. The server rejects an agent
+caller that sets or changes it on agent create, hire, update or rollback
+(403). Removing it is allowed, because that only sends more requests to the
+board.
 
 Every step writes `adapter.approval.*` run-log events and activity entries.
-Commands are redacted before they are logged or stored.
+Commands are redacted before they are logged or stored, including in the
+per-event stream log line.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `approvalRouting` | `true` | `false` denies every request immediately. |
-| `approvalSupervisorAgentId` | unset | Agent whose delegated policy approves yellow requests. |
-| `approvalBoardTimeoutSec` | `900` | How long to wait for a board decision before denying (10 s to 24 h). |
+| `approvalSupervisorAgentId` | unset | Board-only. Agent whose delegated policy approves known-safe requests. |
+| `approvalBoardTimeoutSec` | `540` | How long to wait for a board decision before denying (10 s to 24 h). |
+| `approvalScratchRoots` | unset | Extra absolute safe roots, comma-separated, added to `/tmp` and `/private/tmp`. |
 
-The board wait is also capped by the run's own `timeoutSec` (less a 15 second
-reserve), so set `timeoutSec` above `approvalBoardTimeoutSec`.
+The effective board wait is `min(approvalBoardTimeoutSec, remaining
+timeoutSec - 15 s)`. The default of 540 s fits inside the default
+`timeoutSec` of 600 s. When the wait is capped, the run log gets an
+`adapter.approval.timeout_capped` warning. To wait longer, raise both
+values together.
 
 Hermes has its own timeout, which must be raised separately in the Hermes
-profile: `approvals.timeout` (seconds) must be at least
-`approvalBoardTimeoutSec`. Otherwise Hermes denies the command first, and the
-late answer from Paperclip fails with `approval_not_pending`; the adapter logs
-this as `adapter.approval.answer_failed`.
+profile: `approvals.timeout` (seconds, default 300 in current releases) must
+be at least `approvalBoardTimeoutSec`. Otherwise Hermes denies the command
+first, and the late answer from Paperclip fails with `approval_not_pending`;
+the adapter logs this as `adapter.approval.answer_failed`.
 
 ### Compatibility with the old gateway package
 

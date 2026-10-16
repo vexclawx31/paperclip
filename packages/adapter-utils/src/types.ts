@@ -210,7 +210,14 @@ export interface AdapterApprovalRequest {
   /** "supervisor" asks the host to apply the delegated supervisor policy. */
   route: "board" | "supervisor";
   supervisorAgentId?: string | null;
+  /** Known-safe categories the whole command matched; empty unless yellow. */
+  categories: string[];
+  /** Display copy; may differ from the provider command when redacted. */
   command: string;
+  /** SHA-256 (hex) of the exact command text the provider sent. */
+  commandSha256: string;
+  /** False when `command` is redacted or truncated relative to the provider text. */
+  commandComplete: boolean;
   description: string;
   /** Classifier rule ids that produced the tier. */
   reasons: string[];
@@ -226,6 +233,9 @@ export interface AdapterApprovalDecision {
   approvalId?: string | null;
   supervisorAgentId?: string | null;
   note?: string | null;
+  /** Echo of the decided request; an approval without a matching echo is treated as a denial. */
+  requestId?: string | null;
+  commandSha256?: string | null;
 }
 
 export interface AdapterExecutionContext {
