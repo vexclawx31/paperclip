@@ -14,6 +14,20 @@ function app() { const app = express(); app.use(idleAdmissionMiddleware); return
 afterEach(() => stopTaskDrain());
 
 describe("idle admission", () => {
+  it("tracks a mounted Connect-style app (Vite dev middleware) as one handler", async () => {
+    const server = app();
+    // Shape of a Connect app: a function with a `stack` of layers whose
+    // `route` is a string, and a string `route` of its own.
+    const connectApp = Object.assign(
+      (_req: unknown, res: { status(code: number): { end(): void } }) => { res.status(204).end(); },
+      { route: "/", stack: [{ route: "/__open-in-editor", handle: () => {} }] },
+    );
+    server.use(connectApp as unknown as express.RequestHandler);
+    expect(() => trackIdleRequestHandlers(server)).not.toThrow();
+    await request(server).get("/anything").expect(204);
+    expect(idleWorkSnapshot().active).toBe(0);
+  });
+
   it("preserves legacy drains, but blocks all new work during an owned idle hold", async () => {
     const server = app();
     server.all("/{*path}", (_req, res) => res.sendStatus(204));

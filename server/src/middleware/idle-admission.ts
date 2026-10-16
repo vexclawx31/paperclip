@@ -53,15 +53,22 @@ export const idleAdmissionMiddleware: RequestHandler = (req, res, next) => {
 // preserving router objects and error-handler arity. Waiting only for finish
 // loses async work after res.json(), including the disconnected-client case.
 // Keep this adapter isolated and exercise it against real Express in tests.
-type Layer = { handle: Function & { stack?: Layer[] }; route?: { stack: Layer[] } };
+// Only Express routes and routers are walked. A mounted Connect app (Vite dev
+// middleware) also has a `stack`, but its layers carry a string `route`; it is
+// wrapped as one handler instead.
+type Layer = { handle: Function & { stack?: unknown; route?: unknown }; route?: unknown };
+const isExpressRoute = (route: unknown): route is { stack: Layer[] } =>
+  typeof route === "object" && route !== null && Array.isArray((route as { stack?: unknown }).stack);
+const isExpressRouter = (handle: Layer["handle"]): handle is Layer["handle"] & { stack: Layer[] } =>
+  Array.isArray(handle.stack) && typeof handle.route === "function";
 export function trackIdleRequestHandlers(app: Application): void {
   const seen = new Set<Layer>();
   const visit = (stack: Layer[], route = false) => {
     for (const layer of stack) {
       if (seen.has(layer)) continue;
       seen.add(layer);
-      if (layer.route) { visit(layer.route.stack, true); continue; }
-      if (layer.handle.stack) { visit(layer.handle.stack); continue; }
+      if (isExpressRoute(layer.route)) { visit(layer.route.stack, true); continue; }
+      if (isExpressRouter(layer.handle)) { visit(layer.handle.stack); continue; }
       const original = layer.handle;
       if (original === idleAdmissionMiddleware) continue;
       const invoke = (req: Request, args: unknown[]) => {
