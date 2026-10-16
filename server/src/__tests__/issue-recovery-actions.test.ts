@@ -1806,6 +1806,28 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(recorded);
   });
 
+  it("clears a legacy reconciliation hold left by a cancelled run with the board's Reconcile and continue payload", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "cancelled" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: coderId, cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+      nextAction: "Automatic recovery stopped.",
+      evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const resolved = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({
+      actionId: action!.id, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "mixed",
+        outcomeEvidence: "Checked the run log: the first file write landed, the second did not." },
+    }).expect(200);
+    expect(resolved.body.issue.status).toBe("todo");
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    expect(recorded!.evidence).not.toHaveProperty("automaticRecovery");
+    expect(recorded!.evidence).toMatchObject({ executionReconciliation: { runId, actionOutcome: "mixed" }, continuationDelivery: "pending" });
+  });
+
   async function seedReconciledDelivery() {
     const fixture = await seedCompany();
     const { companyId, coderId, sourceIssueId } = fixture;
