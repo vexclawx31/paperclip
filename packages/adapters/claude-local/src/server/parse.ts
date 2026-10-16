@@ -203,24 +203,31 @@ function claudeResultIndicatesAuthFailure(parsed: Record<string, unknown>): bool
   return extractClaudeErrorMessages(parsed).length > 0;
 }
 
-const TRANSCRIPT_EVENT_TYPES = new Set(["assistant", "user", "stream_event", "tool_use", "tool_result"]);
-
-// Drop stream-json transcript events from raw stdout. Their content is model
-// and tool text, not Claude CLI status, so it must not drive auth classification.
-function nonTranscriptStdout(stdout: string): string {
-  return stdout
-    .split(/\r?\n/)
-    .filter((line) => {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("{")) return true;
-      try {
-        const event = JSON.parse(trimmed) as { type?: unknown };
-        return !(typeof event.type === "string" && TRANSCRIPT_EVENT_TYPES.has(event.type));
-      } catch {
-        return true;
-      }
-    })
-    .join("\n");
+// Login-prompt markers are matched against Claude CLI status output only
+// (allowlist): non-JSON stdout lines, and the CLI's own synthetic auth-error
+// assistant event (`error: "authentication_failed"` and similar). All other
+// stream-json events (result, system, assistant, user, tool results, future
+// types) carry model, tool or workspace text and are ignored here.
+function loginPromptStdoutLines(stdout: string): string[] {
+  const lines: string[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (!trimmed.startsWith("{")) {
+      lines.push(trimmed);
+      continue;
+    }
+    const event = parseJson(trimmed);
+    if (!event) {
+      lines.push(trimmed);
+      continue;
+    }
+    const error = asString(event.error, "").trim().toLowerCase();
+    if (event.type === "assistant" && (error.includes("auth") || error.includes("login"))) {
+      lines.push(...extractClaudeErrorMessages(event), JSON.stringify(event.message ?? ""));
+    }
+  }
+  return lines;
 }
 
 export function detectClaudeLoginRequired(input: {
@@ -239,8 +246,8 @@ export function detectClaudeLoginRequired(input: {
   const runFailed = parsed === null || claudeResultIndicatesAuthFailure(parsed);
   const promptLines = [
     runFailed ? resultText : "",
-    ...(runFailed ? extractClaudeErrorMessages(parsed ?? {}) : []),
-    nonTranscriptStdout(input.stdout),
+    ...extractClaudeErrorMessages(parsed ?? {}),
+    ...loginPromptStdoutLines(input.stdout),
     input.stderr,
   ]
     .join("\n")
@@ -259,7 +266,7 @@ export function detectClaudeLoginRequired(input: {
 
   return {
     requiresLogin: loginPrompt || tokenFailure,
-    loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
+    loginUrl: extractClaudeLoginUrl([...loginPromptStdoutLines(input.stdout), input.stderr].join("\n")),
   };
 }
 
