@@ -1700,7 +1700,19 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(expired).toHaveLength(1);
     const rows = await db.select().from(issueThreadInteractions);
     expect(rows).toHaveLength(1);
-    expect(rows[0]?.status).not.toBe("pending");
+    expect(rows[0]?.status).toBe("expired");
+    expect(rows[0]?.result).toMatchObject({ version: 1, expirationReason: "superseded_by_comment" });
+  });
+
+  it("does not default a restricted-resolver question to supersede on a board comment", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Restricted question");
+    await interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "ask_user_questions",
+      resolverPolicy: "not_creator",
+      payload: { version: 1, questions: [{ id: "scope", prompt: "Choose", selectionMode: "single", options: [{ id: "a", label: "A" }] }] },
+    }, { userId: "local-board" });
+    const [created] = await db.select().from(issueThreadInteractions);
+    expect(created?.payload).toMatchObject({ supersedeOnUserComment: false });
   });
 
   it("keeps ask_user_questions pending when its creator opts out of supersede", async () => {
