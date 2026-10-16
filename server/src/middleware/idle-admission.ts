@@ -1,4 +1,5 @@
 import { markIdleIngressTracked } from "../services/idle-local-work.js";
+import express from "express";
 import type { Application, Request, RequestHandler } from "express";
 import { beginIdleTrackedWork, isIdleTaskDrainActive } from "../services/task-admission.js";
 
@@ -53,17 +54,24 @@ export const idleAdmissionMiddleware: RequestHandler = (req, res, next) => {
 // preserving router objects and error-handler arity. Waiting only for finish
 // loses async work after res.json(), including the disconnected-client case.
 // Keep this adapter isolated and exercise it against real Express in tests.
-type Layer = { handle: Function & { stack?: Layer[] }; route?: { stack: Layer[] } };
+// Only this Express's own Route and Router objects are walked. Anything else
+// with a `stack`, such as a mounted Connect app (Vite dev middleware, whose
+// layers carry a string `route`), is wrapped as one opaque handler.
+type Layer = { handle: Function & { stack?: unknown }; route?: unknown };
+// Express 5 exports Route at runtime, but @types/express does not declare it.
+const ExpressRoute = (express as unknown as { Route: abstract new (...args: never[]) => unknown }).Route;
+const isExpressRoute = (route: unknown): route is { stack: Layer[] } => route instanceof ExpressRoute;
+const isExpressRouter = (handle: unknown): handle is { stack: Layer[] } => handle instanceof express.Router;
 export function trackIdleRequestHandlers(app: Application): void {
   const seen = new Set<Layer>();
   const visit = (stack: Layer[], route = false) => {
     for (const layer of stack) {
       if (seen.has(layer)) continue;
       seen.add(layer);
-      if (layer.route) { visit(layer.route.stack, true); continue; }
-      if (layer.handle.stack) { visit(layer.handle.stack); continue; }
+      if (isExpressRoute(layer.route)) { visit(layer.route.stack, true); continue; }
+      if (isExpressRouter(layer.handle)) { visit(layer.handle.stack); continue; }
       const original = layer.handle;
-      if (original === idleAdmissionMiddleware) continue;
+      if (typeof original !== "function" || original === idleAdmissionMiddleware) continue;
       const invoke = (req: Request, args: unknown[]) => {
         const work = requests.get(req);
         if (!work) return original(...args);

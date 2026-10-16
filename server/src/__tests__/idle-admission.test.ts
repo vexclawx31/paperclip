@@ -14,6 +14,27 @@ function app() { const app = express(); app.use(idleAdmissionMiddleware); return
 afterEach(() => stopTaskDrain());
 
 describe("idle admission", () => {
+  it("tracks a mounted Connect-style app (Vite dev middleware) as one handler", async () => {
+    const server = app();
+    const gate = deferred();
+    // Shape of a Connect app: a function carrying `handle`/`use`, a string
+    // `route`, and a `stack` of layers whose `route` is a string.
+    const connectApp = Object.assign(
+      async (_req: unknown, res: { status(code: number): { end(): void } }) => { await gate.promise; res.status(204).end(); },
+      { route: "/", handle() {}, use() {}, stack: [{ route: "/__open-in-editor", handle: () => {} }] },
+    );
+    server.use(connectApp as unknown as express.RequestHandler);
+    expect(() => trackIdleRequestHandlers(server)).not.toThrow();
+    const connectLayer = (server.router.stack as Array<{ handle: unknown }>).at(-1)!;
+    expect(connectLayer.handle).not.toBe(connectApp);
+    const pending = request(server).get("/anything").then((res) => res.status);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(idleWorkSnapshot().active).toBeGreaterThan(0);
+    gate.resolve();
+    expect(await pending).toBe(204);
+    expect(idleWorkSnapshot().active).toBe(0);
+  });
+
   it("preserves legacy drains, but blocks all new work during an owned idle hold", async () => {
     const server = app();
     server.all("/{*path}", (_req, res) => res.sendStatus(204));
