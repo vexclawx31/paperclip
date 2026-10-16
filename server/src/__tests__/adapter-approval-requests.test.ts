@@ -17,7 +17,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { createHash } from "node:crypto";
-import { createAdapterApprovalRequestHandler } from "../services/adapter-approval-requests.js";
+import { createAdapterApprovalRequestHandler, formatWait } from "../services/adapter-approval-requests.js";
 import { logActivity } from "../services/activity-log.js";
 import { approvalService } from "../services/approvals.js";
 
@@ -278,5 +278,14 @@ describeEmbeddedPostgres("adapter approval request handler", () => {
     expect(await db.select().from(approvals).where(eq(approvals.companyId, seeded.companyId))).toHaveLength(1);
     await expect(handler(request({ command: "launchctl remove ai.paperclip", timeoutMs: 30 })))
       .resolves.toMatchObject({ decision: "denied", decidedBy: "system" });
+  });
+});
+
+describe("formatWait", () => {
+  it("shows whole minutes, or seconds under two minutes", () => {
+    expect(formatWait(270_000)).toBe("4 minutes");
+    expect(formatWait(179_999)).toBe("2 minutes");
+    expect(formatWait(119_999)).toBe("119 seconds");
+    expect(formatWait(1_000)).toBe("1 second");
   });
 });

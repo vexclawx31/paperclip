@@ -30,6 +30,15 @@ export const ADAPTER_APPROVAL_SOURCE = "adapter_approval_request";
 const DEFAULT_FALLBACK_POLL_MS = 15_000;
 const INCOMPLETE_NOTE = "This command contains redacted/truncated content; full command not shown.";
 
+/** Whole minutes, or seconds when the wait is under two minutes. */
+export function formatWait(ms: number): string {
+  if (ms < 120_000) {
+    const seconds = Math.max(0, Math.floor(ms / 1000));
+    return `${seconds} second${seconds === 1 ? "" : "s"}`;
+  }
+  return `${Math.floor(ms / 60_000)} minutes`;
+}
+
 export type AdapterApprovalRequestHandlerDeps = {
   db: Db;
   companyId: string;
@@ -98,7 +107,6 @@ export function createAdapterApprovalRequestHandler(deps: AdapterApprovalRequest
   }
 
   async function createBoardApproval(request: AdapterApprovalRequest) {
-    const timeoutMinutes = Math.max(1, Math.round(request.timeoutMs / 60_000));
     const agentLabel = deps.agentName?.trim() || "An agent";
     const created = await approvalsSvc.create(companyId, {
       type: "request_board_approval",
@@ -110,7 +118,7 @@ export function createAdapterApprovalRequestHandler(deps: AdapterApprovalRequest
       payload: {
         title: "Approve agent command",
         summary: `${agentLabel} asked to run a command that its runtime flagged for human approval: ${request.description || "no description"}.`,
-        recommendedAction: `Approve only if this exact command is intended. The run waits up to ${timeoutMinutes} minute(s); after that the command is denied.`,
+        recommendedAction: `Approve only if this exact command is intended. The run waits up to ${formatWait(request.timeoutMs)}; after that the command is denied.`,
         risks: [
           ...(request.commandComplete ? [] : [INCOMPLETE_NOTE]),
           "Approval applies to this single command only (choice \"once\").",
@@ -257,8 +265,24 @@ export function createAdapterApprovalRequestHandler(deps: AdapterApprovalRequest
         settled = true;
         return { decision: "cancelled", decidedBy: "system", approvalId: approval.id, note: decisionNote ?? null };
       }
-      // revision_requested (or anything unexpected): deny; finally closes it.
-      return { decision: "denied", decidedBy: "board", approvalId: approval.id, note: decisionNote ?? "The board requested a revision; the command was denied." };
+      // revision_requested (or anything unexpected): close the record before
+      // returning the denial, then re-read in case the board approved meanwhile.
+      const revisionNote = decisionNote ?? "The board requested a revision; the command was denied.";
+      await approvalsSvc.cancel(approval.id, "Closed: the board requested a revision; agents cannot revise a runtime command.");
+      const after = await approvalsSvc.getById(approval.id);
+      settled = true;
+      if (after?.status === "approved") {
+        const note = "Approved after a revision was requested; the command was denied and did not run.";
+        await closeApproved(approval.id, note);
+        await log("adapter_approval.approved_too_late", "approval", approval.id, { ...auditBase(request), after: "revision_requested" });
+        return { decision: "denied", decidedBy: "board", approvalId: approval.id, note };
+      }
+      await log("adapter_approval.board_resolved", "approval", approval.id, {
+        ...auditBase(request),
+        approvalStatus: "revision_requested",
+        decision: "denied",
+      });
+      return { decision: "denied", decidedBy: "board", approvalId: approval.id, note: revisionNote };
     } finally {
       if (!settled) {
         // Close the record on every other exit path, including thrown errors.
