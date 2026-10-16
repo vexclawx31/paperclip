@@ -7216,6 +7216,40 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect((await heartbeat.getRun(updated!.runId!))!.contextSnapshot?.wakeCommentIds).toEqual([comment!.id]);
   });
 
+  it("hands an operator-delivery interrupt to the next turn without a no-replay hold on a process adapter", async () => {
+    const actualProcess = await vi.importActual<typeof import("../adapters/process/execute.js")>("../adapters/process/execute.js");
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      runtimeMode: "legacy", adapterType: "process", agentStatus: "idle", runStatus: "queued",
+    });
+    await db.update(agents).set({ adapterConfig: {
+      command: process.execPath, args: ["-e", "console.log('ready');setInterval(() => {}, 1000)"], graceSec: 1,
+    } }).where(eq(agents.id, agentId));
+    mockAdapterExecute.mockImplementationOnce((async (input: unknown) =>
+      actualProcess.execute(input as Parameters<typeof actualProcess.execute>[0])) as typeof mockAdapterExecute);
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    expect(await waitForValue(async () => runningProcesses.get(runId))).toBeTruthy();
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "responsible-user", body: "here is my answer" }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId, agentId, source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId, commentId: comment!.id, _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [comment!.id] } },
+    }).returning();
+    await heartbeat.cancelRun(runId, "Interrupted to send queued messages", {
+      errorCode: "operator_interrupted", suppressImmediateRecovery: true,
+      resultJson: { operatorInterrupted: true, interruptionSource: "issue_comment_interrupt", queuedCommentInterruptQueueId: wake!.id },
+    });
+    await heartbeat.drainActiveRunExecutions();
+    expect(await heartbeat.getRun(runId)).toMatchObject({ status: "cancelled", errorCode: "operator_interrupted" });
+    expect(await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, issueId),
+      eq(issueRecoveryActions.cause, "legacy_execution_requires_reconciliation")))).toEqual([]);
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    const [updated] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id));
+    expect(updated!.runId).toBeTruthy();
+    expect(updated!.runId).not.toBe(runId);
+    expect((await heartbeat.getRun(updated!.runId!))!.contextSnapshot?.wakeCommentIds).toEqual([comment!.id]);
+  });
+
   it("retries durable queue interruption after a promotion failure on a fresh service", async () => {
     const { companyId, agentId, issueId, runId } = await seedRunFixture({
       runtimeMode: "legacy", adapterType: "codex_local", agentStatus: "idle", runStatus: "cancelled",
