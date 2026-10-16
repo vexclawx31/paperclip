@@ -855,11 +855,13 @@ function normalizeCreateInteractionInput(
 ): CreateIssueThreadInteraction {
   switch (input.kind) {
     case "ask_user_questions":
+      // An ordinary question is superseded by the operator's newer comment
+      // unless its creator explicitly keeps it open for discussion (false).
       return {
         ...input,
         payload: {
           ...input.payload,
-          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? false,
+          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? true,
         },
       };
     case "request_confirmation":
