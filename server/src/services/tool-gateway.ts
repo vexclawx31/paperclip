@@ -1,3 +1,4 @@
+import { enqueueIssueChildInteractionAttentionWakeSafely } from "./issue-child-attention-wakeups.js";
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
 import { browserUseService } from "./browser-use.js";
 import { isBrowserUseConnection } from "./browser-use-client.js";
@@ -4255,7 +4256,7 @@ export function createToolGatewayService(
         .where(eq(issueThreadInteractions.id, existing.id));
       return;
     }
-    await db.insert(issueThreadInteractions).values({
+    const [inserted] = await db.insert(issueThreadInteractions).values({
       companyId: session.companyId,
       issueId: session.issueId,
       kind: "request_confirmation",
@@ -4278,7 +4279,21 @@ export function createToolGatewayService(
       createdByAgentId: session.agentId,
       addresseeUserId: userId,
       payload,
+    }).returning({
+      id: issueThreadInteractions.id,
+      kind: issueThreadInteractions.kind,
+      addresseeUserId: issueThreadInteractions.addresseeUserId,
+      effectiveResolverPolicy: issueThreadInteractions.effectiveResolverPolicy,
+      effectiveResolverPolicySource: issueThreadInteractions.effectiveResolverPolicySource,
     });
+    if (inserted) {
+      await enqueueIssueChildInteractionAttentionWakeSafely(db, {
+        companyId: session.companyId,
+        issueId: session.issueId,
+        interaction: inserted,
+        actor: { agentId: session.agentId },
+      });
+    }
   }
 
   async function resolveConnectionGrant(

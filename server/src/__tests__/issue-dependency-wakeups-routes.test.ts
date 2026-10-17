@@ -18,6 +18,7 @@ vi.setConfig({ testTimeout: 30000 });
 
 const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
 const mockFindExistingIssueBlockersResolvedWakeForReadyState = vi.hoisted(() => vi.fn(async () => null));
+const mockPlanIssueChildUpdateAttentionWakeup = vi.hoisted(() => vi.fn(async (): Promise<unknown> => null));
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
   getById: vi.fn(),
@@ -117,6 +118,16 @@ vi.mock("../services/issue-dependency-wakeups.js", async () => {
   };
 });
 
+vi.mock("../services/issue-child-attention-wakeups.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/issue-child-attention-wakeups.js")>(
+    "../services/issue-child-attention-wakeups.js",
+  );
+  return {
+    ...actual,
+    planIssueChildUpdateAttentionWakeup: mockPlanIssueChildUpdateAttentionWakeup,
+  };
+});
+
 async function createApp() {
   const emptyRows: unknown[] = [];
   const whereResult = {
@@ -181,6 +192,7 @@ describe("issue dependency wakeups in issue routes", () => {
     });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockPlanIssueChildUpdateAttentionWakeup.mockResolvedValue(null);
   });
 
   it("wakes dependents when the final blocker transitions to done", async () => {
@@ -680,5 +692,83 @@ describe("issue dependency wakeups in issue routes", () => {
     expect(res.status).toBe(200);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(mockWakeup).not.toHaveBeenCalled();
+  });
+  it("wakes the parent's lead with issue_child_needs_attention when a child moves to in_review", async () => {
+    mockIssueService.getById.mockResolvedValue(issueRecord({
+      id: "child-1",
+      identifier: "PAP-159",
+      status: "in_progress",
+      parentId: "parent-1",
+      assigneeAgentId: "agent-worker",
+    }));
+    mockIssueService.update.mockResolvedValue(issueRecord({
+      id: "child-1",
+      identifier: "PAP-159",
+      status: "in_review",
+      parentId: "parent-1",
+      assigneeAgentId: "agent-worker",
+    }));
+    const wakeup = {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_child_needs_attention",
+      payload: { issueId: "parent-1", childIssueId: "child-1", trigger: "status_changed", newStatus: "in_review" },
+      idempotencyKey: "issue_child_needs_attention:parent-1:child-1:status_changed:in_review",
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+      contextSnapshot: { issueId: "parent-1", wakeReason: "issue_child_needs_attention" },
+    };
+    mockPlanIssueChildUpdateAttentionWakeup.mockResolvedValue({
+      agentId: "agent-lead",
+      parentIssueId: "parent-1",
+      wakeup,
+    });
+
+    const res = await request(await createApp()).patch("/api/issues/child-1").send({ status: "in_review" });
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockPlanIssueChildUpdateAttentionWakeup).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          previous: expect.objectContaining({ id: "child-1", status: "in_progress" }),
+          next: expect.objectContaining({ id: "child-1", status: "in_review" }),
+          actor: expect.objectContaining({ actorType: "user" }),
+        }),
+      );
+      expect(mockWakeup).toHaveBeenCalledWith("agent-lead", wakeup);
+    });
+  });
+
+  it("keeps the issue_children_completed wake when the last child completes", async () => {
+    mockIssueService.getById.mockResolvedValue(issueRecord({
+      id: "child-1",
+      status: "in_progress",
+      parentId: "parent-1",
+    }));
+    mockIssueService.update.mockResolvedValue(issueRecord({
+      id: "child-1",
+      status: "done",
+      parentId: "parent-1",
+    }));
+    mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue({
+      id: "parent-1",
+      assigneeAgentId: "agent-lead",
+      childIssueIds: ["child-1"],
+      childIssueSummaries: [],
+      childIssueSummaryTruncated: false,
+    });
+
+    const res = await request(await createApp()).patch("/api/issues/child-1").send({ status: "done" });
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockWakeup).toHaveBeenCalledWith(
+        "agent-lead",
+        expect.objectContaining({ reason: "issue_children_completed" }),
+      );
+    });
+    expect(mockWakeup).not.toHaveBeenCalledWith(
+      "agent-lead",
+      expect.objectContaining({ reason: "issue_child_needs_attention" }),
+    );
   });
 });

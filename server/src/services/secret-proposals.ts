@@ -1,3 +1,4 @@
+import { enqueueIssueChildInteractionAttentionWakeSafely } from "./issue-child-attention-wakeups.js";
 import { withAgentAppearance } from "@paperclipai/shared";
 import { and, count, desc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -222,6 +223,12 @@ export function createSecretProposalsService(db: Db) {
         },
       })
       .returning();
+    await enqueueIssueChildInteractionAttentionWakeSafely(txDb, {
+      companyId: proposal.companyId,
+      issueId: proposal.originIssueId,
+      interaction,
+      actor: { agentId: proposal.proposedByAgentId },
+    });
 
     const [linked] = await txDb
       .update(companySecretProposals)

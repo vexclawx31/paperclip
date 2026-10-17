@@ -29,6 +29,11 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import {
+  insertIssueChildNeedsAttentionWakeIntent,
+  planIssueChildNeedsAttentionWake,
+  planIssueChildUpdateAttentionWakeup,
+} from "../services/issue-child-attention-wakeups.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -265,6 +270,248 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       expect.objectContaining({ status: "coalesced", runId: dispatchedRun!.id }),
     ]));
     expect(dispatchedRequests[0]).toMatchObject({ runId: dispatchedRun!.id });
+  });
+
+  it("dispatches a child needs-attention intent to the parent's lead with its own provenance", async () => {
+    const companyId = randomUUID();
+    const leadAgentId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Child attention",
+      issuePrefix: `A${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: leadAgentId,
+      companyId,
+      name: "Lead",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: parentId,
+      companyId,
+      title: "Lead task",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: leadAgentId,
+      responsibleUserId: "responsible-user",
+    });
+    await db.insert(issues).values({
+      id: childId,
+      companyId,
+      title: "Parked child",
+      status: "in_review",
+      priority: "medium",
+      parentId,
+    });
+    const context = {
+      issueId: parentId,
+      taskId: parentId,
+      childIssueId: childId,
+      trigger: "status_changed",
+      newStatus: "in_review",
+    };
+    const [intent] = await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: leadAgentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_child_needs_attention",
+      payload: {
+        ...context,
+        _paperclipWakeContext: {
+          ...context,
+          wakeReason: "issue_child_needs_attention",
+          source: "issue.child_needs_attention",
+        },
+      },
+      requestedByActorType: "system",
+      requestedByActorId: "issue-child-attention",
+      idempotencyKey: `issue_child_needs_attention:${parentId}:${childId}:status_changed:in_review`,
+    }).returning({ id: agentWakeupRequests.id });
+
+    const result = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    expect(result.dispatched).toBe(1);
+    await heartbeat.drainActiveRunExecutions();
+
+    const dispatchedRequests = await db.select().from(agentWakeupRequests).where(
+      sql`${agentWakeupRequests.requestedByActorId} = ${`issue-child-attention-dispatch:${intent!.id}`}`,
+    );
+    expect(dispatchedRequests).toHaveLength(1);
+    expect(dispatchedRequests[0]).toMatchObject({
+      reason: "issue_child_needs_attention",
+      idempotencyKey: `issue_child_needs_attention:${parentId}:${childId}:status_changed:in_review`,
+    });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    const run = runs.find((candidate) => candidate.id === dispatchedRequests[0]!.runId);
+    expect(run).toMatchObject({ agentId: leadAgentId, status: "succeeded" });
+    expect(run!.contextSnapshot).toMatchObject({
+      issueId: parentId,
+      wakeReason: "issue_child_needs_attention",
+      source: "issue.child_needs_attention",
+      childIssueId: childId,
+      trigger: "status_changed",
+    });
+    expect(run!.contextSnapshot).not.toHaveProperty("statusDecisionSource");
+    const [persistedIntent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent!.id));
+    expect(persistedIntent).toMatchObject({ status: "coalesced", runId: run!.id });
+  });
+
+  it.each(["route", "intent"] as const)(
+    "admits a child needs-attention wake for a parent blocked on that child as a bounded triage run (%s path)",
+    async (mode) => {
+      const companyId = randomUUID();
+      const leadAgentId = randomUUID();
+      const workerAgentId = randomUUID();
+      const parentId = randomUUID();
+      const childId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Blocked parent",
+        issuePrefix: `B${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      for (const [id, name] of [[leadAgentId, "Lead"], [workerAgentId, "Worker"]] as const) {
+        await db.insert(agents).values({
+          id,
+          companyId,
+          name,
+          role: "engineer",
+          status: "active",
+          adapterType: "codex_local",
+          adapterConfig: {},
+          runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+          permissions: {},
+        });
+      }
+      await db.insert(issues).values({
+        id: parentId,
+        companyId,
+        title: "Lead task",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: leadAgentId,
+        responsibleUserId: "responsible-user",
+      });
+      await db.insert(issues).values({
+        id: childId,
+        companyId,
+        title: "Delegated child",
+        status: "in_review",
+        priority: "medium",
+        parentId,
+        assigneeAgentId: workerAgentId,
+        responsibleUserId: "responsible-user",
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: childId,
+        relatedIssueId: parentId,
+        type: "blocks",
+      });
+
+      if (mode === "route") {
+        const planned = await planIssueChildUpdateAttentionWakeup(db, {
+          previous: { id: childId, companyId, parentId, status: "in_progress", assigneeAgentId: workerAgentId, assigneeUserId: null },
+          next: { id: childId, companyId, parentId, status: "in_review", assigneeAgentId: workerAgentId, assigneeUserId: null },
+          actor: { actorType: "agent", actorId: workerAgentId, agentId: workerAgentId },
+        });
+        expect(planned).not.toBeNull();
+        const run = await heartbeat.wakeup(planned!.agentId, planned!.wakeup);
+        expect(run).not.toBeNull();
+      } else {
+        const plan = await planIssueChildNeedsAttentionWake(db, {
+          companyId,
+          childIssueId: childId,
+          actor: { agentId: workerAgentId },
+          event: { trigger: "status_changed", status: "in_review", previousStatus: "in_progress" },
+        });
+        await insertIssueChildNeedsAttentionWakeIntent(db, plan!);
+        const result = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+        expect(result.dispatched).toBe(1);
+      }
+      await heartbeat.drainActiveRunExecutions();
+
+      const skipped = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "issue_dependencies_blocked"),
+      ));
+      expect(skipped).toHaveLength(0);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ agentId: leadAgentId, status: "succeeded" });
+      expect(runs[0]!.contextSnapshot).toMatchObject({
+        issueId: parentId,
+        wakeReason: "issue_child_needs_attention",
+        childIssueId: childId,
+        dependencyBlockedInteraction: true,
+        dependencyBlockedChildAttention: true,
+        unresolvedBlockerIssueIds: [childId],
+      });
+      // The parent stays blocked: the run is triage-only.
+      const [parent] = await db.select().from(issues).where(eq(issues.id, parentId));
+      expect(parent!.status).toBe("blocked");
+    },
+  );
+
+  it("still skips a needs-attention wake on a blocked parent for an unrelated issue", async () => {
+    const companyId = randomUUID();
+    const leadAgentId = randomUUID();
+    const parentId = randomUUID();
+    const blockerId = randomUUID();
+    const strangerId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Blocked parent unrelated",
+      issuePrefix: `U${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: leadAgentId,
+      companyId,
+      name: "Lead",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: parentId, companyId, title: "Lead task", status: "blocked", priority: "medium", assigneeAgentId: leadAgentId, responsibleUserId: "responsible-user" },
+      { id: blockerId, companyId, title: "Blocker", status: "in_progress", priority: "medium" },
+      { id: strangerId, companyId, title: "Unrelated", status: "in_review", priority: "medium" },
+    ]);
+    await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: parentId, type: "blocks" });
+
+    const run = await heartbeat.wakeup(leadAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_child_needs_attention",
+      payload: { issueId: parentId, childIssueId: strangerId },
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      contextSnapshot: {
+        issueId: parentId,
+        taskId: parentId,
+        childIssueId: strangerId,
+        wakeReason: "issue_child_needs_attention",
+        source: "issue.child_needs_attention",
+      },
+    });
+    expect(run).toBeNull();
+    const skipped = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.reason, "issue_dependencies_blocked"),
+    ));
+    expect(skipped).toHaveLength(1);
   });
 
   it.each(["onboarding", "ordinary", "cancelled"])("dispatches only a verified completed onboarding report: %s", async kind => {

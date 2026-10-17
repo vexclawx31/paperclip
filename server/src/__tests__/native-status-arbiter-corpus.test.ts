@@ -2861,4 +2861,49 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     expect(persistedIssue).toMatchObject({ status: decision.toStatus, statusVersion: 0, lastStatusDecisionId: null });
     expect(coordinator).toMatchObject({ phase: "assessing", decisionId: null });
   });
+  // Runs last: it adds a lead agent to the shared corpus company.
+  it("wakes the parent's lead when a native decision parks a child in review", async () => {
+    const leadAgentId = randomUUID();
+    const parentId = randomUUID();
+    await db.insert(agents).values({
+      id: leadAgentId, companyId, name: "Corpus lead", adapterType: "codex_local", status: "idle",
+    });
+    await db.insert(issues).values({
+      id: parentId, companyId, title: "Corpus parent", status: "in_progress", assigneeAgentId: leadAgentId,
+    });
+    const template = corpus.fixtures.find((candidate) => candidate.mode === "native")!;
+    const seeded = await seedFixture({
+      ...template, id: `child-attention-${randomUUID()}`,
+      given: { ...template.given, priorIssueStatus: "in_progress", completionState: "policy_review_cleanup" },
+    });
+    await db.update(issues).set({ parentId }).where(eq(issues.id, seeded.issueId));
+
+    const committed = await commitNativeStatusDecision({
+      db, companyId, issueId: seeded.issueId, runId: seeded.runId,
+      assessmentId: seeded.assessmentId, priorStatus: "in_progress", priorStatusVersion: 0, priorDecisionId: null,
+      decision: {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction: "in_review", toStatus: "in_review", reasonCode: "completion_review_required", unblockDescriptor: null,
+        // No reviewer card: a card on the child would coalesce the status wake.
+        effects: [],
+      },
+    });
+
+    const wakes = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, leadAgentId),
+      eq(agentWakeupRequests.reason, "issue_child_needs_attention"),
+    ));
+    const statusWake = wakes.find((wake) => (wake.payload as Record<string, unknown>).trigger === "status_changed");
+    expect(statusWake).toMatchObject({
+      status: "queued",
+      requestedByActorId: "issue-child-attention",
+      idempotencyKey: `issue_child_needs_attention:${parentId}:${seeded.issueId}:status_changed:in_review`,
+      payload: expect.objectContaining({ issueId: parentId, childIssueId: seeded.issueId, newStatus: "in_review" }),
+    });
+    const effects = await db.select().from(statusDecisionEffects)
+      .where(eq(statusDecisionEffects.decisionId, committed.decision.id));
+    expect(effects).toEqual(expect.arrayContaining([
+      expect.objectContaining({ effectKind: "parent_attention_wake", targetId: statusWake!.id }),
+    ]));
+  }, 30_000);
 });
