@@ -50,7 +50,10 @@ export function approvalRoutes(
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: options.pluginWorkerManager,
   });
-  const issueApprovalsSvc = issueApprovalService(db);
+  // Pending approvals linked to a child wake its parent's lead immediately.
+  const issueApprovalsSvc = issueApprovalService(db, {
+    wakeup: (agentId, wakeup) => heartbeat.wakeup(agentId, wakeup),
+  });
   const issuesSvc = issueService(db);
   const secretsSvc = secretService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";

@@ -732,7 +732,10 @@ export function agentRoutes(
     logger.warn({ error }, "provider trace expiry cleanup failed");
   });
   const recovery = recoveryService(db, { enqueueWakeup: heartbeat.wakeup });
-  const issueApprovalsSvc = issueApprovalService(db);
+  // Pending approvals linked to a child wake its parent's lead immediately.
+  const issueApprovalsSvc = issueApprovalService(db, {
+    wakeup: (agentId, wakeup) => heartbeat.wakeup(agentId, wakeup),
+  });
   const secretsSvc = secretService(db);
   const instructions = agentInstructionsService(db);
   const agentFiles = agentFileStore(db);

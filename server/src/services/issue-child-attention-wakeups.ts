@@ -28,6 +28,7 @@ export const ISSUE_CHILD_ATTENTION_WAKE_INTENT_ACTOR_ID = "issue-child-attention
 
 export type IssueChildAttentionTrigger =
   | "interaction_created"
+  | "approval_created"
   | "status_changed"
   | "assignee_changed";
 
@@ -120,6 +121,11 @@ export type IssueChildAttentionEvent =
       trigger: "interaction_created";
       interactionId: string;
       interactionKind: string;
+    }
+  | {
+      trigger: "approval_created";
+      approvalId: string;
+      approvalType: string;
     };
 
 export type IssueChildAttentionActor = {
@@ -142,6 +148,8 @@ function discriminatorFor(event: IssueChildAttentionEvent) {
   switch (event.trigger) {
     case "interaction_created":
       return event.interactionId;
+    case "approval_created":
+      return event.approvalId;
     case "status_changed":
       return event.status;
     case "assignee_changed":
@@ -155,6 +163,10 @@ function summaryFor(event: IssueChildAttentionEvent, childStatus: string) {
       // The card title is worker-authored. Keep it out of the lead's prompt;
       // the lead reads the card on the child thread.
       return `Child left a pending ${event.interactionKind} card and is waiting on it.`;
+    case "approval_created":
+      // The approval title and description are worker-authored. Only the
+      // system-derived type goes into the lead's prompt.
+      return `Child is waiting on a pending ${event.approvalType} approval. The approval window can be short.`;
     case "status_changed":
       return ATTENTION_STATUSES.has(event.status)
         ? `Child moved from ${event.previousStatus} to ${event.status}. Its assignee stopped working on it.`
@@ -243,7 +255,10 @@ export async function planIssueChildNeedsAttentionWake(
   if (inFlight) return null;
 
   const event = input.event;
-  const childStatus = event.trigger === "interaction_created" ? child.status : event.status;
+  const childStatus =
+    event.trigger === "interaction_created" || event.trigger === "approval_created"
+      ? child.status
+      : event.status;
   // The child title is worker-authored. Bound it, and leave it out entirely
   // for review-contained or low-trust children, whose content must not reach
   // a higher-trust lead's prompt.
@@ -265,6 +280,9 @@ export async function planIssueChildNeedsAttentionWake(
       : {}),
     ...(event.trigger === "interaction_created"
       ? { childInteractionId: event.interactionId, interactionKind: event.interactionKind }
+      : {}),
+    ...(event.trigger === "approval_created"
+      ? { approvalId: event.approvalId, approvalType: event.approvalType }
       : {}),
     // Rendered by the wake prompt as a "Direct child issue summaries" section.
     childIssueSummaries: [
@@ -536,4 +554,77 @@ export async function allowsDependencyBlockedChildAttentionWake(
     )
     .then((rows) => rows[0] ?? null);
   return Boolean(child);
+}
+
+export type IssueChildAttentionWakeup = (
+  agentId: string,
+  wakeup: ReturnType<typeof buildIssueChildNeedsAttentionWakeRequest>,
+) => Promise<unknown>;
+
+/**
+ * Tell the parents' leads that a pending approval was linked to their child
+ * issues. Approvals often have a short window (an adapter command approval
+ * waits a few minutes at most), so when the caller has `wakeup` the lead is
+ * woken immediately through `heartbeat.wakeup`. Without it, a durable intent
+ * is written for the scheduler bridge. Best-effort: errors are logged, never
+ * thrown, so the approval link always succeeds.
+ */
+export async function notifyParentsOfChildApproval(
+  db: Db,
+  input: {
+    companyId: string;
+    approval: { id: string; type: string; status: string };
+    issueIds: readonly string[];
+    actor: IssueChildAttentionActor & { userId?: string | null };
+    wakeup?: IssueChildAttentionWakeup | null;
+  },
+) {
+  if (input.approval.status !== "pending") return 0;
+  let woken = 0;
+  const event = {
+    trigger: "approval_created" as const,
+    approvalId: input.approval.id,
+    approvalType: input.approval.type,
+  };
+  for (const issueId of new Set(input.issueIds)) {
+    try {
+      if (input.wakeup) {
+        const plan = await planIssueChildNeedsAttentionWake(db, {
+          companyId: input.companyId,
+          childIssueId: issueId,
+          actor: { agentId: input.actor.agentId ?? null },
+          event,
+        });
+        if (!plan) continue;
+        await input.wakeup(
+          plan.parentAgentId,
+          buildIssueChildNeedsAttentionWakeRequest(plan, {
+            actorType: input.actor.agentId ? "agent" : input.actor.userId ? "user" : "system",
+            actorId: input.actor.agentId ?? input.actor.userId ?? null,
+          }),
+        );
+        woken += 1;
+      } else {
+        // A savepoint (when `db` is a transaction) keeps a failure here from
+        // aborting the caller's transaction.
+        const intentId = await db.transaction(async (sp) => {
+          const spDb = sp as unknown as Db;
+          const plan = await planIssueChildNeedsAttentionWake(spDb, {
+            companyId: input.companyId,
+            childIssueId: issueId,
+            actor: { agentId: input.actor.agentId ?? null },
+            event,
+          });
+          return plan ? insertIssueChildNeedsAttentionWakeIntent(spDb, plan) : null;
+        });
+        if (intentId) woken += 1;
+      }
+    } catch (err) {
+      logger.warn(
+        { err, issueId, approvalId: input.approval.id },
+        "failed to wake parent for child issue approval",
+      );
+    }
+  }
+  return woken;
 }

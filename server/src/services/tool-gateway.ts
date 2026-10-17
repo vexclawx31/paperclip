@@ -1,4 +1,7 @@
-import { enqueueIssueChildInteractionAttentionWakeSafely } from "./issue-child-attention-wakeups.js";
+import {
+  enqueueIssueChildInteractionAttentionWakeSafely,
+  notifyParentsOfChildApproval,
+} from "./issue-child-attention-wakeups.js";
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
 import { browserUseService } from "./browser-use.js";
 import { isBrowserUseConnection } from "./browser-use-client.js";
@@ -2393,6 +2396,14 @@ export function createToolGatewayService(
           linkedByAgentId: input.session.agentId,
         })
         .onConflictDoNothing();
+      // No heartbeat here: the parent lead is told through a durable intent
+      // that the scheduler tick dispatches.
+      await notifyParentsOfChildApproval(db, {
+        companyId: input.session.companyId,
+        approval,
+        issueIds: [input.session.issueId],
+        actor: { agentId: input.session.agentId },
+      });
     }
 
     const interaction = await interactions.create(

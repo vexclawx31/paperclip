@@ -753,7 +753,9 @@ export function buildHostServices(
   const access = accessService(db);
   const authorization = authorizationService(db);
   const budgets = budgetService(db);
-  const issueApprovals = issueApprovalService(db);
+  const issueApprovals = issueApprovalService(db, {
+    wakeup: (agentId, wakeup) => heartbeat.wakeup(agentId, wakeup),
+  });
   const approvalSvc = approvalService(db);
   const interactions = issueThreadInteractionService(db);
   const scopedBus = eventBus.forPlugin(pluginKey);

@@ -173,6 +173,55 @@ describeEmbeddedPostgres("adapter approval request handler", () => {
     expect(await actionsFor(seeded.companyId)).toEqual(expect.arrayContaining(["approval.created", "adapter_approval.board_resolved"]));
   });
 
+  it("wakes the child issue's parent lead immediately when the approval is created", async () => {
+    const seeded = await seed();
+    const leadAgentId = randomUUID();
+    const parentId = randomUUID();
+    await db.insert(agents).values({
+      id: leadAgentId, companyId: seeded.companyId, name: "Orca", role: "engineer",
+      adapterType: "hermes_gateway", adapterConfig: {}, permissions: {}, status: "idle",
+    });
+    await db.insert(issues).values({
+      id: parentId, companyId: seeded.companyId, title: "Lead task", status: "in_progress", assigneeAgentId: leadAgentId,
+    });
+    await db.update(issues).set({ parentId, assigneeAgentId: seeded.agentId }).where(eq(issues.id, seeded.issueId));
+    const wakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const pending = createAdapterApprovalRequestHandler({
+      db,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      agentName: "Vex",
+      heartbeatRunId: seeded.heartbeatRunId,
+      adapterType: "hermes_gateway",
+      issueId: seeded.issueId,
+      fallbackPollMs: 20,
+      wakeup,
+    })(request({ signal: controller.signal }));
+    const approval = await waitForPendingApproval(seeded.companyId);
+    await vi.waitFor(() => expect(wakeup).toHaveBeenCalledTimes(1));
+    // Woken while the approval is still pending, well inside its window.
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(wakeup).toHaveBeenCalledWith(leadAgentId, expect.objectContaining({
+      reason: "issue_child_needs_attention",
+      payload: expect.objectContaining({
+        issueId: parentId,
+        childIssueId: seeded.issueId,
+        trigger: "approval_created",
+        approvalId: approval.id,
+        approvalType: "request_board_approval",
+      }),
+    }));
+    // Worker-authored approval text never reaches the lead's wake.
+    const wake = JSON.stringify((wakeup.mock.calls[0] as unknown[])[1]);
+    expect(wake).not.toContain("stop/restart hermes launchd service");
+    expect(wake).not.toContain("launchctl");
+    expect(wake).not.toContain("Approve agent command");
+    controller.abort();
+    await pending;
+  });
+
   it("wakes on the approval activity event instead of waiting for the fallback poll", async () => {
     const seeded = await seed();
     const started = Date.now();
