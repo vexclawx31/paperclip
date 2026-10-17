@@ -33,6 +33,7 @@ Status values: **open** (not started), **in progress**, **fixed (master)**,
 | C13 | A worker that refuses, hands back or parks a child in review does not wake the lead. Only completion and comments on the lead's own issue do. LIT-159 (Clipy declined, no owner) sat unwatched. | Pilot LIT-152 | Paperclip wake rules plus Orca | fixed (live line, not deployed) — paperclip #29 (child card, park or hand-back wakes the parent lead; blocked-parent gate admits it) |
 | C14 | Orca sessions linger while their issue waits (in_review/blocked); the 2-hour idle stop in the flow doc is not built. | LIT-146 | Orca v0 | open |
 | C15 | A `request_confirmation` card created with `wake_assignee_on_accept` never wakes anyone on "Request changes". | Pilot LIT-151 | Agent skill (orca-handoff) | open — use `wake_assignee` |
+| C16 | A single child finishing (done) while its siblings are still open doesn't wake the parent's lead. `issue_children_completed` needs all children terminal, and C13 covers parks, cards and approvals only. A review that ended in REQUEST_CHANGES (LIT-194) sat unseen. | Pilot LIT-152 | Paperclip wake rules | open — extend C13: a child reaching done or cancelled wakes the parent's agent assignee (trigger `child_completed`) |
 | C6 | A failure with unknown effect is settled to `blocked` plus an agent-error alert, but the task-level inbox item does not say why it is stuck. | Isolated proofs (fail case) | Paperclip attention | open |
 
 ## Agent access and channel parity
