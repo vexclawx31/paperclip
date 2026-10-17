@@ -117,7 +117,6 @@ export type IssueChildAttentionEvent =
       trigger: "interaction_created";
       interactionId: string;
       interactionKind: string;
-      interactionTitle?: string | null;
     };
 
 export type IssueChildAttentionActor = {
@@ -150,7 +149,9 @@ function discriminatorFor(event: IssueChildAttentionEvent) {
 function summaryFor(event: IssueChildAttentionEvent, childStatus: string) {
   switch (event.trigger) {
     case "interaction_created":
-      return `Child left a pending ${event.interactionKind} card${event.interactionTitle ? `: ${event.interactionTitle}` : ""}. It is waiting on that card.`;
+      // The card title is worker-authored. Keep it out of the lead's prompt;
+      // the lead reads the card on the child thread.
+      return `Child left a pending ${event.interactionKind} card and is waiting on it.`;
     case "status_changed":
       return ATTENTION_STATUSES.has(event.status)
         ? `Child moved from ${event.previousStatus} to ${event.status}. Its assignee stopped working on it.`
@@ -339,7 +340,7 @@ export async function enqueueIssueChildInteractionAttentionWake(
   input: {
     companyId: string;
     issueId: string;
-    interaction: { id: string; kind: string; title?: string | null };
+    interaction: { id: string; kind: string };
     actor: IssueChildAttentionActor;
   },
 ) {
@@ -351,7 +352,6 @@ export async function enqueueIssueChildInteractionAttentionWake(
       trigger: "interaction_created",
       interactionId: input.interaction.id,
       interactionKind: input.interaction.kind,
-      interactionTitle: input.interaction.title ?? null,
     },
   });
   if (!plan) return null;

@@ -4279,7 +4279,7 @@ export function createToolGatewayService(
       createdByAgentId: session.agentId,
       addresseeUserId: userId,
       payload,
-    }).returning({ id: issueThreadInteractions.id, kind: issueThreadInteractions.kind, title: issueThreadInteractions.title });
+    }).returning({ id: issueThreadInteractions.id, kind: issueThreadInteractions.kind });
     if (inserted) {
       await enqueueIssueChildInteractionAttentionWakeSafely(db, {
         companyId: session.companyId,
