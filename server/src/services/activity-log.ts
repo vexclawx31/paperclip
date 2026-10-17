@@ -148,6 +148,37 @@ export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActi
   return readNonEmptyString(company?.defaultResponsibleUserId);
 }
 
+const PLUGIN_ACTOR_TYPES: ReadonlySet<string> = new Set(["user", "agent", "system", "plugin"]);
+
+/**
+ * Build the generic `activity.logged` plugin event for one activity row.
+ *
+ * `activity.logged` is a documented core plugin event (PLUGIN_SPEC §16), but
+ * until now only activity actions that map to a typed domain event reached the
+ * plugin bus. Plugins that react to actions without a typed event (for example
+ * `issue.thread_interaction_created`) subscribe to this one and filter on
+ * `payload.action`. The payload is the same already-redacted payload that the
+ * live-events channel carries; no extra data leaves the instance.
+ */
+export function activityLoggedPluginEvent(publication: ActivityPublication): PluginEvent | null {
+  const payload = publication.payload;
+  if (typeof payload.action !== "string" || payload.action.length === 0) return null;
+  const actorType = typeof payload.actorType === "string" && PLUGIN_ACTOR_TYPES.has(payload.actorType)
+    ? payload.actorType as PluginEvent["actorType"]
+    : undefined;
+  return {
+    eventId: randomUUID(),
+    eventType: "activity.logged",
+    occurredAt: new Date().toISOString(),
+    actorId: typeof payload.actorId === "string" ? payload.actorId : undefined,
+    actorType,
+    entityId: typeof payload.entityId === "string" ? payload.entityId : undefined,
+    entityType: typeof payload.entityType === "string" ? payload.entityType : undefined,
+    companyId: publication.companyId,
+    payload: { ...payload },
+  };
+}
+
 export function publishActivity(publication: ActivityPublication) {
   publishLiveEvent({
     companyId: publication.companyId,
@@ -155,6 +186,11 @@ export function publishActivity(publication: ActivityPublication) {
     payload: publication.payload,
   });
   if (publication.pluginEvent) publishPluginDomainEvent(publication.pluginEvent);
+  // Typed events whose type is literally `activity.logged` are already covered.
+  if (publication.pluginEvent?.eventType !== "activity.logged") {
+    const activityEvent = activityLoggedPluginEvent(publication);
+    if (activityEvent) publishPluginDomainEvent(activityEvent);
+  }
 }
 
 export async function persistActivity(db: Db, input: LogActivityInput) {

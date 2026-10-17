@@ -130,6 +130,8 @@ Subscribe in `setup` with `ctx.events.on(name, handler)` or `ctx.events.on(name,
 | `cost_event.created` | cost |
 | `activity.logged` | activity |
 
+**`activity.logged`:** delivered for every activity-log row, including actions that also map to a typed event above. `entityType`/`entityId` are the logged entity; the payload is the redacted activity payload (`action`, `actorType`, `actorId`, `entityType`, `entityId`, `agentId`, `runId`, `responsibleUserId`, `details`). Filter on `payload.action`, for example `issue.thread_interaction_created`. Do not write activity from an `activity.logged` handler without a guard, or the plugin will receive its own rows.
+
 **Plugin-to-plugin:** Subscribe to `plugin.<pluginId>.<eventName>` (e.g. `plugin.acme.linear.sync-done`). Emit with `ctx.events.emit("sync-done", companyId, payload)`; the host namespaces it automatically.
 
 **Filter (optional):** Pass a second argument to `on()`: `{ projectId?, companyId?, agentId? }` so the host only delivers matching events.

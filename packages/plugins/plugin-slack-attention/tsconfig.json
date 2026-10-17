@@ -1,0 +1,14 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "lib": ["ES2023", "DOM"],
+    "types": [],
+    "paths": {
+      "@paperclipai/plugin-sdk": ["../sdk/dist/index.d.ts"],
+      "@paperclipai/plugin-sdk/testing": ["../sdk/dist/testing.d.ts"]
+    }
+  },
+  "include": ["src", "tests"]
+}

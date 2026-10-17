@@ -20,6 +20,7 @@ export default defineConfig({
       "packages/plugins/sdk",
       "packages/plugins/create-paperclip-plugin",
       "packages/plugins/sandbox-providers/daytona",
+      "packages/plugins/plugin-slack-attention",
       "server",
       "ui",
       "cli",
