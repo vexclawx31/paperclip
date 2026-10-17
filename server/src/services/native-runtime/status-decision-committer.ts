@@ -24,6 +24,7 @@ import {
   type NativeStatusEffect,
 } from "./status-arbiter.js";
 import { nativeSha256 } from "./canonical.js";
+import { logger } from "../../middleware/logger.js";
 import {
   classifyIssueChildAttentionTransition,
   insertIssueChildNeedsAttentionWakeIntent,
@@ -2028,41 +2029,49 @@ export async function commitNativeStatusDecision(input: {
     if (input.decision.statusAction !== "preserve" && updated.parentId) {
       const transition = classifyIssueChildAttentionTransition(issue, updated);
       if (transition) {
-        const runAgentId = await tx
-          .select({ agentId: heartbeatRuns.agentId })
-          .from(heartbeatRuns)
-          .where(
-            and(
-              eq(heartbeatRuns.id, input.runId),
-              eq(heartbeatRuns.companyId, input.companyId),
-            ),
-          )
-          .then((rows) => rows[0]?.agentId ?? null);
-        const plan = await planIssueChildNeedsAttentionWake(
-          tx as unknown as Db,
-          {
-            companyId: input.companyId,
-            childIssueId: input.issueId,
-            event: transition,
-            actor: { agentId: runAgentId },
-          },
-        );
-        if (plan) {
-          const wakeId = await insertIssueChildNeedsAttentionWakeIntent(
-            tx as unknown as Db,
-            plan,
-          );
-          materialized.push({
-            effectKind: "parent_attention_wake",
-            targetType: "agent_wakeup_request",
-            targetId: wakeId,
-            payload: {
-              parentIssueId: plan.parentIssueId,
+        // Best-effort: a failure to notify the parent's lead must never roll
+        // back the child's status decision, so it runs in a savepoint.
+        try {
+          const parentWake = await tx.transaction(async (sp) => {
+            const spDb = sp as unknown as Db;
+            const runAgentId = await spDb
+              .select({ agentId: heartbeatRuns.agentId })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.id, input.runId),
+                  eq(heartbeatRuns.companyId, input.companyId),
+                ),
+              )
+              .then((rows) => rows[0]?.agentId ?? null);
+            const plan = await planIssueChildNeedsAttentionWake(spDb, {
+              companyId: input.companyId,
               childIssueId: input.issueId,
-              trigger: transition.trigger,
-              newStatus: transition.status,
-            },
+              event: transition,
+              actor: { agentId: runAgentId },
+            });
+            if (!plan) return null;
+            const wakeId = await insertIssueChildNeedsAttentionWakeIntent(spDb, plan);
+            return { plan, wakeId };
           });
+          if (parentWake) {
+            materialized.push({
+              effectKind: "parent_attention_wake",
+              targetType: "agent_wakeup_request",
+              targetId: parentWake.wakeId,
+              payload: {
+                parentIssueId: parentWake.plan.parentIssueId,
+                childIssueId: input.issueId,
+                trigger: transition.trigger,
+                newStatus: transition.status,
+              },
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { err, issueId: input.issueId, runId: input.runId },
+            "failed to enqueue parent wake for native child status decision",
+          );
         }
       }
     }

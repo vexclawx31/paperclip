@@ -1,7 +1,8 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, like } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests, issues } from "@paperclipai/db";
+import { agentWakeupRequests, agents, issues, projects } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
+import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 
 /**
  * Wake reason for a parent issue's agent assignee when a direct child issue
@@ -31,10 +32,12 @@ export type IssueChildAttentionTrigger =
   | "assignee_changed";
 
 /**
- * A repeat of the same attention event coalesces only while an earlier wake for
- * it is still pending or running. A completed wake does not suppress a later
- * occurrence: a child can park in `in_review`, be resumed, and park again, and
- * the lead must hear about the second stop too.
+ * Any attention event for a (parent, child) pair coalesces while an earlier
+ * wake for that pair is still pending or running, whatever its trigger. One
+ * normal park (card, then `in_review`) is one lead run, and replacement cards
+ * do not stack wakes. A completed wake does not suppress a later occurrence: a
+ * child can park, be resumed, and park again, and the lead must hear about the
+ * second stop too.
  */
 const IN_FLIGHT_CHILD_ATTENTION_WAKE_STATUSES = [
   "queued",
@@ -170,8 +173,7 @@ function summaryFor(event: IssueChildAttentionEvent, childStatus: string) {
  * - the parent is `done` or `cancelled`, or is an agent conversation;
  * - the actor making the change is the parent's assignee (no self-wake);
  * - the parent's assignee is also the child's assignee;
- * - a wake for the same (parent, child, trigger, discriminator) is still in
- *   flight (coalesce).
+ * - a wake for the same (parent, child) pair is still in flight (coalesce).
  */
 export async function planIssueChildNeedsAttentionWake(
   db: Db,
@@ -191,6 +193,8 @@ export async function planIssueChildNeedsAttentionWake(
       title: issues.title,
       status: issues.status,
       assigneeAgentId: issues.assigneeAgentId,
+      projectId: issues.projectId,
+      executionPolicy: issues.executionPolicy,
     })
     .from(issues)
     .where(and(eq(issues.id, input.childIssueId), eq(issues.companyId, input.companyId)))
@@ -228,7 +232,10 @@ export async function planIssueChildNeedsAttentionWake(
         eq(agentWakeupRequests.companyId, child.companyId),
         eq(agentWakeupRequests.agentId, parent.assigneeAgentId),
         inArray(agentWakeupRequests.status, [...IN_FLIGHT_CHILD_ATTENTION_WAKE_STATUSES]),
-        eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        like(
+          agentWakeupRequests.idempotencyKey,
+          `${ISSUE_CHILD_NEEDS_ATTENTION_WAKE_REASON}:${parent.id}:${child.id}:%`,
+        ),
       ),
     )
     .limit(1)
@@ -237,6 +244,12 @@ export async function planIssueChildNeedsAttentionWake(
 
   const event = input.event;
   const childStatus = event.trigger === "interaction_created" ? child.status : event.status;
+  // The child title is worker-authored. Bound it, and leave it out entirely
+  // for review-contained or low-trust children, whose content must not reach
+  // a higher-trust lead's prompt.
+  const title = (await childRunsUnderStandardTrust(db, child))
+    ? truncateChildTitle(child.title)
+    : null;
   const context: Record<string, unknown> = {
     issueId: parent.id,
     taskId: parent.id,
@@ -258,7 +271,7 @@ export async function planIssueChildNeedsAttentionWake(
       {
         id: child.id,
         identifier: child.identifier ?? null,
-        title: child.title,
+        ...(title ? { title } : {}),
         status: childStatus,
         summary: summaryFor(event, childStatus),
       },
@@ -273,6 +286,52 @@ export async function planIssueChildNeedsAttentionWake(
     idempotencyKey,
     context,
   };
+}
+
+export const CHILD_ATTENTION_TITLE_MAX_LENGTH = 120;
+
+function truncateChildTitle(title: string | null | undefined) {
+  const trimmed = title?.trim();
+  if (!trimmed) return null;
+  return trimmed.length > CHILD_ATTENTION_TITLE_MAX_LENGTH
+    ? `${trimmed.slice(0, CHILD_ATTENTION_TITLE_MAX_LENGTH - 1)}…`
+    : trimmed;
+}
+
+async function childRunsUnderStandardTrust(
+  db: Db,
+  child: {
+    companyId: string;
+    assigneeAgentId: string | null;
+    projectId: string | null;
+    executionPolicy: unknown;
+  },
+) {
+  const agent = child.assigneeAgentId
+    ? await db
+        .select({ companyId: agents.companyId, permissions: agents.permissions })
+        .from(agents)
+        .where(and(eq(agents.id, child.assigneeAgentId), eq(agents.companyId, child.companyId)))
+        .then((rows) => rows[0] ?? null)
+    : null;
+  const project = child.projectId
+    ? await db
+        .select({
+          companyId: projects.companyId,
+          executionWorkspacePolicy: projects.executionWorkspacePolicy,
+        })
+        .from(projects)
+        .where(and(eq(projects.id, child.projectId), eq(projects.companyId, child.companyId)))
+        .then((rows) => rows[0] ?? null)
+    : null;
+  return (
+    resolveCoreTrustPreset({
+      companyId: child.companyId,
+      agent,
+      project,
+      issue: { companyId: child.companyId, executionPolicy: child.executionPolicy },
+    }).kind === "standard"
+  );
 }
 
 /** Wake request for `heartbeat.wakeup`, matching the `issue_children_completed` route shape. */
@@ -335,15 +394,37 @@ export async function insertIssueChildNeedsAttentionWakeIntent(
  * issue. Safe to call for any issue: non-child issues and skipped cases are a
  * no-op. Returns the intent id, or null when nothing was enqueued.
  */
+export type IssueChildAttentionInteraction = {
+  id: string;
+  kind: string;
+  addresseeUserId?: string | null;
+  effectiveResolverPolicy?: string | null;
+  effectiveResolverPolicySource?: string | null;
+};
+
+/**
+ * Cards only a human can answer do not wake the lead: the lead cannot act on
+ * them. This covers human-only cards addressed to a specific user (connection
+ * and tool-authorization cards) and human-only governed actions (secret
+ * bindings). Question and confirmation cards that the lead or a board user can
+ * answer still wake the lead.
+ */
+export function isHumanOnlyChildCard(interaction: IssueChildAttentionInteraction) {
+  if (interaction.effectiveResolverPolicy !== "human_only") return false;
+  return Boolean(interaction.addresseeUserId) ||
+    interaction.effectiveResolverPolicySource === "governed_action";
+}
+
 export async function enqueueIssueChildInteractionAttentionWake(
   db: Db,
   input: {
     companyId: string;
     issueId: string;
-    interaction: { id: string; kind: string };
+    interaction: IssueChildAttentionInteraction;
     actor: IssueChildAttentionActor;
   },
 ) {
+  if (isHumanOnlyChildCard(input.interaction)) return null;
   const plan = await planIssueChildNeedsAttentionWake(db, {
     companyId: input.companyId,
     childIssueId: input.issueId,
@@ -420,4 +501,39 @@ export async function planIssueChildUpdateAttentionWakeup(
     );
     return null;
   }
+}
+
+/**
+ * Admission exception for a parent whose dependencies are unresolved. Leads
+ * usually block the parent on the very child they delegated, so without this a
+ * child that parks could never reach its lead. The wake is admitted (as a
+ * bounded, triage-only dependency-blocked run) only when the waking child is
+ * one of the parent's unresolved blockers or its direct child.
+ */
+export async function allowsDependencyBlockedChildAttentionWake(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    contextSnapshot: Record<string, unknown> | null | undefined;
+    unresolvedBlockerIssueIds: readonly string[];
+  },
+) {
+  const context = input.contextSnapshot ?? {};
+  if (context.wakeReason !== ISSUE_CHILD_NEEDS_ATTENTION_WAKE_REASON) return false;
+  const childIssueId = typeof context.childIssueId === "string" ? context.childIssueId : null;
+  if (!childIssueId || childIssueId === input.issueId) return false;
+  if (input.unresolvedBlockerIssueIds.includes(childIssueId)) return true;
+  const child = await db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.id, childIssueId),
+        eq(issues.companyId, input.companyId),
+        eq(issues.parentId, input.issueId),
+      ),
+    )
+    .then((rows) => rows[0] ?? null);
+  return Boolean(child);
 }

@@ -815,6 +815,9 @@ type PaperclipWakePayload = {
   // Technical English with brief decision context.
   simplifiedEnglishInteractions: boolean;
   dependencyBlockedInteraction: boolean;
+  // The bounded dependency-blocked run was admitted for a child that needs
+  // the lead's attention, not for a human comment.
+  dependencyBlockedChildAttention: boolean;
   treeHoldInteraction: boolean;
   activeTreeHold: PaperclipWakeTreeHoldSummary | null;
   unresolvedBlockerIssueIds: string[];
@@ -1878,6 +1881,10 @@ export function normalizePaperclipWakePayload(
       payload.dependencyBlockedInteraction,
       false,
     ),
+    dependencyBlockedChildAttention: asBoolean(
+      payload.dependencyBlockedChildAttention,
+      false,
+    ),
     treeHoldInteraction: asBoolean(payload.treeHoldInteraction, false),
     activeTreeHold,
     unresolvedBlockerIssueIds,
@@ -2669,7 +2676,9 @@ function renderPaperclipWakePromptBody(
   if (normalized.dependencyBlockedInteraction) {
     lines.push("- dependency-blocked interaction: yes");
     lines.push(
-      "- execution scope: respond or triage the human comment; do not treat blocker-dependent deliverable work as unblocked",
+      normalized.dependencyBlockedChildAttention
+        ? "- execution scope: triage the child issue that needs your attention (answer or route its card, re-assign, or unblock it); do not treat blocker-dependent deliverable work as unblocked"
+        : "- execution scope: respond or triage the human comment; do not treat blocker-dependent deliverable work as unblocked",
     );
     if (normalized.unresolvedBlockerSummaries.length > 0) {
       const blockers = normalized.unresolvedBlockerSummaries

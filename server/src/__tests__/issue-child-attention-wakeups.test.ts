@@ -299,39 +299,41 @@ describeEmbeddedPostgres("issue child needs-attention wakes", () => {
     ).toBeNull();
   });
 
-  it("coalesces an identical repeat event while the first wake is in flight, and re-arms after it completes", async () => {
+  it("coalesces every event for a (parent, child) pair while a wake is in flight, and re-arms after it completes", async () => {
     const tree = await seedTree();
-    const interaction = { id: randomUUID(), kind: "request_confirmation" };
-    const input = {
+    const cardInput = (id: string) => ({
       companyId: tree.companyId,
       issueId: tree.childId,
-      interaction,
+      interaction: { id, kind: "request_confirmation" },
       actor: { agentId: tree.workerAgentId },
-    };
-    const firstIntentId = await enqueueIssueChildInteractionAttentionWake(db, input);
-    expect(firstIntentId).toBeTruthy();
-    expect(await enqueueIssueChildInteractionAttentionWake(db, input)).toBeNull();
-    expect(await intentsFor(tree.companyId)).toHaveLength(1);
-
-    // A route-time status wake with the same key is also coalesced.
+    });
+    const firstCard = cardInput(randomUUID());
+    expect(await enqueueIssueChildInteractionAttentionWake(db, firstCard)).toBeTruthy();
+    // Identical repeat, a replacement card, and the follow-up in_review all coalesce.
+    expect(await enqueueIssueChildInteractionAttentionWake(db, firstCard)).toBeNull();
+    expect(await enqueueIssueChildInteractionAttentionWake(db, cardInput(randomUUID()))).toBeNull();
     const statusInput = {
       previous: tree.child,
       next: { ...tree.child, status: "in_review" },
       actor: workerActor(tree.workerAgentId),
     };
-    const statusWake = await planIssueChildUpdateAttentionWakeup(db, statusInput);
-    expect(statusWake).not.toBeNull();
-    await db.insert(agentWakeupRequests).values({
-      companyId: tree.companyId,
-      agentId: tree.leadAgentId,
-      source: "automation",
-      triggerDetail: "system",
-      reason: ISSUE_CHILD_NEEDS_ATTENTION_WAKE_REASON,
-      payload: statusWake!.wakeup.payload,
-      status: "claimed",
-      idempotencyKey: statusWake!.wakeup.idempotencyKey,
-    });
     expect(await planIssueChildUpdateAttentionWakeup(db, statusInput)).toBeNull();
+    expect(await intentsFor(tree.companyId)).toHaveLength(1);
+
+    // Another child of the same parent is a separate pair.
+    const siblingId = randomUUID();
+    await db.insert(issues).values({
+      id: siblingId,
+      companyId: tree.companyId,
+      title: "Sibling",
+      status: "in_progress",
+      priority: "medium",
+      parentId: tree.parentId,
+      assigneeAgentId: tree.workerAgentId,
+    });
+    expect(
+      await enqueueIssueChildInteractionAttentionWake(db, { ...cardInput(randomUUID()), issueId: siblingId }),
+    ).toBeTruthy();
 
     // Once the lead has processed the earlier wake, the child parking again is
     // new attention and must wake the lead again.
@@ -340,6 +342,55 @@ describeEmbeddedPostgres("issue child needs-attention wakes", () => {
       .set({ status: "completed" })
       .where(eq(agentWakeupRequests.companyId, tree.companyId));
     expect(await planIssueChildUpdateAttentionWakeup(db, statusInput)).not.toBeNull();
+  });
+
+  it("does not wake the lead for cards only a human can answer", async () => {
+    const tree = await seedTree();
+    const base = { companyId: tree.companyId, issueId: tree.childId, actor: { agentId: tree.workerAgentId } };
+    // Human-only card addressed to a user (connection / tool authorization).
+    expect(await enqueueIssueChildInteractionAttentionWake(db, {
+      ...base,
+      interaction: { id: randomUUID(), kind: "connection_intent", addresseeUserId: "board-user", effectiveResolverPolicy: "human_only", effectiveResolverPolicySource: "governed_action" },
+    })).toBeNull();
+    expect(await enqueueIssueChildInteractionAttentionWake(db, {
+      ...base,
+      interaction: { id: randomUUID(), kind: "request_confirmation", addresseeUserId: "board-user", effectiveResolverPolicy: "human_only", effectiveResolverPolicySource: "requested" },
+    })).toBeNull();
+    // Human-only governed action (secret binding).
+    expect(await enqueueIssueChildInteractionAttentionWake(db, {
+      ...base,
+      interaction: { id: randomUUID(), kind: "request_confirmation", addresseeUserId: null, effectiveResolverPolicy: "human_only", effectiveResolverPolicySource: "governed_action" },
+    })).toBeNull();
+    expect(await intentsFor(tree.companyId)).toHaveLength(0);
+    // A confirmation the lead or a board user can answer still wakes.
+    expect(await enqueueIssueChildInteractionAttentionWake(db, {
+      ...base,
+      interaction: { id: randomUUID(), kind: "request_confirmation", addresseeUserId: null, effectiveResolverPolicy: "board_or_assigned_agents", effectiveResolverPolicySource: "default" },
+    })).toBeTruthy();
+  });
+
+  it("truncates the child title and leaves it out for a low-trust child", async () => {
+    const tree = await seedTree();
+    await db.update(issues).set({ title: "x".repeat(300) }).where(eq(issues.id, tree.childId));
+    const standard = await planIssueChildUpdateAttentionWakeup(db, {
+      previous: tree.child,
+      next: { ...tree.child, status: "blocked" },
+      actor: workerActor(tree.workerAgentId),
+    });
+    const [summary] = standard!.wakeup.contextSnapshot.childIssueSummaries as Array<Record<string, unknown>>;
+    expect((summary!.title as string).length).toBe(120);
+
+    await db.update(issues).set({
+      executionPolicy: { trustPreset: "low_trust_review" },
+    }).where(eq(issues.id, tree.childId));
+    const lowTrust = await planIssueChildUpdateAttentionWakeup(db, {
+      previous: tree.child,
+      next: { ...tree.child, status: "in_review" },
+      actor: workerActor(tree.workerAgentId),
+    });
+    const [lowTrustSummary] = lowTrust!.wakeup.contextSnapshot.childIssueSummaries as Array<Record<string, unknown>>;
+    expect(lowTrustSummary).not.toHaveProperty("title");
+    expect(lowTrustSummary).toMatchObject({ id: tree.childId, status: "in_review" });
   });
 
   it("does not plan a needs-attention wake for a child completing (issue_children_completed owns that)", async () => {

@@ -2851,6 +2851,25 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt).toContain("PAP-1723 Finish blocker (todo)");
   });
 
+  it("renders child-attention triage scope for a dependency-blocked parent", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "issue_child_needs_attention",
+      issue: { id: "parent-1", identifier: "PAP-152", title: "Lead task", status: "blocked" },
+      dependencyBlockedInteraction: true,
+      dependencyBlockedChildAttention: true,
+      unresolvedBlockerIssueIds: ["child-1"],
+      childIssueSummaries: [
+        { id: "child-1", identifier: "PAP-159", status: "in_review", summary: "Child moved from in_progress to in_review." },
+      ],
+      fallbackFetchNeeded: false,
+    });
+
+    expect(prompt).toContain("dependency-blocked interaction: yes");
+    expect(prompt).toContain("triage the child issue that needs your attention");
+    expect(prompt).not.toContain("respond or triage the human comment");
+    expect(prompt).toContain("PAP-159 (in_review)");
+  });
+
   it("renders loose review request instructions for execution handoffs", () => {
     const prompt = renderPaperclipWakePrompt({
       reason: "execution_review_requested",

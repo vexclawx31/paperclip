@@ -435,6 +435,7 @@ import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.
 import {
   ISSUE_CHILD_ATTENTION_WAKE_INTENT_ACTOR_ID,
   ISSUE_CHILD_NEEDS_ATTENTION_WAKE_REASON,
+  allowsDependencyBlockedChildAttentionWake,
 } from "./issue-child-attention-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
@@ -8238,6 +8239,8 @@ export async function buildPaperclipWakePayload(input: {
     simplifiedEnglishInteractions: input.simplifiedEnglishInteractions === true,
     dependencyBlockedInteraction:
       input.contextSnapshot.dependencyBlockedInteraction === true,
+    dependencyBlockedChildAttention:
+      input.contextSnapshot.dependencyBlockedChildAttention === true,
     treeHoldInteraction: input.contextSnapshot.treeHoldInteraction === true,
     activeTreeHold: parseObject(input.contextSnapshot.activeTreeHold),
     unresolvedBlockerIssueIds: Array.isArray(
@@ -17421,7 +17424,13 @@ export function heartbeatService(
         !allowsIssueInteractionWake(
           context,
           ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
-        )
+        ) &&
+        !(await allowsDependencyBlockedChildAttentionWake(db, {
+          companyId: run.companyId,
+          issueId,
+          contextSnapshot: context,
+          unresolvedBlockerIssueIds: readiness?.unresolvedBlockerIssueIds ?? [],
+        }))
       ) {
         await cancelQueuedRunForBlockedDependencies(
           run,
@@ -28149,16 +28158,36 @@ export function heartbeatService(
           // Blocked descendants should stay idle until the final blocker resolves.
           // Human comment/mention wakes are the exception: they may run in a
           // bounded interaction mode so the assignee can answer or triage.
+          // A child that needs the lead's attention is the same kind of
+          // exception: a parent is usually blocked on the very child that
+          // parked, so the lead gets a bounded triage-only run for it.
+          const blockedChildAttentionWake = Boolean(
+            dependencyReadiness &&
+            !dependencyReadiness.isDependencyReady &&
+            !allowsIssueInteractionWake(
+              enrichedContextSnapshot,
+              ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
+            ) &&
+            (await allowsDependencyBlockedChildAttentionWake(tx as unknown as Db, {
+              companyId: issue.companyId,
+              issueId: issue.id,
+              contextSnapshot: enrichedContextSnapshot,
+              unresolvedBlockerIssueIds: dependencyReadiness.unresolvedBlockerIssueIds,
+            })),
+          );
           const blockedInteractionWake =
             dependencyReadiness &&
             !dependencyReadiness.isDependencyReady &&
-            allowsIssueInteractionWake(
+            (allowsIssueInteractionWake(
               enrichedContextSnapshot,
               ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
-            );
+            ) || blockedChildAttentionWake);
 
           if (blockedInteractionWake) {
             enrichedContextSnapshot.dependencyBlockedInteraction = true;
+            if (blockedChildAttentionWake) {
+              enrichedContextSnapshot.dependencyBlockedChildAttention = true;
+            }
             enrichedContextSnapshot.unresolvedBlockerIssueIds =
               dependencyReadiness.unresolvedBlockerIssueIds;
             enrichedContextSnapshot.unresolvedBlockerCount =

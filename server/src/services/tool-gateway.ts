@@ -4279,7 +4279,13 @@ export function createToolGatewayService(
       createdByAgentId: session.agentId,
       addresseeUserId: userId,
       payload,
-    }).returning({ id: issueThreadInteractions.id, kind: issueThreadInteractions.kind });
+    }).returning({
+      id: issueThreadInteractions.id,
+      kind: issueThreadInteractions.kind,
+      addresseeUserId: issueThreadInteractions.addresseeUserId,
+      effectiveResolverPolicy: issueThreadInteractions.effectiveResolverPolicy,
+      effectiveResolverPolicySource: issueThreadInteractions.effectiveResolverPolicySource,
+    });
     if (inserted) {
       await enqueueIssueChildInteractionAttentionWakeSafely(db, {
         companyId: session.companyId,

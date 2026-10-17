@@ -1410,6 +1410,8 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "chat_task_completed",
   "issue_assigned",
   "issue_blockers_resolved",
+  "issue_children_completed",
+  "issue_child_needs_attention",
   "issue_commented",
   "issue_comment_mentioned",
   "issue_dependencies_blocked",

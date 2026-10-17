@@ -2884,7 +2884,8 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       decision: {
         policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
         statusAction: "in_review", toStatus: "in_review", reasonCode: "completion_review_required", unblockDescriptor: null,
-        effects: [{ kind: "bind_reviewer", prompt: "Review the release before publishing.", ownerUserId: null }],
+        // No reviewer card: a card on the child would coalesce the status wake.
+        effects: [],
       },
     });
 
