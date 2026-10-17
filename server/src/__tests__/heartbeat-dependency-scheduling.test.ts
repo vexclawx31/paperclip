@@ -267,6 +267,98 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(dispatchedRequests[0]).toMatchObject({ runId: dispatchedRun!.id });
   });
 
+  it("dispatches a child needs-attention intent to the parent's lead with its own provenance", async () => {
+    const companyId = randomUUID();
+    const leadAgentId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Child attention",
+      issuePrefix: `A${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: leadAgentId,
+      companyId,
+      name: "Lead",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: parentId,
+      companyId,
+      title: "Lead task",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: leadAgentId,
+      responsibleUserId: "responsible-user",
+    });
+    await db.insert(issues).values({
+      id: childId,
+      companyId,
+      title: "Parked child",
+      status: "in_review",
+      priority: "medium",
+      parentId,
+    });
+    const context = {
+      issueId: parentId,
+      taskId: parentId,
+      childIssueId: childId,
+      trigger: "status_changed",
+      newStatus: "in_review",
+    };
+    const [intent] = await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: leadAgentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_child_needs_attention",
+      payload: {
+        ...context,
+        _paperclipWakeContext: {
+          ...context,
+          wakeReason: "issue_child_needs_attention",
+          source: "issue.child_needs_attention",
+        },
+      },
+      requestedByActorType: "system",
+      requestedByActorId: "issue-child-attention",
+      idempotencyKey: `issue_child_needs_attention:${parentId}:${childId}:status_changed:in_review`,
+    }).returning({ id: agentWakeupRequests.id });
+
+    const result = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    expect(result.dispatched).toBe(1);
+    await heartbeat.drainActiveRunExecutions();
+
+    const dispatchedRequests = await db.select().from(agentWakeupRequests).where(
+      sql`${agentWakeupRequests.requestedByActorId} = ${`issue-child-attention-dispatch:${intent!.id}`}`,
+    );
+    expect(dispatchedRequests).toHaveLength(1);
+    expect(dispatchedRequests[0]).toMatchObject({
+      reason: "issue_child_needs_attention",
+      idempotencyKey: `issue_child_needs_attention:${parentId}:${childId}:status_changed:in_review`,
+    });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    const run = runs.find((candidate) => candidate.id === dispatchedRequests[0]!.runId);
+    expect(run).toMatchObject({ agentId: leadAgentId, status: "succeeded" });
+    expect(run!.contextSnapshot).toMatchObject({
+      issueId: parentId,
+      wakeReason: "issue_child_needs_attention",
+      source: "issue.child_needs_attention",
+      childIssueId: childId,
+      trigger: "status_changed",
+    });
+    expect(run!.contextSnapshot).not.toHaveProperty("statusDecisionSource");
+    const [persistedIntent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent!.id));
+    expect(persistedIntent).toMatchObject({ status: "coalesced", runId: run!.id });
+  });
+
   it.each(["onboarding", "ordinary", "cancelled"])("dispatches only a verified completed onboarding report: %s", async kind => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), childId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Completion", issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}` });

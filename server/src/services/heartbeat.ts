@@ -433,6 +433,10 @@ import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
 import {
+  ISSUE_CHILD_ATTENTION_WAKE_INTENT_ACTOR_ID,
+  ISSUE_CHILD_NEEDS_ATTENTION_WAKE_REASON,
+} from "./issue-child-attention-wakeups.js";
+import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
   normalizeIssueExecutionPolicy,
@@ -1261,6 +1265,9 @@ const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set([
   CHAT_COMPLETION_WAKE_REASON,
   "approval_approved",
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  // A lead's running turn started before the child parked; it must get one
+  // follow-up instead of having the attention event merged into that turn.
+  ISSUE_CHILD_NEEDS_ATTENTION_WAKE_REASON,
   "issue_recovery_action_restored",
   // A blocked transition made inside the owner's own run must not be marked
   // delivered into that exiting run; it needs one queued follow-up.
@@ -1274,6 +1281,7 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "issue_reopened_via_comment",
   "issue_blockers_resolved",
   "issue_children_completed",
+  ISSUE_CHILD_NEEDS_ATTENTION_WAKE_REASON,
   "issue_status_changed",
   "issue_tree_restored",
   "issue_recovery_action_restored",
@@ -29028,7 +29036,10 @@ export function heartbeatService(
             ? eq(agentWakeupRequests.companyId, input.companyId)
             : undefined,
           eq(agentWakeupRequests.requestedByActorType, "system"),
-          eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+          inArray(agentWakeupRequests.requestedByActorId, [
+            "native-status-committer",
+            ISSUE_CHILD_ATTENTION_WAKE_INTENT_ACTOR_ID,
+          ]),
           inArray(agentWakeupRequests.status, ["queued", "claimed"]),
           isNull(agentWakeupRequests.runId),
         ),
@@ -29045,7 +29056,14 @@ export function heartbeatService(
     >();
 
     for (const candidate of candidates) {
-      const dispatchActorId = `native-status-wake-dispatch:${candidate.id}`;
+      // Child-attention intents are not native status decisions. They use a
+      // distinct dispatcher prefix so native-decision provenance checks (for
+      // example chat-control recovery lineage) never treat them as one.
+      const isChildAttentionIntent =
+        candidate.requestedByActorId === ISSUE_CHILD_ATTENTION_WAKE_INTENT_ACTOR_ID;
+      const dispatchActorId = isChildAttentionIntent
+        ? `issue-child-attention-dispatch:${candidate.id}`
+        : `native-status-wake-dispatch:${candidate.id}`;
       const existingDispatch = await db
         .select()
         .from(agentWakeupRequests)
@@ -29212,8 +29230,12 @@ export function heartbeatService(
             ...wakeContext,
             ...(issueId ? { issueId, taskId: issueId } : {}),
             wakeReason: candidate.reason,
-            source: "native_status_decision",
-            statusDecisionSource: "native_status_decision",
+            ...(isChildAttentionIntent
+              ? { source: readNonEmptyString(wakeContext.source) ?? "issue.child_needs_attention" }
+              : {
+                  source: "native_status_decision",
+                  statusDecisionSource: "native_status_decision",
+                }),
             nativeStatusWakeIntentId: candidate.id,
           },
         });

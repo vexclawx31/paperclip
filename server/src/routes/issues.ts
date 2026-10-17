@@ -270,6 +270,7 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../services/issue-dependency-wakeups.js";
+import { planIssueChildUpdateAttentionWakeup } from "../services/issue-child-attention-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import {
   executionWorkspaceService as executionWorkspaceServiceDirect,
@@ -14801,6 +14802,21 @@ export function issueRoutes(
           }
         }
 
+        // A child that parks, hands back, or leaves its assignee tells the
+        // parent's lead agent. A stop-relay comment wake for the same parent
+        // already carries this transition, so it is not replaced.
+        const childAttentionWakeup = await planIssueChildUpdateAttentionWakeup(db, {
+          previous: existing,
+          next: issue,
+          actor,
+        });
+        if (
+          childAttentionWakeup &&
+          !wakeups.has(`${childAttentionWakeup.agentId}:${childAttentionWakeup.parentIssueId}`)
+        ) {
+          addWakeup(childAttentionWakeup.agentId, childAttentionWakeup.wakeup);
+        }
+
         const becameTerminal =
           !["done", "cancelled"].includes(existing.status) &&
           ["done", "cancelled"].includes(issue.status);
@@ -15151,6 +15167,24 @@ export function issueRoutes(
       entityType: "issue",
       entityId: released.id,
     });
+
+    // Releasing an in-progress child is a hand-back; tell the parent's lead.
+    void planIssueChildUpdateAttentionWakeup(db, {
+      previous: existing,
+      next: released,
+      actor,
+    })
+      .then((childAttentionWakeup) =>
+        childAttentionWakeup
+          ? heartbeat.wakeup(childAttentionWakeup.agentId, childAttentionWakeup.wakeup)
+          : null,
+      )
+      .catch((err) =>
+        logger.warn(
+          { err, issueId: released.id },
+          "failed to wake parent after child issue release",
+        ),
+      );
 
     res.json(released);
   });
@@ -18146,6 +18180,18 @@ export function issueRoutes(
               blockedTransitionAt: dependent.blockedTransitionAt,
             });
           }
+        }
+
+        const childAttentionWakeup = await planIssueChildUpdateAttentionWakeup(db, {
+          previous: issueBeforeCommentDecision,
+          next: currentIssue,
+          actor,
+        });
+        if (
+          childAttentionWakeup &&
+          !wakeups.has(`${childAttentionWakeup.agentId}:${childAttentionWakeup.parentIssueId}`)
+        ) {
+          addWakeup(childAttentionWakeup.agentId, childAttentionWakeup.wakeup);
         }
 
         const becameTerminal =

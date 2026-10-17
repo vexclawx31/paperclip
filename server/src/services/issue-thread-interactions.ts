@@ -103,6 +103,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import { enqueueIssueChildInteractionAttentionWakeSafely } from "./issue-child-attention-wakeups.js";
 import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
 import {
   assertIssueReviewVerdictActorAllowed,
@@ -2650,6 +2651,12 @@ export function issueThreadInteractionService(
             payload,
           })
           .returning();
+        await enqueueIssueChildInteractionAttentionWakeSafely(tx as unknown as Db, {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          interaction: row,
+          actor: { agentId: payload.requestingAgentId },
+        });
 
         const olderPending = await tx
           .select()
@@ -3655,6 +3662,12 @@ export function issueThreadInteractionService(
               payload: data.payload,
             })
             .returning();
+          await enqueueIssueChildInteractionAttentionWakeSafely(tx as unknown as Db, {
+            companyId: issue.companyId,
+            issueId: issue.id,
+            interaction: row,
+            actor: { agentId: actor.agentId ?? null },
+          });
 
           // An agent replacing its own still-pending card supersedes the older
           // one so the thread never accumulates stale sibling cards. This covers

@@ -1,3 +1,4 @@
+import { enqueueIssueChildInteractionAttentionWakeSafely } from "./issue-child-attention-wakeups.js";
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
 import { BROWSER_USE_TOOLS } from "@paperclipai/shared";
 import { browserUseClient, isBrowserUseConnection } from "./browser-use-client.js";
@@ -14351,6 +14352,13 @@ export function toolAccessService(
           .update(toolOauthStates)
           .set({ interactionId: interaction.id })
           .where(eq(toolOauthStates.state, state));
+        // Only a new card is new attention; re-arming an existing card is not.
+        if (!existingInteraction) await enqueueIssueChildInteractionAttentionWakeSafely(db, {
+          companyId,
+          issueId: input.issueId,
+          interaction,
+          actor: { agentId: binding.actorType === "agent" ? binding.actorId : null },
+        });
       }
     }
 

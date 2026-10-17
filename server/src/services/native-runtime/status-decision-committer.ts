@@ -25,6 +25,11 @@ import {
 } from "./status-arbiter.js";
 import { nativeSha256 } from "./canonical.js";
 import {
+  classifyIssueChildAttentionTransition,
+  insertIssueChildNeedsAttentionWakeIntent,
+  planIssueChildNeedsAttentionWake,
+} from "../issue-child-attention-wakeups.js";
+import {
   readNativeBoardResponseWaitSource,
   readNativeBoardResponseWaitOrigin,
   type NativeBoardResponseWaitOrigin,
@@ -2017,6 +2022,48 @@ export async function commitNativeStatusDecision(input: {
             childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
           },
         });
+      }
+    }
+
+    if (input.decision.statusAction !== "preserve" && updated.parentId) {
+      const transition = classifyIssueChildAttentionTransition(issue, updated);
+      if (transition) {
+        const runAgentId = await tx
+          .select({ agentId: heartbeatRuns.agentId })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.id, input.runId),
+              eq(heartbeatRuns.companyId, input.companyId),
+            ),
+          )
+          .then((rows) => rows[0]?.agentId ?? null);
+        const plan = await planIssueChildNeedsAttentionWake(
+          tx as unknown as Db,
+          {
+            companyId: input.companyId,
+            childIssueId: input.issueId,
+            event: transition,
+            actor: { agentId: runAgentId },
+          },
+        );
+        if (plan) {
+          const wakeId = await insertIssueChildNeedsAttentionWakeIntent(
+            tx as unknown as Db,
+            plan,
+          );
+          materialized.push({
+            effectKind: "parent_attention_wake",
+            targetType: "agent_wakeup_request",
+            targetId: wakeId,
+            payload: {
+              parentIssueId: plan.parentIssueId,
+              childIssueId: input.issueId,
+              trigger: transition.trigger,
+              newStatus: transition.status,
+            },
+          });
+        }
       }
     }
 
