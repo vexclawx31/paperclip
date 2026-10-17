@@ -30,6 +30,9 @@ Status values: **open** (not started), **in progress**, **fixed (master)**,
 | C10 | Scoped "fresh-only" Hermes runs cold-start every time, so each relay hop costs minutes. | LIT-134 | Paperclip Hermes adapter | open |
 | C11 | Claude background tasks (for example a long test) are killed when the run ends, so their result never reports back. | Claudy runs | Agent instructions plus adapter | mitigated — Claudy's instructions require long commands in the foreground |
 | C12 | Orca is also woken by its own status and comment changes (LIT-144 took 4 runs). | Orca v0 | Paperclip wake rules | open — harmless |
+| C13 | A worker that refuses, hands back or parks a child in review does not wake the lead. Only completion and comments on the lead's own issue do. LIT-159 (Clipy declined, no owner) sat unwatched. | Pilot LIT-152 | Paperclip wake rules plus Orca | mitigated — Orca checks open children on every wake; durable fix: wake the parent's assignee on a child hand-back or refusal |
+| C14 | Orca sessions linger while their issue waits (in_review/blocked); the 2-hour idle stop in the flow doc is not built. | LIT-146 | Orca v0 | open |
+| C15 | A `request_confirmation` card created with `wake_assignee_on_accept` never wakes anyone on "Request changes". | Pilot LIT-151 | Agent skill (orca-handoff) | open — use `wake_assignee` |
 | C6 | A failure with unknown effect is settled to `blocked` plus an agent-error alert, but the task-level inbox item does not say why it is stuck. | Isolated proofs (fail case) | Paperclip attention | open |
 
 ## Agent access and channel parity
@@ -47,6 +50,7 @@ Status values: **open** (not started), **in progress**, **fixed (master)**,
 | A9 | Agents that run as the operator's OS user can reach the operator's board CLI login (`~/.local/bin/paperclipai` with its stored context), which would let them act as the board. | LIT-134 | Host isolation plus agent instructions | open — instructions forbid it; durable fix: run agents as separate OS users or keep the board CLI context out of agent reach |
 | A10 | Hermes agents do not remember Paperclip work: `retain_platforms` lists chat platforms only, not `api_server`. Nox could not recall LIT-129 or LIT-131. | r6 post-check (LIT-148) | Hindsight config | by design — decision available: Paperclip runs (and cron) have been excluded producers since Hindsight r4, because issues and comments are already the durable record and retaining task runs caused the 34k-note vex-personal backlog. Enabling it is one config line per agent plus a cost and noise decision. |
 | A11 | Orca (the long-lived Claude Code lead) runs with bypass permissions. Red-tier limits come from its instructions only; the Hermes floor does not apply to it. | Orca v0 | Agent configuration | open — same class as A6 |
+| A12 | Clipy's (codex_local) own approval review blocks its Paperclip API writes as an "unverified bearer destination", so it cannot hand back work. | Pilot LIT-159 | Codex agent config | open |
 
 ## External tool access (Apex as the reference workload)
 
