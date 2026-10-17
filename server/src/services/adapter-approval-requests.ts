@@ -9,6 +9,7 @@ import type {
 import { logActivity } from "./activity-log.js";
 import { approvalService } from "./approvals.js";
 import { issueApprovalService } from "./issue-approvals.js";
+import type { IssueChildAttentionWakeup } from "./issue-child-attention-wakeups.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 
 // Host side of AdapterExecutionContext.onApprovalRequest. An adapter (today
@@ -49,6 +50,11 @@ export type AdapterApprovalRequestHandlerDeps = {
   issueId: string | null;
   fallbackPollMs?: number;
   now?: () => number;
+  /**
+   * Immediate wake for the child issue's parent lead. The approval window is
+   * short, so the lead must not wait for the scheduler tick.
+   */
+  wakeup?: IssueChildAttentionWakeup | null;
 };
 
 export function createAdapterApprovalRequestHandler(deps: AdapterApprovalRequestHandlerDeps) {
@@ -56,7 +62,7 @@ export function createAdapterApprovalRequestHandler(deps: AdapterApprovalRequest
   const fallbackPollMs = deps.fallbackPollMs ?? DEFAULT_FALLBACK_POLL_MS;
   const now = deps.now ?? Date.now;
   const approvalsSvc = approvalService(db);
-  const issueApprovalsSvc = issueApprovalService(db);
+  const issueApprovalsSvc = issueApprovalService(db, { wakeup: deps.wakeup ?? null });
 
   const auditBase = (request: AdapterApprovalRequest) => ({
     adapterType: deps.adapterType,

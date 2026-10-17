@@ -3,13 +3,26 @@ import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issues } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { redactEventPayload } from "../redaction.js";
+import {
+  notifyParentsOfChildApproval,
+  type IssueChildAttentionWakeup,
+} from "./issue-child-attention-wakeups.js";
 
 interface LinkActor {
   agentId?: string | null;
   userId?: string | null;
 }
 
-export function issueApprovalService(db: Db) {
+export type IssueApprovalServiceOptions = {
+  /**
+   * Immediate wake path (`heartbeat.wakeup`) for telling a child's parent lead
+   * about a newly linked pending approval. Without it the lead is told through
+   * a durable intent that the scheduler tick dispatches.
+   */
+  wakeup?: IssueChildAttentionWakeup | null;
+};
+
+export function issueApprovalService(db: Db, options: IssueApprovalServiceOptions = {}) {
   async function getIssue(issueId: string) {
     return db
       .select()
@@ -105,9 +118,9 @@ export function issueApprovalService(db: Db) {
     },
 
     link: async (issueId: string, approvalId: string, actor?: LinkActor) => {
-      const { issue } = await assertIssueAndApprovalSameCompany(issueId, approvalId);
+      const { issue, approval } = await assertIssueAndApprovalSameCompany(issueId, approvalId);
 
-      await db
+      const inserted = await db
         .insert(issueApprovals)
         .values({
           companyId: issue.companyId,
@@ -116,7 +129,17 @@ export function issueApprovalService(db: Db) {
           linkedByAgentId: actor?.agentId ?? null,
           linkedByUserId: actor?.userId ?? null,
         })
-        .onConflictDoNothing();
+        .onConflictDoNothing()
+        .returning({ issueId: issueApprovals.issueId });
+      if (inserted.length > 0) {
+        await notifyParentsOfChildApproval(db, {
+          companyId: issue.companyId,
+          approval,
+          issueIds: [issueId],
+          actor: { agentId: actor?.agentId ?? null, userId: actor?.userId ?? null },
+          wakeup: options.wakeup,
+        });
+      }
 
       return db
         .select()
@@ -157,7 +180,7 @@ export function issueApprovalService(db: Db) {
         }
       }
 
-      await db
+      const inserted = await db
         .insert(issueApprovals)
         .values(
           uniqueIssueIds.map((issueId) => ({
@@ -168,7 +191,15 @@ export function issueApprovalService(db: Db) {
             linkedByUserId: actor?.userId ?? null,
           })),
         )
-        .onConflictDoNothing();
+        .onConflictDoNothing()
+        .returning({ issueId: issueApprovals.issueId });
+      await notifyParentsOfChildApproval(db, {
+        companyId: approval.companyId,
+        approval,
+        issueIds: inserted.map((row) => row.issueId),
+        actor: { agentId: actor?.agentId ?? null, userId: actor?.userId ?? null },
+        wakeup: options.wakeup,
+      });
     },
   };
 }

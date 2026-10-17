@@ -24957,6 +24957,7 @@ export function heartbeatService(
                       heartbeatRunId: run.id,
                       adapterType: agent.adapterType,
                       issueId: issueId ?? null,
+                      wakeup: (parentAgentId, wakeup) => trackWakeup(parentAgentId, wakeup),
                     }),
                     startupTraceContext: getStartupTraceContext(),
                     onRuntimeProgress: async (progress) => {

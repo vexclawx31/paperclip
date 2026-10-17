@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
   agents,
+  approvals,
   companies,
   createDb,
+  issueApprovals,
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
@@ -22,6 +24,7 @@ import {
   planIssueChildUpdateAttentionWakeup,
 } from "../services/issue-child-attention-wakeups.ts";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
+import { issueApprovalService } from "../services/issue-approvals.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -87,6 +90,8 @@ describeEmbeddedPostgres("issue child needs-attention wakes", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await db.delete(issueApprovals);
+    await db.delete(approvals);
     await db.delete(issueThreadInteractions);
     await db.delete(activityLog);
     await db.delete(agentWakeupRequests);
@@ -413,5 +418,93 @@ describeEmbeddedPostgres("issue child needs-attention wakes", () => {
       actor: { agentId: tree.workerAgentId },
     });
     expect(await intentsFor(tree.companyId)).toHaveLength(0);
+  });
+  async function createPendingApproval(companyId: string) {
+    const [approval] = await db.insert(approvals).values({
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: { title: "Approve agent command", summary: "worker-authored text", source: "adapter_approval_request" },
+    }).returning();
+    return approval!;
+  }
+
+  it("a pending approval linked to a child wakes the parent's lead immediately", async () => {
+    const tree = await seedTree();
+    const approval = await createPendingApproval(tree.companyId);
+    const wakeup = vi.fn(async () => ({ id: randomUUID() }));
+    await issueApprovalService(db, { wakeup }).linkManyForApproval(approval.id, [tree.childId], {
+      agentId: tree.workerAgentId,
+    });
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(wakeup).toHaveBeenCalledWith(tree.leadAgentId, expect.objectContaining({
+      reason: ISSUE_CHILD_NEEDS_ATTENTION_WAKE_REASON,
+      idempotencyKey: `${ISSUE_CHILD_NEEDS_ATTENTION_WAKE_REASON}:${tree.parentId}:${tree.childId}:approval_created:${approval.id}`,
+      payload: expect.objectContaining({
+        issueId: tree.parentId,
+        childIssueId: tree.childId,
+        childIdentifier: `${tree.prefix}-159`,
+        trigger: "approval_created",
+        approvalId: approval.id,
+        approvalType: "request_board_approval",
+      }),
+    }));
+    const wake = JSON.stringify((wakeup.mock.calls[0] as unknown[])[1]);
+    expect(wake).not.toContain("worker-authored text");
+    expect(wake).not.toContain("Approve agent command");
+    // Linking the same approval again is not a new event.
+    await issueApprovalService(db, { wakeup }).link(tree.childId, approval.id, { agentId: tree.workerAgentId });
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("without an immediate wake path, a linked approval persists a durable intent", async () => {
+    const tree = await seedTree();
+    const approval = await createPendingApproval(tree.companyId);
+    await issueApprovalService(db).link(tree.childId, approval.id, { agentId: tree.workerAgentId });
+    const intents = await intentsFor(tree.companyId);
+    expect(intents).toHaveLength(1);
+    expect(intents[0]).toMatchObject({
+      agentId: tree.leadAgentId,
+      requestedByActorId: ISSUE_CHILD_ATTENTION_WAKE_INTENT_ACTOR_ID,
+      payload: expect.objectContaining({ trigger: "approval_created", approvalId: approval.id }),
+    });
+  });
+
+  it("an approval coalesces with an in-flight wake from the same child", async () => {
+    const tree = await seedTree();
+    await enqueueIssueChildInteractionAttentionWake(db, {
+      companyId: tree.companyId,
+      issueId: tree.childId,
+      interaction: { id: randomUUID(), kind: "request_confirmation" },
+      actor: { agentId: tree.workerAgentId },
+    });
+    const approval = await createPendingApproval(tree.companyId);
+    const wakeup = vi.fn(async () => null);
+    await issueApprovalService(db, { wakeup }).linkManyForApproval(approval.id, [tree.childId], {
+      agentId: tree.workerAgentId,
+    });
+    expect(wakeup).not.toHaveBeenCalled();
+  });
+
+  it.each(["done", "cancelled"])("an approval on a child does not wake the lead when the parent is %s", async (parentStatus) => {
+    const tree = await seedTree({ parentStatus });
+    const approval = await createPendingApproval(tree.companyId);
+    const wakeup = vi.fn(async () => null);
+    await issueApprovalService(db, { wakeup }).linkManyForApproval(approval.id, [tree.childId], {
+      agentId: tree.workerAgentId,
+    });
+    expect(wakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not wake for a decided approval or when the lead linked it", async () => {
+    const tree = await seedTree();
+    const approval = await createPendingApproval(tree.companyId);
+    const wakeup = vi.fn(async () => null);
+    await issueApprovalService(db, { wakeup }).link(tree.childId, approval.id, { agentId: tree.leadAgentId });
+    const [decided] = await db.insert(approvals).values({
+      companyId: tree.companyId, type: "request_board_approval", status: "approved", payload: {},
+    }).returning();
+    await issueApprovalService(db, { wakeup }).link(tree.childId, decided!.id, { agentId: tree.workerAgentId });
+    expect(wakeup).not.toHaveBeenCalled();
   });
 });

@@ -3,6 +3,8 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  approvals,
+  issueApprovals,
   agents,
   agentRuntimeState,
   agentWakeupRequests,
@@ -29,6 +31,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { issueApprovalService } from "../services/issue-approvals.ts";
 import {
   insertIssueChildNeedsAttentionWakeIntent,
   planIssueChildNeedsAttentionWake,
@@ -145,6 +148,8 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.delete(documents);
     await db.delete(issueRelations);
     await db.delete(issueTreeHolds);
+    await db.delete(issueApprovals);
+    await db.delete(approvals);
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
@@ -460,6 +465,57 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       expect(parent!.status).toBe("blocked");
     },
   );
+
+  it("wakes a blocked parent's lead immediately when a pending approval is linked to its child", async () => {
+    const companyId = randomUUID();
+    const leadAgentId = randomUUID();
+    const workerAgentId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Approval attention",
+      issuePrefix: `V${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    for (const [id, name] of [[leadAgentId, "Orca"], [workerAgentId, "Vex"]] as const) {
+      await db.insert(agents).values({
+        id, companyId, name, role: "engineer", status: "active", adapterType: "codex_local",
+        adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {},
+      });
+    }
+    await db.insert(issues).values([
+      { id: parentId, companyId, title: "Lead task", status: "blocked", priority: "medium", assigneeAgentId: leadAgentId, responsibleUserId: "responsible-user" },
+      { id: childId, companyId, title: "Child task", status: "in_progress", priority: "medium", parentId, assigneeAgentId: workerAgentId, responsibleUserId: "responsible-user" },
+    ]);
+    await db.insert(issueRelations).values({ companyId, issueId: childId, relatedIssueId: parentId, type: "blocks" });
+    const [approval] = await db.insert(approvals).values({
+      companyId, type: "request_board_approval", status: "pending",
+      payload: { title: "Approve agent command", source: "adapter_approval_request" },
+    }).returning();
+
+    const linkedAt = Date.now();
+    await issueApprovalService(db, {
+      wakeup: (agentId, wakeup) => heartbeat.wakeup(agentId, wakeup),
+    }).linkManyForApproval(approval!.id, [childId], { agentId: workerAgentId });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs).toHaveLength(1);
+    // The run exists when the link call returns: no scheduler tick is involved.
+    const latencyMs = runs[0]!.createdAt.getTime() - linkedAt;
+    expect(latencyMs).toBeLessThan(2_000);
+    await heartbeat.drainActiveRunExecutions();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runs[0]!.id));
+    expect(run).toMatchObject({ agentId: leadAgentId, status: "succeeded" });
+    expect(run!.contextSnapshot).toMatchObject({
+      issueId: parentId,
+      wakeReason: "issue_child_needs_attention",
+      trigger: "approval_created",
+      approvalId: approval!.id,
+      approvalType: "request_board_approval",
+      dependencyBlockedInteraction: true,
+      dependencyBlockedChildAttention: true,
+    });
+  });
 
   it("still skips a needs-attention wake on a blocked parent for an unrelated issue", async () => {
     const companyId = randomUUID();
