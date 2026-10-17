@@ -1,0 +1,29 @@
+{
+  "name": "@paperclipai/plugin-slack-attention",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Posts every human ask (board approvals and human-only decision cards) into the matching Slack thread, event-driven, and marks it resolved when it is decided.",
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "scripts": {
+    "prebuild": "pnpm -C ../../.. --filter @paperclipai/plugin-sdk ensure-build-deps",
+    "build": "node ./esbuild.config.mjs",
+    "clean": "rm -rf dist",
+    "test": "pnpm -C ../../.. exec vitest run --project @paperclipai/plugin-slack-attention",
+    "typecheck": "pnpm -C ../../.. --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit -p tsconfig.json"
+  },
+  "keywords": [
+    "paperclip",
+    "plugin",
+    "slack",
+    "notifications"
+  ],
+  "author": "Paperclip",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.11.0"
+  }
+}
